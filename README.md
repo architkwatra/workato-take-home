@@ -23,7 +23,7 @@ working local system with sound engineering judgment:
 Use Docker Compose to run everything on one machine:
 
 - `api`: accepts orders, exposes control endpoints, serves health/readiness, and
-  streams live updates to the dashboard.
+  streams live updates to the dashboard from Postgres notifications.
 - `worker`: advances orders through the lifecycle by claiming pending work from
   the database.
 - `postgres`: durable source of truth for orders, lifecycle events, attempts,
@@ -74,15 +74,17 @@ idempotency, and guarded transitions.
 
 Core rules:
 
-- Every submitted order has a stable `order_id` or idempotency key with a unique
-  constraint.
+- The client/load generator creates a UUID idempotency key for each intended
+  order and sends it with the request. The API stores it with a unique
+  constraint and returns the existing order if the same key is retried.
 - Every lifecycle change is written transactionally.
 - Workers claim work with a lease, for example `locked_by` and `locked_until`.
 - Task claiming uses `SELECT FOR UPDATE SKIP LOCKED` inside a transaction, so
   concurrent workers never claim the same task row. Only one worker wins the
   claim; others skip to the next available task.
 - Expired leases are recoverable by another worker.
-- Retries use exponential backoff and max-attempt limits.
+- Tasks retry up to 5 times by default, configurable per stage. After that, the
+  order is marked `failed` and no automatic requeue is attempted.
 - Rate limit responses (`429`) are handled separately from normal transient
   errors. If the downstream service returns `Retry-After`, the worker schedules
   the next attempt for that time instead of applying standard exponential
@@ -144,9 +146,15 @@ current version and includes it in `UPDATE orders ... WHERE id = ? AND version =
 If another worker or cancellation already updated the row, the update affects
 zero rows and the worker retries or discards the stale task.
 
+`SELECT FOR UPDATE SKIP LOCKED` and optimistic locking protect different cases:
+the first prevents two workers from claiming the same task at once; the second
+prevents a stale worker from overwriting a newer state after its lease expired.
+
 `downstream_calls` does not need to grow forever. A retention job can prune
 successful idempotency records after a safe window, for example several days,
-while keeping failed or disputed calls longer for debugging.
+while keeping failed or disputed calls longer for debugging. If a zombie worker
+retries after that retention window, idempotency protection is gone; this is an
+acceptable demo limitation and would need a production retention policy.
 
 ## Pipeline Flow
 
@@ -161,8 +169,12 @@ while keeping failed or disputed calls longer for debugging.
 
 Important downstream handoffs:
 
-- Restaurant simulator: confirmation, preparation start, ready status.
-- Courier simulator: courier assignment, pickup, delivery.
+- Restaurant simulator: confirmation advances `placed -> confirmed`, preparation
+  start advances `confirmed -> preparing`, and the worker polls until the
+  simulator reports ready before advancing `preparing -> ready`.
+- Courier simulator: assignment advances `ready -> out_for_delivery`; pickup is
+  recorded as an event inside that state; delivery advances
+  `out_for_delivery -> delivered`.
 
 ## Dashboard
 
@@ -180,8 +192,9 @@ Show:
 - Worker health: active workers, queue depth, lease expirations, processing
   rate.
 
-The UI should update automatically via Server-Sent Events, WebSockets, or short
-polling. SSE is likely enough and simpler to explain.
+The UI should update through Server-Sent Events. Workers write `order_events`
+and issue `pg_notify`; the API listens with Postgres `LISTEN/NOTIFY` and pushes
+events to connected dashboard clients.
 
 If the SSE stream disconnects, the dashboard should reconnect automatically. On
 reconnect it should fetch a fresh REST snapshot before resuming the stream, so a
@@ -199,7 +212,8 @@ The load generator should support:
 - Steady traffic: small number of orders per second.
 - Dinner rush: sharp burst of orders for a configurable duration.
 - Promotion mode: sustained high load.
-- Controls from either CLI or dashboard.
+- Primary demo controls in the dashboard, with CLI commands available for
+  scripted load.
 
 Example future commands:
 
@@ -213,11 +227,11 @@ docker compose run loadgen --rate 100 --duration 1m --burst
 
 The demo should make failures easy to trigger:
 
-- Increase restaurant latency.
-- Make restaurant calls fail randomly.
-- Return courier rate limits.
-- Kill one worker container while orders are in flight.
-- Pause downstream recovery, then restore it.
+- Dashboard: increase restaurant latency, random restaurant failures, courier
+  rate limits, and downstream recovery.
+- CLI: kill one worker container while orders are in flight. This is the only
+  process-level failure action; dashboard chaos controls are for downstream
+  behavior.
 
 Expected behavior:
 
@@ -232,7 +246,7 @@ To make the demo feel like an operations tool instead of a raw engineering
 console, build a few focused product touches:
 
 - Chaos controls in the dashboard for restaurant failures, courier rate limits,
-  downstream latency, and worker kill/recovery notes.
+  downstream latency, and recovery.
 - Per-stage p95 latency so the team can see whether orders are stuck at
   confirmation, preparation, courier dispatch, pickup, or delivery.
 - Stuck-order highlighting for orders that have not moved in more than a
