@@ -32,7 +32,8 @@ Use Docker Compose to run everything on one machine:
 - `downstream-sim`: fake restaurant and courier services with configurable
   latency, random failures, rate limits, and recovery.
 - `dashboard`: web UI for the operations/business view.
-- `loadgen`: controllable traffic simulator for normal traffic and dinner rush.
+- `loadgen`: persistent traffic simulator that starts idle, exposes a control
+  API, and can change order rate while running.
 - `prometheus`/`grafana` or a lightweight metrics endpoint: health and runtime
   observability.
 
@@ -233,20 +234,37 @@ workers catch up.
 
 ## Load Generation
 
+The load generator should be a long-running service started by
+`docker compose up`, not a one-shot job. It starts idle, creates a fresh
+client-side idempotency key for each intended order, and posts orders to the API
+at the configured rate.
+
+The dashboard is the primary control surface. It calls API load-control
+endpoints, and the API forwards those commands to the internal `loadgen`
+service. CLI commands are just curl wrappers around the same controls.
+
 The load generator should support:
 
 - Steady traffic: small number of orders per second.
-- Dinner rush: sharp burst of orders for a configurable duration.
+- Dinner rush: sharp burst of orders that can be dialed up and back down during
+  the demo.
 - Promotion mode: sustained high load.
-- Primary demo controls in the dashboard, with CLI commands available for
-  scripted load.
+- Start, stop, and live rate changes without restarting the service.
 
 Example future commands:
 
 ```bash
 docker compose up
-docker compose run loadgen --rate 5 --duration 2m
-docker compose run loadgen --rate 100 --duration 1m --burst
+curl -X POST http://localhost:8080/admin/load/start \
+  -H 'content-type: application/json' \
+  -d '{"ratePerSecond":5,"profile":"steady"}'
+curl -X PATCH http://localhost:8080/admin/load/rate \
+  -H 'content-type: application/json' \
+  -d '{"ratePerSecond":100}'
+curl -X PATCH http://localhost:8080/admin/load/rate \
+  -H 'content-type: application/json' \
+  -d '{"ratePerSecond":5}'
+curl -X POST http://localhost:8080/admin/load/stop
 ```
 
 ## Failure Demo
@@ -336,7 +354,8 @@ sections once the actual commands and endpoints exist.
 3. Build worker task claiming, leases, retries, heartbeats, and lifecycle
    transitions.
 4. Add restaurant/courier simulators with failure controls.
-5. Add load generator.
+5. Add persistent load generator service and dashboard/API controls for live
+   rate changes.
 6. Wire the SSE stream and REST snapshot path used by the dashboard.
 7. Build dashboard with live metrics and order state views.
 8. Add health/metrics endpoints and demo failure controls.
