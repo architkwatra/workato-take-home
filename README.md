@@ -43,6 +43,11 @@ Chosen implementation stack:
 - Frontend: React/Vite.
 - Local orchestration: Docker Compose.
 
+`docker-compose.yml` should set the project name to `workato-take-home`, run
+three worker replicas by default with `deploy.replicas: 3`, and avoid a fixed
+`container_name` for the worker service so scaling works. Use
+`docker compose up --scale worker=1` only when debugging a single worker.
+
 I would keep Postgres as the source of truth instead of relying on an in-memory
 queue. For a take-home, a durable `order_tasks` table with worker leases is
 simple, inspectable, and defensible. If a worker dies mid-order, another worker
@@ -88,6 +93,8 @@ Core rules:
 - Expired leases are recoverable by another worker.
 - Tasks retry up to 5 times by default, configurable per stage. After that, the
   order is marked `failed` and no automatic requeue is attempted.
+- Expected poll results such as `not_ready`, `not_picked_up`, or `not_delivered`
+  are not errors and do not increment attempts; they only move `next_run_at`.
 - Rate limit responses (`429`) are handled separately from normal transient
   errors. If the downstream service returns `Retry-After`, the worker schedules
   the next attempt for that time instead of applying standard exponential
@@ -127,7 +134,9 @@ downstream call; if the order is already terminal (`cancelled`, `failed`, or
 
 If cancellation happens while a downstream request is already in flight, the
 response is ignored unless the order is still in the expected state. The order
-remains cancelled, and any follow-up task insertion is skipped.
+remains cancelled, and any follow-up task insertion is skipped. Optimistic
+locking enforces this: cancellation increments `orders.version`, so a stale
+worker's `UPDATE ... WHERE version = ?` affects zero rows.
 
 ## Suggested Data Model
 
@@ -139,9 +148,11 @@ High-level tables:
   `to_state`, `occurred_at`, and metadata, so stage duration can be computed
   from consecutive events.
 - `order_tasks`: durable work queue with order id, target stage, attempts,
-  status, next run time, lease owner, and lease expiry.
+  status, next run time, lease owner, lease expiry, and `task_type` such as
+  `advance_state`, `check_ready`, `check_pickup`, or `check_delivery`.
 - `downstream_calls`: idempotency records for restaurant/courier requests and
   responses.
+- `workers`: worker heartbeat rows with `worker_id` and `last_seen_at`.
 
 The dashboard can read current status from `orders` and historical flow from
 `order_events`.
@@ -179,9 +190,11 @@ Important downstream handoffs:
 - Restaurant simulator: confirmation advances `placed -> confirmed`, preparation
   start advances `confirmed -> preparing`, then the worker inserts a future
   `check_ready` task. Later workers claim that task, check readiness once, and
-  either advance `preparing -> ready` or reschedule another check.
-- Courier simulator: assignment advances `ready -> out_for_delivery`; pickup is
-  recorded as an event inside that state; delivery advances
+  either advance `preparing -> ready` or reschedule another check without
+  incrementing attempts.
+- Courier simulator: assignment advances `ready -> out_for_delivery` and inserts
+  a future `check_pickup` task. Pickup records an event inside
+  `out_for_delivery` and schedules `check_delivery`; delivery advances
   `out_for_delivery -> delivered`.
 
 ## Dashboard
@@ -199,6 +212,10 @@ Show:
   responses.
 - Worker health: active workers, queue depth, lease expirations, processing
   rate.
+
+Workers heartbeat every 10 seconds into the `workers` table. The dashboard
+counts active workers as those seen within the last 30 seconds, which includes
+idle workers that are not currently holding a task lease.
 
 The UI should update through Server-Sent Events. Workers write `order_events`
 and issue `pg_notify` with only `order_id` and event type. The API listens with
@@ -227,7 +244,7 @@ The load generator should support:
 Example future commands:
 
 ```bash
-docker compose up --scale worker=3
+docker compose up
 docker compose run loadgen --rate 5 --duration 2m
 docker compose run loadgen --rate 100 --duration 1m --burst
 ```
@@ -241,7 +258,8 @@ The demo should make failures easy to trigger:
 - CLI: kill one worker replica while orders are in flight. Other replicas keep
   working and reclaim the killed worker's tasks after the 30-second lease
   expires. This is the only process-level failure action; dashboard chaos
-  controls are for downstream behavior.
+  controls are for downstream behavior. With the fixed Compose project name, the
+  demo command can be `docker stop workato-take-home-worker-3`.
 
 Expected behavior:
 
@@ -315,7 +333,8 @@ sections once the actual commands and endpoints exist.
 1. Define order states, database schema, migrations, and `downstream_calls`
    idempotency records.
 2. Build order intake API and basic order creation.
-3. Build worker task claiming, leases, retries, and lifecycle transitions.
+3. Build worker task claiming, leases, retries, heartbeats, and lifecycle
+   transitions.
 4. Add restaurant/courier simulators with failure controls.
 5. Add load generator.
 6. Wire the SSE stream and REST snapshot path used by the dashboard.
