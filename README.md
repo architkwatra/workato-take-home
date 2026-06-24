@@ -35,12 +35,11 @@ Use Docker Compose to run everything on one machine:
 - `prometheus`/`grafana` or a lightweight metrics endpoint: health and runtime
   observability.
 
-Recommended stack:
+Chosen implementation stack:
 
-- Backend/workers/load generator: TypeScript with Node.js, or Python with
-  FastAPI. Pick one language and keep the moving parts easy to explain.
+- Backend/workers/load generator: TypeScript with Node.js and Fastify.
 - Database: Postgres.
-- Frontend: React/Vite or Next.js.
+- Frontend: React/Vite.
 - Local orchestration: Docker Compose.
 
 I would keep Postgres as the source of truth instead of relying on an in-memory
@@ -79,8 +78,15 @@ Core rules:
   constraint.
 - Every lifecycle change is written transactionally.
 - Workers claim work with a lease, for example `locked_by` and `locked_until`.
+- Task claiming uses `SELECT FOR UPDATE SKIP LOCKED` inside a transaction, so
+  concurrent workers never claim the same task row. Only one worker wins the
+  claim; others skip to the next available task.
 - Expired leases are recoverable by another worker.
 - Retries use exponential backoff and max-attempt limits.
+- Rate limit responses (`429`) are handled separately from normal transient
+  errors. If the downstream service returns `Retry-After`, the worker schedules
+  the next attempt for that time instead of applying standard exponential
+  backoff. This prevents the system from hammering a rate-limited service.
 - Downstream calls include idempotency keys so repeated calls do not create
   duplicate restaurant confirmations or courier dispatches.
 - Before doing work, a worker checks the current order state. If the order has
@@ -88,6 +94,35 @@ Core rules:
 
 This means the system can process some work more than once internally, but it
 should not produce duplicate business effects.
+
+### Preventing Duplicate Business Effects
+
+The specific failure to avoid is dispatching two couriers, confirming the same
+restaurant order twice, or charging twice if payment were included later.
+
+Every downstream call carries a stable idempotency key derived from
+`order_id` and the business action, for example
+`courier_dispatch:{order_id}` or `restaurant_confirm:{order_id}`. The
+downstream simulator stores the first result for that key and returns the same
+result for duplicate calls instead of creating a second dispatch or
+confirmation.
+
+If a downstream connection drops mid-request, the worker cannot know whether the
+restaurant or courier received the call. The worker still retries, but it retries
+with the same idempotency key. If the first request reached the downstream
+system, the duplicate request returns the already-created result. If it did not,
+the retry creates the result once.
+
+### Cancellation and Stale Work
+
+When an order is cancelled, outstanding tasks for that order are no longer
+eligible for useful work. A worker checks the latest order state before making a
+downstream call; if the order is already terminal (`cancelled`, `failed`, or
+`delivered`), the task is treated as a no-op.
+
+If cancellation happens while a downstream request is already in flight, the
+response is ignored unless the order is still in the expected state. The order
+remains cancelled, and any follow-up task insertion is skipped.
 
 ## Suggested Data Model
 
@@ -103,6 +138,15 @@ High-level tables:
 
 The dashboard can read current status from `orders` and historical flow from
 `order_events`.
+
+The `orders.version` column supports optimistic locking. A worker reads the
+current version and includes it in `UPDATE orders ... WHERE id = ? AND version = ?`.
+If another worker or cancellation already updated the row, the update affects
+zero rows and the worker retries or discards the stale task.
+
+`downstream_calls` does not need to grow forever. A retention job can prune
+successful idempotency records after a safe window, for example several days,
+while keeping failed or disputed calls longer for debugging.
 
 ## Pipeline Flow
 
@@ -139,6 +183,15 @@ Show:
 The UI should update automatically via Server-Sent Events, WebSockets, or short
 polling. SSE is likely enough and simpler to explain.
 
+If the SSE stream disconnects, the dashboard should reconnect automatically. On
+reconnect it should fetch a fresh REST snapshot before resuming the stream, so a
+dropped browser connection does not leave stale data on screen.
+
+After a dinner-rush burst ends, the dashboard should make the recovery arc
+visible: queue depth peaks and then drains, orders-per-minute returns to
+baseline, downstream error rate normalizes, and p95 time-in-stage falls as
+workers catch up.
+
 ## Load Generation
 
 The load generator should support:
@@ -173,6 +226,20 @@ Expected behavior:
 - Duplicate processing attempts do not create duplicate business effects.
 - The dashboard shows backlog growth, retries, failures, and recovery.
 
+## Nice Touches
+
+To make the demo feel like an operations tool instead of a raw engineering
+console, build a few focused product touches:
+
+- Chaos controls in the dashboard for restaurant failures, courier rate limits,
+  downstream latency, and worker kill/recovery notes.
+- Per-stage p95 latency so the team can see whether orders are stuck at
+  confirmation, preparation, courier dispatch, pickup, or delivery.
+- Stuck-order highlighting for orders that have not moved in more than a
+  configurable threshold.
+- A live delivery ETA estimate that updates from current queue depth and recent
+  stage latencies.
+
 ## Observability
 
 Expose health and metrics:
@@ -204,6 +271,20 @@ order can be traced during the walkthrough.
 - Simulated downstream systems should be controllably unreliable so the demo can
   show recovery, not just random chaos.
 
+## Final README Shape
+
+This file is currently an implementation blueprint. Before submission, rewrite
+the README around the evaluator workflow:
+
+1. Quick Start
+2. How to Drive Load
+3. How to Trigger Failures
+4. Architecture Summary
+5. Trade-offs
+
+Most of this planning content should move into the architecture and trade-off
+sections once the actual commands and endpoints exist.
+
 ## Implementation Order
 
 1. Define order states, database schema, and migrations.
@@ -211,6 +292,7 @@ order can be traced during the walkthrough.
 3. Build worker task claiming, leases, retries, and lifecycle transitions.
 4. Add restaurant/courier simulators with failure controls.
 5. Add load generator.
-6. Build dashboard with live metrics and order state views.
-7. Add health/metrics endpoints and demo failure controls.
-8. Write final README instructions for running, load testing, and failure demos.
+6. Wire the SSE stream and REST snapshot path used by the dashboard.
+7. Build dashboard with live metrics and order state views.
+8. Add health/metrics endpoints and demo failure controls.
+9. Write final README instructions for running, load testing, and failure demos.
