@@ -1,4 +1,4 @@
-# Worksto Take-Home: Order Pipeline
+# Workato Take-Home: Order Pipeline
 
 This project will model a food-delivery order pipeline from `placed` to
 `delivered`, including bursty traffic, flaky restaurant/courier integrations,
