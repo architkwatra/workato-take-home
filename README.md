@@ -39,7 +39,8 @@ Use Docker Compose to run everything on one machine:
 
 Chosen implementation stack:
 
-- Backend/workers/load generator: TypeScript with Node.js and Fastify.
+- Backend/workers/load generator: Python with FastAPI, asyncio, SQLAlchemy,
+  Alembic, and psycopg.
 - Database: Postgres.
 - Frontend: React/Vite.
 - Local orchestration: Docker Compose.
