@@ -25,7 +25,8 @@ Use Docker Compose to run everything on one machine:
 - `api`: accepts orders, exposes control endpoints, serves health/readiness, and
   streams live updates to the dashboard from Postgres notifications.
 - `worker`: advances orders through the lifecycle by claiming pending work from
-  the database.
+  the database. Run multiple replicas locally so killing one worker does not stop
+  processing.
 - `postgres`: durable source of truth for orders, lifecycle events, attempts,
   and worker leases.
 - `downstream-sim`: fake restaurant and courier services with configurable
@@ -78,7 +79,9 @@ Core rules:
   order and sends it with the request. The API stores it with a unique
   constraint and returns the existing order if the same key is retried.
 - Every lifecycle change is written transactionally.
-- Workers claim work with a lease, for example `locked_by` and `locked_until`.
+- Workers claim work with a 30-second lease, for example `locked_by` and
+  `locked_until`, so tasks from a killed worker become reclaimable quickly during
+  the demo.
 - Task claiming uses `SELECT FOR UPDATE SKIP LOCKED` inside a transaction, so
   concurrent workers never claim the same task row. Only one worker wins the
   claim; others skip to the next available task.
@@ -132,7 +135,9 @@ High-level tables:
 
 - `orders`: current state, customer/restaurant/courier metadata, timestamps,
   version, terminal reason.
-- `order_events`: append-only history of state changes and notable failures.
+- `order_events`: append-only history of transitions with `from_state`,
+  `to_state`, `occurred_at`, and metadata, so stage duration can be computed
+  from consecutive events.
 - `order_tasks`: durable work queue with order id, target stage, attempts,
   status, next run time, lease owner, and lease expiry.
 - `downstream_calls`: idempotency records for restaurant/courier requests and
@@ -162,7 +167,9 @@ acceptable demo limitation and would need a production retention policy.
 2. The API stores the order as `placed` and inserts the first task.
 3. A worker claims the next eligible task.
 4. The worker calls the required downstream simulator if the stage needs it.
-5. On success, the worker advances the order and inserts the next task.
+5. On success, the worker advances the order and inserts the next task. If the
+   next step is waiting on slow external progress, it inserts a future task with
+   `next_run_at` and releases the lease.
 6. On transient failure, the worker records the attempt and schedules a retry.
 7. On repeated failure or invalid state, the order is marked `failed` or the task
    is discarded as a safe no-op.
@@ -170,8 +177,9 @@ acceptable demo limitation and would need a production retention policy.
 Important downstream handoffs:
 
 - Restaurant simulator: confirmation advances `placed -> confirmed`, preparation
-  start advances `confirmed -> preparing`, and the worker polls until the
-  simulator reports ready before advancing `preparing -> ready`.
+  start advances `confirmed -> preparing`, then the worker inserts a future
+  `check_ready` task. Later workers claim that task, check readiness once, and
+  either advance `preparing -> ready` or reschedule another check.
 - Courier simulator: assignment advances `ready -> out_for_delivery`; pickup is
   recorded as an event inside that state; delivery advances
   `out_for_delivery -> delivered`.
@@ -193,8 +201,9 @@ Show:
   rate.
 
 The UI should update through Server-Sent Events. Workers write `order_events`
-and issue `pg_notify`; the API listens with Postgres `LISTEN/NOTIFY` and pushes
-events to connected dashboard clients.
+and issue `pg_notify` with only `order_id` and event type. The API listens with
+Postgres `LISTEN/NOTIFY`, fetches current state from Postgres, then pushes the
+SSE event to connected dashboard clients.
 
 If the SSE stream disconnects, the dashboard should reconnect automatically. On
 reconnect it should fetch a fresh REST snapshot before resuming the stream, so a
@@ -218,7 +227,7 @@ The load generator should support:
 Example future commands:
 
 ```bash
-docker compose up
+docker compose up --scale worker=3
 docker compose run loadgen --rate 5 --duration 2m
 docker compose run loadgen --rate 100 --duration 1m --burst
 ```
@@ -229,9 +238,10 @@ The demo should make failures easy to trigger:
 
 - Dashboard: increase restaurant latency, random restaurant failures, courier
   rate limits, and downstream recovery.
-- CLI: kill one worker container while orders are in flight. This is the only
-  process-level failure action; dashboard chaos controls are for downstream
-  behavior.
+- CLI: kill one worker replica while orders are in flight. Other replicas keep
+  working and reclaim the killed worker's tasks after the 30-second lease
+  expires. This is the only process-level failure action; dashboard chaos
+  controls are for downstream behavior.
 
 Expected behavior:
 
@@ -247,8 +257,9 @@ console, build a few focused product touches:
 
 - Chaos controls in the dashboard for restaurant failures, courier rate limits,
   downstream latency, and recovery.
-- Per-stage p95 latency so the team can see whether orders are stuck at
-  confirmation, preparation, courier dispatch, pickup, or delivery.
+- Per-stage p95 latency from `order_events`; pickup is an event inside
+  `out_for_delivery`, so its timing is computed from event timestamps rather
+  than state-entry/state-exit pairs.
 - Stuck-order highlighting for orders that have not moved in more than a
   configurable threshold.
 - A live delivery ETA estimate that updates from current queue depth and recent
@@ -301,7 +312,8 @@ sections once the actual commands and endpoints exist.
 
 ## Implementation Order
 
-1. Define order states, database schema, and migrations.
+1. Define order states, database schema, migrations, and `downstream_calls`
+   idempotency records.
 2. Build order intake API and basic order creation.
 3. Build worker task claiming, leases, retries, and lifecycle transitions.
 4. Add restaurant/courier simulators with failure controls.
