@@ -86,6 +86,25 @@ authoritative for the platform. In a production system, this is where a
 compensating restaurant/courier cancellation would be sent; for the demo, stale
 acks are ignored and terminal order state wins.
 
+When the API cancels an order, it updates the order state and marks pending
+tasks for that order as `cancelled` in the same transaction. If a worker still
+encounters a cancelled order because of a race, it marks its task completed as a
+no-op and emits a diagnostic event.
+
+### Example 3: Worker Crash After Downstream Success
+
+1. A worker calls `downstream-sim` to dispatch a courier.
+2. The simulator returns success.
+3. The worker records `downstream_calls.status = 'succeeded'` but crashes before
+   it advances the order or completes the task.
+4. The task lease expires and another worker reclaims the task.
+5. The new worker upserts the same `downstream_calls.idempotency_key`.
+6. Because the existing row is already `succeeded`, the worker skips the HTTP
+   call and uses the stored result to attempt the guarded order update.
+
+This avoids both failure modes: no unique-key crash in the pipeline and no
+second downstream dispatch.
+
 ## Downstream Simulator
 
 `downstream-sim` is one local service that logically behaves like two external
@@ -106,12 +125,11 @@ The simulator stores runtime state for the fake external systems:
 - Idempotency results keyed by the idempotency key passed by the worker.
 - Current failure settings for restaurant and courier behavior.
 
-For the first implementation, this simulator state can be in memory. The
-pipeline's durable source of truth is still Postgres, not the simulator. The
-demo should use simulator admin controls to degrade/recover behavior rather than
-restarting the simulator container. If restart resilience for the simulator
-becomes part of the demo, its state should move to Postgres or a small local
-store with a volume.
+The simulator's idempotency and progress state should be durable from the
+start, backed by Postgres tables in a simulator namespace/schema. This prevents a
+`downstream-sim` restart from forgetting that a courier was already dispatched
+for a given idempotency key. Failure settings can remain in memory because they
+are demo controls, not business facts.
 
 The simulator must honor idempotency keys. If a worker retries
 `courier_dispatch:{order_id}` after a timeout or dropped connection, the
@@ -127,8 +145,12 @@ The pipeline assumes at-least-once processing. Correctness comes from:
 - Durable tasks in Postgres.
 - Worker leases and reclaiming expired work.
 - Guarded state transitions and optimistic locking.
+- Downstream call upserts, so a reclaimed task can reuse a prior successful
+  downstream result instead of getting stuck on a unique-key conflict.
 - Explicit retry behavior for errors and separate scheduling for expected
   `not_ready`-style poll results.
+- Poll deadlines for long-running checks, so an order does not stay in
+  `preparing` or `out_for_delivery` forever if the simulator never progresses.
 
 The system may retry work internally, but it should not create duplicate
 business effects such as dispatching two couriers for one order.
@@ -147,6 +169,10 @@ Workers write order events and issue lightweight Postgres notifications. The API
 uses those notifications to fetch current state and update connected dashboard
 clients.
 
+If the API's Postgres `LISTEN` connection drops, it reconnects, re-subscribes,
+logs the gap, and broadcasts a fresh snapshot to connected SSE clients. This
+mirrors the browser reconnect behavior and prevents a silent stale dashboard.
+
 ## Database Design
 
 Postgres is the durable source of truth. Use UUID primary keys, `timestamptz`
@@ -160,7 +186,7 @@ query logic.
 | `order_state` | `placed`, `confirmed`, `preparing`, `ready`, `out_for_delivery`, `delivered`, `cancelled`, `failed` | Valid lifecycle states for an order. |
 | `task_type` | `advance_state`, `check_ready`, `check_pickup`, `check_delivery` | What kind of work a worker should perform. |
 | `task_status` | `pending`, `running`, `completed`, `failed`, `cancelled` | Current state of a durable task. |
-| `event_type` | `order_created`, `state_transition`, `courier_picked_up`, `retry_scheduled`, `order_cancelled`, `order_failed` | Timeline events shown in the dashboard. |
+| `event_type` | `order_created`, `state_transition`, `courier_picked_up`, `retry_scheduled`, `task_cancelled`, `order_cancelled`, `order_failed` | Timeline events shown in the dashboard. |
 | `downstream_action` | `restaurant_confirm`, `restaurant_start_prep`, `restaurant_check_ready`, `courier_dispatch`, `courier_check_pickup`, `courier_check_delivery` | Business action sent to a downstream simulator. |
 | `downstream_call_status` | `started`, `succeeded`, `failed`, `unknown` | Result of a downstream call from the pipeline's perspective. |
 
@@ -230,6 +256,7 @@ in-memory queue.
 | `attempts` | `integer not null default 0` | Counts actual errors only. Expected poll results like `not_ready` do not increment it. |
 | `max_attempts` | `integer not null default 5` | Error limit before the order is marked `failed`. |
 | `next_run_at` | `timestamptz not null` | Earliest time this task can be claimed. Used for retries and future checks. |
+| `deadline_at` | `timestamptz` | Wall-clock deadline for poll tasks such as `check_ready`, after which repeated `not_ready` results become a failure. Initial defaults can be 10 minutes for restaurant readiness and 15 minutes for courier pickup/delivery. |
 | `locked_by` | `text` | Worker id currently holding the lease. |
 | `locked_until` | `timestamptz` | Lease expiry. Defaults to 30 seconds after claim. |
 | `dedupe_key` | `text` | Stable key to prevent duplicate active tasks for the same order/action. |
@@ -241,6 +268,18 @@ in-memory queue.
 Workers claim or reclaim tasks using `SELECT ... FOR UPDATE SKIP LOCKED` where
 `next_run_at <= now()` and either the task is `pending` or it is `running` with
 an expired `locked_until`.
+
+Workers renew `locked_until` while actively processing a task, for example every
+10 seconds. The 30-second lease is the recovery window for crashed workers, not
+the maximum allowed duration of a downstream call.
+
+Poll tasks treat expected results such as `not_ready` as successful checks:
+they update `next_run_at` without incrementing `attempts`. If `now() >=
+deadline_at`, the poll is converted into a real failure and the order moves to
+`failed`.
+
+When an order is cancelled, pending tasks for that order are marked
+`cancelled` in the same transaction as the order state change.
 
 Key indexes:
 
@@ -274,6 +313,13 @@ connection drops after the simulator processed a request, the retry uses the sam
 key and receives the original result instead of creating a second dispatch or
 confirmation.
 
+Workers write this table with `INSERT ... ON CONFLICT (idempotency_key) DO
+UPDATE`. If the existing row is `succeeded`, the worker skips the downstream HTTP
+call and uses the stored result to advance the order. If the row is `started`,
+`unknown`, or `failed`, the worker retries the downstream call with the same
+idempotency key. A `request_hash` mismatch is treated as a programming error and
+fails the task.
+
 Key indexes:
 
 - Unique index on `idempotency_key`.
@@ -294,6 +340,21 @@ when it is idle and holding no task.
 
 The dashboard counts active workers as rows with `last_seen_at` within the last
 30 seconds.
+
+### Simulator Support Tables
+
+These tables belong to `downstream-sim`, not the core platform. They make the
+simulator restart-safe enough that idempotency still holds if the simulator
+container is restarted during a demo.
+
+| Table | Purpose |
+| --- | --- |
+| `sim_idempotency_records` | Stores the first response for each downstream idempotency key and returns it on duplicate calls. |
+| `sim_restaurant_orders` | Stores simulated restaurant state such as confirmed, preparing, and `ready_at`. |
+| `sim_courier_deliveries` | Stores simulated courier state such as dispatched, `pickup_at`, and `delivered_at`. |
+
+The platform still treats `orders` as authoritative. Simulator tables only model
+external systems and their idempotent responses.
 
 ### Initial Tables Not Needed
 
