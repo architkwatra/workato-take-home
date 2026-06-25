@@ -118,6 +118,7 @@ Scope:
 - Add `orders`.
 - Add `order_events`.
 - Add `order_tasks`.
+- Add `workers`, because worker heartbeat depends on this table in PR 6.
 - Add indexes and constraints needed for idempotency and basic dashboard reads.
 
 Out of scope:
@@ -133,7 +134,7 @@ docker compose up --build
 docker compose exec postgres psql -U app -d orders -c "\dt"
 ```
 
-Expected: order intake tables exist after migrations.
+Expected: order intake and worker heartbeat tables exist after migrations.
 
 ### PR 4: `POST /orders` With Idempotency
 
@@ -153,10 +154,14 @@ Acceptance checks:
 
 ```bash
 curl -i -X POST http://localhost:8080/orders \
-  -H 'Idempotency-Key: demo-order-1'
+  -H 'Idempotency-Key: demo-order-1' \
+  -H 'content-type: application/json' \
+  -d '{"restaurant_ref":"restaurant-1","customer_ref":"customer-1"}'
 
 curl -i -X POST http://localhost:8080/orders \
-  -H 'Idempotency-Key: demo-order-1'
+  -H 'Idempotency-Key: demo-order-1' \
+  -H 'content-type: application/json' \
+  -d '{"restaurant_ref":"restaurant-1","customer_ref":"customer-1"}'
 ```
 
 Expected:
@@ -166,7 +171,32 @@ Expected:
 - Both responses contain the same order id.
 - Database has one order, one creation event, and one initial task for that key.
 
-### PR 5: Basic Worker Loop Without Downstream Calls
+### PR 5: `downstream_calls` Crash-Recovery Table
+
+Goal: add the pipeline-side idempotency table before any downstream simulator
+behavior depends on it.
+
+Scope:
+
+- Add `downstream_calls`.
+- Add `downstream_action` and `downstream_call_status` enums if not already
+  present.
+- Add unique constraint on `idempotency_key`.
+- Add helper code or tests for `INSERT ... ON CONFLICT (idempotency_key) DO
+  UPDATE` semantics.
+
+Out of scope:
+
+- Real downstream HTTP calls.
+- Restaurant/courier simulator behavior.
+
+Acceptance checks:
+
+- Insert a downstream call with an idempotency key.
+- Upsert the same key again and verify it updates/reuses the existing row.
+- Verify a mismatched `request_hash` is treated as an error path.
+
+### PR 6: Basic Worker Loop Without Downstream Calls
 
 Goal: prove task claiming and lifecycle movement before adding external
 complexity.
@@ -188,7 +218,6 @@ Acceptance checks:
 
 ### Later PRs
 
-- Add `downstream_calls` and downstream idempotency handling.
 - Add durable simulator support tables.
 - Add restaurant simulator behavior.
 - Add courier simulator behavior.
