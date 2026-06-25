@@ -40,6 +40,84 @@ setup understandable.
 6. Workers append events and notify the API.
 7. The API pushes live updates to the dashboard.
 
+## Data Flow Examples
+
+### Example 1: Normal Order
+
+1. `loadgen` sends `POST /orders` with a client-generated idempotency key.
+2. `api` creates an `orders` row in `placed`, appends an `order_created` event,
+   and inserts the first `order_tasks` row.
+3. A `worker` claims the task, calls `downstream-sim` to confirm with the
+   restaurant, then updates the order from `placed -> confirmed`.
+4. The worker inserts the next task to start preparation. After preparation
+   starts, it schedules a future `check_ready` task and releases its lease.
+5. Later, a worker claims `check_ready`. If the simulator says `not_ready`, the
+   task is rescheduled without incrementing error attempts. If it says `ready`,
+   the order moves to `ready`.
+6. A worker dispatches a courier through the simulator and moves the order to
+   `out_for_delivery`.
+7. Future `check_pickup` and `check_delivery` tasks model courier progress. A
+   pickup creates a `courier_picked_up` milestone event while the order remains
+   `out_for_delivery`; delivery moves the order to `delivered`.
+
+At each meaningful step, the worker appends an `order_events` row and sends a
+lightweight Postgres notification. The API receives the notification, fetches
+fresh state, and updates the dashboard.
+
+### Example 2: Cancellation During a Downstream Call
+
+1. A worker reads an order in `placed` with `version = 3` and calls the
+   restaurant confirmation endpoint.
+2. Before the downstream response returns, the order is cancelled through the
+   API. Postgres updates the order to `cancelled` and increments `version` to
+   `4`.
+3. The restaurant simulator later returns a successful confirmation to the
+   worker.
+4. The worker tries to apply the result with a guarded update:
+   `WHERE state = 'placed' AND version = 3`.
+5. The update affects zero rows because the order is now `cancelled` with
+   `version = 4`.
+6. The worker treats the downstream response as stale, does not enqueue the next
+   task, and the order remains `cancelled`.
+
+In this case the simulator may have an internal record saying the restaurant
+confirmed the order, but the pipeline does not continue. Postgres order state is
+authoritative for the platform. In a production system, this is where a
+compensating restaurant/courier cancellation would be sent; for the demo, stale
+acks are ignored and terminal order state wins.
+
+## Downstream Simulator
+
+`downstream-sim` is one local service that logically behaves like two external
+systems: restaurant and courier. It exists to force the pipeline to handle real
+network boundaries, latency, rate limits, failures, and uncertain responses.
+
+It exposes three groups of endpoints:
+
+- Restaurant endpoints: confirm order, start preparation, check readiness.
+- Courier endpoints: dispatch courier, check pickup, check delivery.
+- Admin endpoints: change latency, error rate, rate-limit behavior, and reset
+  behavior.
+
+The simulator stores runtime state for the fake external systems:
+
+- Restaurant order state, such as confirmed/preparing/ready time.
+- Courier delivery state, such as dispatched/picked-up/delivered time.
+- Idempotency results keyed by the idempotency key passed by the worker.
+- Current failure settings for restaurant and courier behavior.
+
+For the first implementation, this simulator state can be in memory. The
+pipeline's durable source of truth is still Postgres, not the simulator. The
+demo should use simulator admin controls to degrade/recover behavior rather than
+restarting the simulator container. If restart resilience for the simulator
+becomes part of the demo, its state should move to Postgres or a small local
+store with a volume.
+
+The simulator must honor idempotency keys. If a worker retries
+`courier_dispatch:{order_id}` after a timeout or dropped connection, the
+simulator returns the existing dispatch result instead of creating another
+courier dispatch.
+
 ## Correctness Approach
 
 The pipeline assumes at-least-once processing. Correctness comes from:
