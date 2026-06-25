@@ -146,9 +146,9 @@ High-level tables:
 
 - `orders`: current state, customer/restaurant/courier metadata, timestamps,
   version, terminal reason.
-- `order_events`: append-only history of transitions with `from_state`,
-  `to_state`, `occurred_at`, and metadata, so stage duration can be computed
-  from consecutive events.
+- `order_events`: append-only history of state transitions and milestone events
+  with `event_type`, optional `from_state`/`to_state`, `occurred_at`, and
+  metadata, so stage duration can be computed from consecutive events.
 - `order_tasks`: durable work queue with order id, target stage, attempts,
   status, next run time, lease owner, lease expiry, and `task_type` such as
   `advance_state`, `check_ready`, `check_pickup`, or `check_delivery`.
@@ -195,8 +195,9 @@ Important downstream handoffs:
   either advance `preparing -> ready` or reschedule another check without
   incrementing attempts.
 - Courier simulator: assignment advances `ready -> out_for_delivery` and inserts
-  a future `check_pickup` task. Pickup records an event inside
-  `out_for_delivery` and schedules `check_delivery`; delivery advances
+  a future `check_pickup` task. When pickup happens, the worker appends a
+  `courier_picked_up` milestone event while the order state remains
+  `out_for_delivery`, then schedules `check_delivery`; delivery advances
   `out_for_delivery -> delivered`.
 
 ## Dashboard
@@ -294,9 +295,9 @@ console, build a few focused product touches:
 
 - Chaos controls in the dashboard for restaurant failures, courier rate limits,
   downstream latency, and recovery.
-- Per-stage p95 latency from `order_events`; pickup is an event inside
-  `out_for_delivery`, so its timing is computed from event timestamps rather
-  than state-entry/state-exit pairs.
+- Per-stage p95 latency from `order_events`; pickup is a milestone event while
+  the order state remains `out_for_delivery`, so its timing is computed from
+  event timestamps rather than state-entry/state-exit pairs.
 - Stuck-order highlighting for orders that have not moved in more than a
   configurable threshold.
 - A live delivery ETA estimate that updates from current queue depth and recent
