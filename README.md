@@ -6,6 +6,26 @@ live operations visibility, and failure recovery.
 
 See [Design Doc](docs/design.md) for the high-level system design.
 
+## Current Scaffold
+
+The repository currently contains the first runnable slice: Docker Compose plus
+empty service frames. These containers start and expose basic health/status
+responses, but the order pipeline logic is not implemented yet.
+
+Run:
+
+```bash
+docker compose up --build
+```
+
+Services:
+
+- API: `http://localhost:8080/healthz`
+- Downstream simulator: `http://localhost:8081/healthz`
+- Load generator: `http://localhost:8082/healthz`
+- Dashboard: `http://localhost:3000`
+- Postgres: `localhost:5432`
+
 ## What the System Should Prove
 
 The goal is not to build a perfect production platform. The goal is to show a

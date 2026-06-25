@@ -1,0 +1,119 @@
+name: workato-take-home
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: orders
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d orders"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: ./backend
+    command: uvicorn api.app:app --host 0.0.0.0 --port 8000
+    environment:
+      SERVICE_NAME: api
+      DATABASE_URL: postgresql://app:app@postgres:5432/orders
+    ports:
+      - "8080:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  downstream-sim:
+    build:
+      context: ./backend
+    command: uvicorn downstream_sim.app:app --host 0.0.0.0 --port 8000
+    environment:
+      SERVICE_NAME: downstream-sim
+      DATABASE_URL: postgresql://app:app@postgres:5432/orders
+    ports:
+      - "8081:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  loadgen:
+    build:
+      context: ./backend
+    command: uvicorn loadgen.app:app --host 0.0.0.0 --port 8000
+    environment:
+      SERVICE_NAME: loadgen
+      API_BASE_URL: http://api:8000
+    ports:
+      - "8082:8000"
+    depends_on:
+      api:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  worker:
+    build:
+      context: ./backend
+    command: python -m worker.main
+    environment:
+      SERVICE_NAME: worker
+      DATABASE_URL: postgresql://app:app@postgres:5432/orders
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      replicas: 3
+
+  dashboard:
+    build:
+      context: ./frontend
+    command: npm run dev -- --host 0.0.0.0
+    environment:
+      VITE_API_BASE_URL: http://localhost:8080
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_started
+
+volumes:
+  postgres_data:
+
