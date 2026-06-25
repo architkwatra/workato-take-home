@@ -4,7 +4,8 @@ This project will model a food-delivery order pipeline from `placed` to
 `delivered`, including bursty traffic, flaky restaurant/courier integrations,
 live operations visibility, and failure recovery.
 
-See [Design Doc](docs/design.md) for the high-level system design.
+See [Design Doc](docs/design.md) for the high-level system design and
+[Implementation Plan](docs/implementation-plan.md) for the next build slices.
 
 ## Current Scaffold
 
