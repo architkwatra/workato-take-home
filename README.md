@@ -4,6 +4,8 @@ This project will model a food-delivery order pipeline from `placed` to
 `delivered`, including bursty traffic, flaky restaurant/courier integrations,
 live operations visibility, and failure recovery.
 
+See [Design Doc](docs/design.md) for the high-level system design.
+
 ## What the System Should Prove
 
 The goal is not to build a perfect production platform. The goal is to show a
