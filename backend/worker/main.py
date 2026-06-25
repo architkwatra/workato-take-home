@@ -13,10 +13,12 @@ logger = logging.getLogger("worker")
 
 
 async def run_worker() -> None:
+    """Run the idle worker process until it receives a shutdown signal."""
     worker_id = os.getenv("WORKER_ID", socket.gethostname())
     stop_event = asyncio.Event()
 
     def request_stop() -> None:
+        """Ask the async worker loop to exit after SIGINT or SIGTERM."""
         logger.info("shutdown requested", extra={"worker_id": worker_id})
         stop_event.set()
 
@@ -37,9 +39,9 @@ async def run_worker() -> None:
 
 
 def main() -> None:
+    """Start the worker scaffold from the module entrypoint."""
     asyncio.run(run_worker())
 
 
 if __name__ == "__main__":
     main()
-

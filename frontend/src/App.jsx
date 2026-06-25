@@ -1,5 +1,8 @@
 import "./styles.css";
 
+/**
+ * Renders the placeholder dashboard shell until live pipeline views are added.
+ */
 export default function App() {
   return (
     <main className="shell">
@@ -14,4 +17,3 @@ export default function App() {
     </main>
   );
 }
-
