@@ -248,7 +248,8 @@ Goal: make realistic order volume controllable while the system is running.
 Why now:
 
 - `POST /orders` now creates the full intake contract: one order, one
-  `order_created` event, and one initial `advance_state -> confirmed` task.
+  `order_created` event, and one initial pending task with
+  `task_type = advance_state` and `target_state = confirmed`.
 - Loadgen can test 1-N order intake before workers and downstream simulators add
   more moving parts.
 - The original requirement says evaluators should be able to dial load up and
@@ -288,11 +289,16 @@ Out of scope:
   profiles can be added later.
 - Retrying failed generated requests. The API idempotency behavior is already
   tested directly; loadgen should surface failures rather than hide them.
+- Horizontal loadgen scaling. This take-home should use one loadgen service; to
+  create more traffic, increase `rate_per_second` instead of adding replicas.
 
 Design notes:
 
 - Loadgen must be a long-running service so rate can be changed while it is
   running.
+- The initial `advance_state -> confirmed` row is a durable task, not an order
+  state. Loadgen only verifies the task is created. A later worker slice will
+  claim that task and move the order from `placed` to `confirmed`.
 - The background producer should use `asyncio` and an async HTTP client so it can
   issue requests without blocking the loadgen API.
 - `POST /load/start` starts a new run only when no run is active. If a run is
@@ -313,9 +319,8 @@ Design notes:
   number, for example `loadgen-{run_id}-{sequence}`. This makes generated
   traffic easy to query in Postgres and avoids accidental key reuse across
   start/stop/start cycles.
-- Keep the first implementation single-process/in-memory because Docker Compose
-  runs one loadgen replica. If loadgen is scaled later, each replica needs a
-  unique run/producer identity.
+- Keep loadgen single-process/in-memory and single-replica by design for this
+  assignment. All demo rate control should go through this one service.
 
 Acceptance checks:
 
@@ -353,7 +358,8 @@ Expected:
 - For a completed `max_orders = 10` run, Postgres shows:
   - 10 generated orders for the run id
   - 10 `order_created` events
-  - 10 initial `advance_state -> confirmed` tasks
+  - 10 initial pending tasks with `task_type = advance_state` and
+    `target_state = confirmed`
   - no duplicate orders for generated idempotency keys
 
 ### Slice 6: `downstream_calls` Crash-Recovery Table
