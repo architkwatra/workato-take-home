@@ -5,6 +5,9 @@ Alembic. Migrations intentionally keep their own copy of the enum values so old
 migrations stay self-contained and do not change when application code changes.
 """
 
+# Individual constants avoid spreading raw enum strings across API and worker
+# code. If a state name changes, most application code should only need to
+# update imports, not hunt for string literals.
 ORDER_STATE_PLACED = "placed"  # API accepted the order; downstream work has not started.
 ORDER_STATE_CONFIRMED = "confirmed"  # Restaurant accepted the order.
 ORDER_STATE_PREPARING = "preparing"  # Restaurant is preparing the food.
@@ -14,6 +17,9 @@ ORDER_STATE_DELIVERED = "delivered"  # Customer received the order; terminal suc
 ORDER_STATE_CANCELLED = "cancelled"  # Order was cancelled; terminal stop.
 ORDER_STATE_FAILED = "failed"  # Pipeline could not complete the order; terminal stop.
 
+# Ordered list of all valid order states. This is useful for validation,
+# response schemas, tests, and any UI/API code that needs to enumerate states
+# in the same order the lifecycle normally follows.
 ORDER_STATES = (
     ORDER_STATE_PLACED,
     ORDER_STATE_CONFIRMED,
@@ -25,6 +31,9 @@ ORDER_STATES = (
     ORDER_STATE_FAILED,
 )
 
+# Normal happy-path state machine. Workers use this to decide what the next
+# lifecycle step should be for an `advance_state` task. Terminal and exceptional
+# states are intentionally absent because workers must not auto-advance them.
 ORDER_TRANSITIONS = {
     ORDER_STATE_PLACED: ORDER_STATE_CONFIRMED,
     ORDER_STATE_CONFIRMED: ORDER_STATE_PREPARING,
@@ -33,6 +42,9 @@ ORDER_TRANSITIONS = {
     ORDER_STATE_OUT_FOR_DELIVERY: ORDER_STATE_DELIVERED,
 }
 
+# Terminal states are final from the worker's perspective. A worker that sees an
+# order in one of these states should complete/no-op its task rather than making
+# another downstream call or inserting follow-up work.
 TERMINAL_ORDER_STATES = frozenset(
     {
         ORDER_STATE_DELIVERED,
