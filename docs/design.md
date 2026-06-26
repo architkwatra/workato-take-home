@@ -179,6 +179,12 @@ Postgres is the durable source of truth. Use UUID primary keys, `timestamptz`
 for timestamps, and `jsonb` only for flexible metadata that is not part of core
 query logic.
 
+Code should capture one operation timestamp and write it to logs, events, and
+`updated_at` columns in the same transaction. A Postgres trigger is kept as a
+fallback: if an `UPDATE` does not change `updated_at`, the trigger fills it with
+database time. If the application provides `updated_at`, the trigger preserves
+that value.
+
 ### Enums
 
 | Enum | Values | Purpose |
@@ -186,9 +192,52 @@ query logic.
 | `order_state` | `placed`, `confirmed`, `preparing`, `ready`, `out_for_delivery`, `delivered`, `cancelled`, `failed` | Valid lifecycle states for an order. |
 | `task_type` | `advance_state`, `check_ready`, `check_pickup`, `check_delivery` | What kind of work a worker should perform. |
 | `task_status` | `pending`, `running`, `completed`, `failed`, `cancelled` | Current state of a durable task. |
-| `event_type` | `order_created`, `state_transition`, `courier_picked_up`, `retry_scheduled`, `task_cancelled`, `order_cancelled`, `order_failed` | Timeline events shown in the dashboard. |
+| `event_type` | `order_created`, `state_transition`, `courier_picked_up`, `retry_scheduled`, `order_cancelled`, `order_failed` | Timeline events shown in the dashboard. |
 | `downstream_action` | `restaurant_confirm`, `restaurant_start_prep`, `restaurant_check_ready`, `courier_dispatch`, `courier_check_pickup`, `courier_check_delivery` | Business action sent to a downstream simulator. |
 | `downstream_call_status` | `started`, `succeeded`, `failed`, `unknown` | Result of a downstream call from the pipeline's perspective. |
+
+#### Task Types
+
+`task_type` describes what a worker should do next. It is separate from
+`order_state` because not every unit of work is a direct state transition.
+
+| Task type | Meaning | Why it exists |
+| --- | --- | --- |
+| `advance_state` | Perform the required work for a transition and move the order to `target_state`. | Handles normal lifecycle movement like `placed -> confirmed`. |
+| `check_ready` | Check whether restaurant preparation is complete. | Lets workers release the task between checks instead of blocking during prep time. |
+| `check_pickup` | Check whether the courier has picked up the order. | Captures courier progress while the order remains `out_for_delivery`. |
+| `check_delivery` | Check whether the courier has delivered the order. | Separates delivery waiting time from worker execution time. |
+
+#### Task Statuses
+
+`task_status` describes the durable queue row, not the customer-visible order
+state.
+
+| Status | Meaning | Why it exists |
+| --- | --- | --- |
+| `pending` | Waiting to be claimed after `next_run_at`. | Gives workers a simple query for runnable work. |
+| `running` | Claimed by a worker lease. | Allows crash recovery when `locked_until` expires. |
+| `completed` | Finished successfully or safely no-op'd after a race. | Prevents completed work from being reclaimed. |
+| `failed` | Exhausted real error retries. | Stops endless retries and makes failed work visible. |
+| `cancelled` | Invalidated because the order reached a terminal state. | Removes stale work when an order is cancelled or failed. |
+
+Task cancellation is represented by `order_tasks.status = 'cancelled'`; it does
+not create an `order_events` row or `pg_notify` event. The dashboard only needs
+the customer-visible order event, such as `order_cancelled`.
+
+#### Event Types
+
+`event_type` records customer-visible order history and dashboard milestones.
+Internal queue state stays in `order_tasks`.
+
+| Event type | Meaning |
+| --- | --- |
+| `order_created` | The API accepted a new order. |
+| `state_transition` | The order moved from one lifecycle state to another. |
+| `courier_picked_up` | Courier pickup happened while the order was already `out_for_delivery`. |
+| `retry_scheduled` | A retry was scheduled after a real downstream or worker error. |
+| `order_cancelled` | The order entered the `cancelled` terminal state. |
+| `order_failed` | The order entered the `failed` terminal state. |
 
 ### `orders`
 
@@ -206,7 +255,7 @@ for the live order view.
 | `courier_ref` | `text` | Simulated courier identifier once assigned. |
 | `terminal_reason` | `text` | Human-readable reason for `cancelled` or `failed` orders. |
 | `created_at` | `timestamptz not null` | When the order entered the system. |
-| `updated_at` | `timestamptz not null` | Last state or metadata update. |
+| `updated_at` | `timestamptz not null` | Last state or metadata update; application-set, with DB trigger fallback. |
 | `delivered_at` | `timestamptz` | Set when the order reaches `delivered`. |
 | `cancelled_at` | `timestamptz` | Set when the order reaches `cancelled`. |
 
@@ -256,13 +305,13 @@ in-memory queue.
 | `attempts` | `integer not null default 0` | Counts actual errors only. Expected poll results like `not_ready` do not increment it. |
 | `max_attempts` | `integer not null default 5` | Error limit before the order is marked `failed`. |
 | `next_run_at` | `timestamptz not null` | Earliest time this task can be claimed. Used for retries and future checks. |
-| `deadline_at` | `timestamptz` | Wall-clock deadline for poll tasks such as `check_ready`, after which repeated `not_ready` results become a failure. Initial defaults can be 10 minutes for restaurant readiness and 15 minutes for courier pickup/delivery. |
+| `deadline_at` | `timestamptz` | Wall-clock deadline for poll tasks such as `check_ready`; null for one-shot `advance_state` tasks. |
 | `locked_by` | `text` | Worker id currently holding the lease. |
 | `locked_until` | `timestamptz` | Lease expiry. Defaults to 30 seconds after claim. |
 | `dedupe_key` | `text` | Stable key to prevent duplicate active tasks for the same order/action. |
 | `last_error` | `text` | Most recent error for debugging and dashboard display. |
 | `created_at` | `timestamptz not null` | Task creation time. |
-| `updated_at` | `timestamptz not null` | Last task update. |
+| `updated_at` | `timestamptz not null` | Last task update; application-set, with DB trigger fallback. |
 | `completed_at` | `timestamptz` | Set when the task completes. |
 
 Workers claim or reclaim tasks using `SELECT ... FOR UPDATE SKIP LOCKED` where
@@ -277,6 +326,12 @@ Poll tasks treat expected results such as `not_ready` as successful checks:
 they update `next_run_at` without incrementing `attempts`. If `now() >=
 deadline_at`, the poll is converted into a real failure and the order moves to
 `failed`.
+
+The creator of a poll sequence sets `deadline_at` when creating the first
+`check_ready`, `check_pickup`, or `check_delivery` task. Rescheduling the same
+poll keeps the original deadline so a permanently stuck simulator cannot keep
+an order alive forever. Initial defaults can be 10 minutes for restaurant
+readiness and 15 minutes for courier pickup or delivery.
 
 When an order is cancelled, pending tasks for that order are marked
 `cancelled` in the same transaction as the order state change.
