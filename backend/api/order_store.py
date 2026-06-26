@@ -5,6 +5,7 @@ from uuid import uuid4
 from psycopg.rows import dict_row
 
 from common.db import open_db_connection
+from common.event_types import EVENT_TYPE_ORDER_CREATED
 from common.state_machine import ORDER_STATE_PLACED
 
 
@@ -55,6 +56,29 @@ def create_or_get_order(
                 )
                 inserted_order = cur.fetchone()
                 if inserted_order is not None:
+                    # The creation event is inserted in the same transaction as
+                    # the order so the audit timeline cannot miss accepted
+                    # orders. Duplicate idempotency requests skip this path, so
+                    # they do not create duplicate events.
+                    cur.execute(
+                        """
+                        insert into order_events (
+                            id,
+                            order_id,
+                            event_type,
+                            to_state,
+                            occurred_at
+                        )
+                        values (%s, %s, %s::event_type, %s::order_state, %s)
+                        """,
+                        (
+                            uuid4(),
+                            order_id,
+                            EVENT_TYPE_ORDER_CREATED,
+                            ORDER_STATE_PLACED,
+                            created_at,
+                        ),
+                    )
                     return dict(inserted_order), True
 
                 cur.execute(
