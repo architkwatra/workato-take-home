@@ -43,10 +43,19 @@ EVENT_TYPES = (
     "state_transition",
     "courier_picked_up",
     "retry_scheduled",
-    "task_cancelled",
     "order_cancelled",
     "order_failed",
 )
+
+TOUCH_UPDATED_AT_FUNCTION = """
+CREATE OR REPLACE FUNCTION touch_updated_at()
+RETURNS trigger AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql
+"""
 
 
 def upgrade() -> None:
@@ -90,7 +99,15 @@ def upgrade() -> None:
         sa.Column("attempts", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("max_attempts", sa.Integer(), nullable=False, server_default="5"),
         sa.Column("next_run_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("deadline_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column(
+            "deadline_at",
+            sa.DateTime(timezone=True),
+            nullable=True,
+            comment=(
+                "Wall-clock cutoff for poll tasks; when expired, repeated "
+                "not-ready responses become a real task failure."
+            ),
+        ),
         sa.Column("locked_by", sa.Text(), nullable=True),
         sa.Column("locked_until", sa.DateTime(timezone=True), nullable=True),
         sa.Column("dedupe_key", sa.Text(), nullable=True),
@@ -106,6 +123,7 @@ def upgrade() -> None:
             sa.DateTime(timezone=True),
             nullable=False,
             server_default=sa.text("now()"),
+            comment="Maintained by the touch_updated_at trigger on each update.",
         ),
         sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
         sa.CheckConstraint(
@@ -131,6 +149,23 @@ def upgrade() -> None:
         postgresql_where=sa.text(
             "dedupe_key is not null and status in ('pending', 'running')"
         ),
+    )
+    op.execute(TOUCH_UPDATED_AT_FUNCTION)
+    op.execute(
+        """
+        CREATE TRIGGER trg_orders_touch_updated_at
+        BEFORE UPDATE ON orders
+        FOR EACH ROW
+        EXECUTE FUNCTION touch_updated_at()
+        """
+    )
+    op.execute(
+        """
+        CREATE TRIGGER trg_order_tasks_touch_updated_at
+        BEFORE UPDATE ON order_tasks
+        FOR EACH ROW
+        EXECUTE FUNCTION touch_updated_at()
+        """
     )
 
     op.create_table(
@@ -206,6 +241,10 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     """Drop order intake support tables and their enums."""
+    op.execute("DROP TRIGGER IF EXISTS trg_order_tasks_touch_updated_at ON order_tasks")
+    op.execute("DROP TRIGGER IF EXISTS trg_orders_touch_updated_at ON orders")
+    op.execute("DROP FUNCTION IF EXISTS touch_updated_at()")
+
     op.drop_index("ix_workers_last_seen_at", table_name="workers")
     op.drop_table("workers")
 
