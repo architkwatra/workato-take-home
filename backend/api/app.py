@@ -1,15 +1,32 @@
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime
+from typing import Any
 
 import psycopg
 from fastapi import FastAPI, Header, HTTPException, Response, status
 from pydantic import BaseModel, Field
 
 from api.order_store import create_or_get_order
-from common.db import DatabaseConfigError, check_database_ready
+from common.db import (
+    DatabaseConfigError,
+    check_database_ready,
+    close_db_pool,
+    configure_db_pool,
+)
 
 
-app = FastAPI(title="Order Pipeline API")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Open the sync DB pool once per API process and close it on shutdown."""
+    configure_db_pool()
+    try:
+        yield
+    finally:
+        close_db_pool()
+
+
+app = FastAPI(title="Order Pipeline API", lifespan=lifespan)
 
 
 class CreateOrderRequest(BaseModel):
@@ -32,13 +49,13 @@ class OrderResponse(BaseModel):
 
 
 @app.get("/healthz")
-async def healthz() -> dict[str, str]:
+def healthz() -> dict[str, str]:
     """Report that the API process is alive and able to serve requests."""
     return {"status": "ok", "service": os.getenv("SERVICE_NAME", "api")}
 
 
 @app.get("/readyz")
-async def readyz() -> dict[str, object]:
+def readyz() -> dict[str, object]:
     """Report API readiness by checking the Postgres connection."""
     try:
         check_database_ready()
@@ -55,17 +72,17 @@ async def readyz() -> dict[str, object]:
 
 
 @app.get("/")
-async def root() -> dict[str, str]:
+def root() -> dict[str, str]:
     """Return a simple scaffold response for humans hitting the API root."""
     return {"message": "Order Pipeline API scaffold"}
 
 
 @app.post("/orders", response_model=OrderResponse)
-async def create_order(
+def create_order(
     request: CreateOrderRequest,
     response: Response,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-) -> dict[str, object]:
+) -> dict[str, Any]:
     """Create an order once, returning the existing row on duplicate submits."""
     cleaned_key = idempotency_key.strip() if idempotency_key else ""
     if not cleaned_key:

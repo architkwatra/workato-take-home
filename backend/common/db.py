@@ -1,10 +1,16 @@
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import psycopg
+from psycopg_pool import ConnectionPool
 
 
 class DatabaseConfigError(RuntimeError):
     """Raised when a service needs Postgres but DATABASE_URL is missing."""
+
+
+_db_pool: ConnectionPool | None = None
 
 
 def get_database_url() -> str:
@@ -15,9 +21,68 @@ def get_database_url() -> str:
     return database_url
 
 
-def open_db_connection(*, connect_timeout: int = 2):
-    """Open a short-lived psycopg connection using the service DATABASE_URL."""
-    return psycopg.connect(get_database_url(), connect_timeout=connect_timeout)
+def _read_pool_size(env_name: str, default: int) -> int:
+    """Read a positive integer pool size from the environment."""
+    raw_value = os.getenv(env_name)
+    if raw_value is None:
+        return default
+
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise DatabaseConfigError(f"{env_name} must be an integer") from exc
+
+    if value <= 0:
+        raise DatabaseConfigError(f"{env_name} must be greater than zero")
+
+    return value
+
+
+def configure_db_pool(*, connect_timeout: int = 2) -> None:
+    """Create the process-wide Postgres connection pool for API request traffic."""
+    global _db_pool
+    if _db_pool is not None:
+        return
+
+    min_size = _read_pool_size("DATABASE_POOL_MIN_SIZE", 1)
+    max_size = _read_pool_size("DATABASE_POOL_MAX_SIZE", 10)
+    if min_size > max_size:
+        raise DatabaseConfigError(
+            "DATABASE_POOL_MIN_SIZE cannot exceed DATABASE_POOL_MAX_SIZE"
+        )
+
+    pool = ConnectionPool(
+        conninfo=get_database_url(),
+        min_size=min_size,
+        max_size=max_size,
+        kwargs={"connect_timeout": connect_timeout},
+        open=False,
+    )
+    pool.open()
+    pool.wait(timeout=connect_timeout)
+    _db_pool = pool
+
+
+def close_db_pool() -> None:
+    """Close the process-wide Postgres connection pool during service shutdown."""
+    global _db_pool
+    if _db_pool is None:
+        return
+
+    _db_pool.close()
+    _db_pool = None
+
+
+@contextmanager
+def open_db_connection(*, connect_timeout: int = 2) -> Iterator[psycopg.Connection]:
+    """Yield a Postgres connection from the pool, falling back to direct connect."""
+    if _db_pool is not None:
+        with _db_pool.connection() as conn:
+            yield conn
+        return
+
+    with psycopg.connect(get_database_url(), connect_timeout=connect_timeout) as conn:
+        yield conn
 
 
 def check_database_ready() -> None:
