@@ -57,16 +57,19 @@ If Compose fails, fix the scaffold before starting database or API work.
 Build idempotent order intake:
 
 - Add migration bootstrap.
-- Add minimal schema required for order intake.
+- Add the first real schema table through Alembic.
 - Add a real DB readiness check.
 - Add `POST /orders` with idempotency.
 
 The first meaningful behavior should be independently testable with only
 Postgres and the API.
 
-## PR Breakdown
+## Implementation Slice Breakdown
 
-### PR 1: Verify and Fix Compose Scaffold
+Each slice should become its own focused PR. Slice numbers are planning order,
+not GitHub PR numbers.
+
+### Slice 1: Verify and Fix Compose Scaffold
 
 Goal: make `docker compose up --build` work reliably from a fresh checkout.
 
@@ -87,7 +90,7 @@ curl http://localhost:8082/healthz
 curl http://localhost:3000
 ```
 
-### PR 2: Migration Bootstrap
+### Slice 2: Migration Bootstrap
 
 Goal: make schema migrations run predictably before the API starts.
 
@@ -95,31 +98,46 @@ Scope:
 
 - Add Alembic config.
 - Add a `migrator` Compose service that runs `alembic upgrade head`.
-- Make API depend on successful migration completion.
-- Add an initial empty migration if useful to validate the path.
+- Make the dependency chain explicit:
+  - `postgres` becomes healthy.
+  - `migrator` runs and exits successfully.
+  - `api` and `worker` start after `migrator` completes successfully.
+- Add the first real migration instead of an empty one. Create `orders` because
+  it has no foreign-key dependencies and validates actual DDL execution.
+- Implement `/readyz` as a real Postgres check using `SELECT 1`.
+- Remove `downstream-sim`'s Postgres dependency until simulator persistence is
+  implemented; it should not block on the DB while it is still a scaffold.
 
 Acceptance checks:
 
 ```bash
 docker compose up --build migrator
-docker compose up --build api postgres
+docker compose up --build api worker postgres
 curl http://localhost:8080/readyz
+docker compose exec postgres psql -U app -d orders -c "\dt orders"
+docker compose exec postgres psql -U app -d orders -c "select * from alembic_version;"
 ```
 
-Expected: API reports Postgres reachable and migrations can run from a clean DB.
+Expected:
 
-### PR 3: Minimal Order Intake Schema
+- `migrator` exits successfully.
+- `api` and `worker` start only after `migrator` completes successfully.
+- `/readyz` reports Postgres reachable.
+- `orders` exists.
+- `alembic_version` is populated.
+
+### Slice 3: Minimal Order Intake Schema
 
 Goal: add the tables needed to create an order and enqueue first work.
 
 Scope:
 
-- Add enums needed for order intake.
-- Add `orders`.
+- Add remaining enums needed for order intake.
 - Add `order_events`.
 - Add `order_tasks`.
-- Add `workers`, because worker heartbeat depends on this table in PR 6.
+- Add `workers`, because worker heartbeat depends on this table in Slice 6.
 - Add indexes and constraints needed for idempotency and basic dashboard reads.
+- Extend `orders` only if Slice 2 kept it intentionally minimal.
 
 Out of scope:
 
@@ -136,7 +154,7 @@ docker compose exec postgres psql -U app -d orders -c "\dt"
 
 Expected: order intake and worker heartbeat tables exist after migrations.
 
-### PR 4: `POST /orders` With Idempotency
+### Slice 4: `POST /orders` With Idempotency
 
 Goal: prove the first correctness rule in isolation.
 
@@ -171,7 +189,7 @@ Expected:
 - Both responses contain the same order id.
 - Database has one order, one creation event, and one initial task for that key.
 
-### PR 5: `downstream_calls` Crash-Recovery Table
+### Slice 5: `downstream_calls` Crash-Recovery Table
 
 Goal: add the pipeline-side idempotency table before any downstream simulator
 behavior depends on it.
@@ -196,7 +214,7 @@ Acceptance checks:
 - Upsert the same key again and verify it updates/reuses the existing row.
 - Verify a mismatched `request_hash` is treated as an error path.
 
-### PR 6: Basic Worker Loop Without Downstream Calls
+### Slice 6: Basic Worker Loop Without Downstream Calls
 
 Goal: prove task claiming and lifecycle movement before adding external
 complexity.
@@ -216,7 +234,7 @@ Acceptance checks:
 - Verify orders advance through the fake lifecycle.
 - Verify queue depth drains.
 
-### Later PRs
+### Later Slices
 
 - Add durable simulator support tables.
 - Add restaurant simulator behavior.
