@@ -18,18 +18,25 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
+# Task types describe the unit of work a worker should execute. They are
+# separate from order states because some work is a delayed check, not an
+# immediate lifecycle transition.
 TASK_TYPES = (
-    "advance_state",
-    "check_ready",
-    "check_pickup",
-    "check_delivery",
+    "advance_state",  # Move the order to target_state after required work succeeds.
+    "check_ready",  # Poll restaurant prep without blocking a worker between checks.
+    "check_pickup",  # Poll courier pickup progress while order stays out_for_delivery.
+    "check_delivery",  # Poll courier delivery progress until the order can be delivered.
 )
+
+# Task statuses track the durable queue row, not the customer-visible order
+# state. Workers use these values to find runnable work, recover expired leases,
+# and avoid retrying work that is already terminal.
 TASK_STATUSES = (
-    "pending",
-    "running",
-    "completed",
-    "failed",
-    "cancelled",
+    "pending",  # Runnable later; worker may claim it when next_run_at is due.
+    "running",  # Claimed by a worker lease; reclaimable after locked_until expires.
+    "completed",  # Finished successfully or safely no-op'd after a race.
+    "failed",  # Exhausted real error retries and should not be claimed again.
+    "cancelled",  # Invalidated because the order moved to a terminal state.
 )
 EVENT_TYPES = (
     "order_created",
@@ -75,6 +82,10 @@ def upgrade() -> None:
             "status",
             postgresql.ENUM(name="task_status", create_type=False),
             nullable=False,
+            comment=(
+                "Durable queue status: pending is claimable, running is leased, "
+                "completed/failed/cancelled are terminal for the task row."
+            ),
         ),
         sa.Column("attempts", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("max_attempts", sa.Integer(), nullable=False, server_default="5"),

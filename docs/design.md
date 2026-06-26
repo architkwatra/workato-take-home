@@ -190,6 +190,31 @@ query logic.
 | `downstream_action` | `restaurant_confirm`, `restaurant_start_prep`, `restaurant_check_ready`, `courier_dispatch`, `courier_check_pickup`, `courier_check_delivery` | Business action sent to a downstream simulator. |
 | `downstream_call_status` | `started`, `succeeded`, `failed`, `unknown` | Result of a downstream call from the pipeline's perspective. |
 
+#### Task Types
+
+`task_type` describes what a worker should do next. It is separate from
+`order_state` because not every unit of work is a direct state transition.
+
+| Task type | Meaning | Why it exists |
+| --- | --- | --- |
+| `advance_state` | Perform the required work for a transition and move the order to `target_state`. | Handles normal lifecycle movement like `placed -> confirmed`. |
+| `check_ready` | Check whether restaurant preparation is complete. | Lets workers release the task between checks instead of blocking during prep time. |
+| `check_pickup` | Check whether the courier has picked up the order. | Captures courier progress while the order remains `out_for_delivery`. |
+| `check_delivery` | Check whether the courier has delivered the order. | Separates delivery waiting time from worker execution time. |
+
+#### Task Statuses
+
+`task_status` describes the durable queue row, not the customer-visible order
+state.
+
+| Status | Meaning | Why it exists |
+| --- | --- | --- |
+| `pending` | Waiting to be claimed after `next_run_at`. | Gives workers a simple query for runnable work. |
+| `running` | Claimed by a worker lease. | Allows crash recovery when `locked_until` expires. |
+| `completed` | Finished successfully or safely no-op'd after a race. | Prevents completed work from being reclaimed. |
+| `failed` | Exhausted real error retries. | Stops endless retries and makes failed work visible. |
+| `cancelled` | Invalidated because the order reached a terminal state. | Removes stale work when an order is cancelled or failed. |
+
 ### `orders`
 
 Stores the current state of each order. This is the table the dashboard reads
