@@ -179,8 +179,11 @@ Postgres is the durable source of truth. Use UUID primary keys, `timestamptz`
 for timestamps, and `jsonb` only for flexible metadata that is not part of core
 query logic.
 
-Rows with `updated_at` are maintained by a Postgres trigger, not by relying on
-each application `UPDATE` statement to remember `updated_at = now()`.
+Code should capture one operation timestamp and write it to logs, events, and
+`updated_at` columns in the same transaction. A Postgres trigger is kept as a
+fallback: if an `UPDATE` does not change `updated_at`, the trigger fills it with
+database time. If the application provides `updated_at`, the trigger preserves
+that value.
 
 ### Enums
 
@@ -252,7 +255,7 @@ for the live order view.
 | `courier_ref` | `text` | Simulated courier identifier once assigned. |
 | `terminal_reason` | `text` | Human-readable reason for `cancelled` or `failed` orders. |
 | `created_at` | `timestamptz not null` | When the order entered the system. |
-| `updated_at` | `timestamptz not null` | Last state or metadata update; maintained by DB trigger. |
+| `updated_at` | `timestamptz not null` | Last state or metadata update; application-set, with DB trigger fallback. |
 | `delivered_at` | `timestamptz` | Set when the order reaches `delivered`. |
 | `cancelled_at` | `timestamptz` | Set when the order reaches `cancelled`. |
 
@@ -308,7 +311,7 @@ in-memory queue.
 | `dedupe_key` | `text` | Stable key to prevent duplicate active tasks for the same order/action. |
 | `last_error` | `text` | Most recent error for debugging and dashboard display. |
 | `created_at` | `timestamptz not null` | Task creation time. |
-| `updated_at` | `timestamptz not null` | Last task update; maintained by DB trigger. |
+| `updated_at` | `timestamptz not null` | Last task update; application-set, with DB trigger fallback. |
 | `completed_at` | `timestamptz` | Set when the task completes. |
 
 Workers claim or reclaim tasks using `SELECT ... FOR UPDATE SKIP LOCKED` where

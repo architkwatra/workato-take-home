@@ -51,7 +51,9 @@ TOUCH_UPDATED_AT_FUNCTION = """
 CREATE OR REPLACE FUNCTION touch_updated_at()
 RETURNS trigger AS $$
 BEGIN
-    NEW.updated_at = now();
+    IF NEW.updated_at IS NOT DISTINCT FROM OLD.updated_at THEN
+        NEW.updated_at = now();
+    END IF;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql
@@ -123,7 +125,10 @@ def upgrade() -> None:
             sa.DateTime(timezone=True),
             nullable=False,
             server_default=sa.text("now()"),
-            comment="Maintained by the touch_updated_at trigger on each update.",
+            comment=(
+                "Application should set this per update; touch_updated_at fills "
+                "it if the update omits it."
+            ),
         ),
         sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
         sa.CheckConstraint(
