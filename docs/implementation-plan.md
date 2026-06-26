@@ -3,43 +3,35 @@
 This document captures the next implementation slices so the plan survives
 between sessions.
 
-## Current Branch
+## Working Rules
 
 Work should happen on feature branches created from latest `origin/main`. Do not
 push implementation work directly to `main`.
 
-Current planning branch:
-
-```bash
-plan/order-intake-slices
-```
-
 ## Compose Validation Checkpoint
 
-Attempted local validation from this branch:
+Local Compose validation has passed after the scaffold and schema PRs:
 
 ```bash
-docker --version
 docker compose version
-docker compose config
-```
-
-Result in the current execution environment:
-
-```text
-docker: command not found
-```
-
-This means Docker Compose has not been verified here yet. Before implementing
-pipeline logic, run these commands on a machine with Docker installed:
-
-```bash
 docker compose config
 docker compose up --build
 curl http://localhost:8080/healthz
+curl http://localhost:8080/readyz
 curl http://localhost:8081/healthz
 curl http://localhost:8082/healthz
 curl http://localhost:3000
+```
+
+Database validation has also passed:
+
+```bash
+docker compose exec postgres psql -U app -d orders -c "select * from alembic_version;"
+docker compose exec postgres psql -U app -d orders -c "\dt"
+docker compose exec postgres psql -U app -d orders -c "\d orders"
+docker compose exec postgres psql -U app -d orders -c "\d order_tasks"
+docker compose exec postgres psql -U app -d orders -c "\d order_events"
+docker compose exec postgres psql -U app -d orders -c "\d workers"
 ```
 
 Expected result:
@@ -49,20 +41,14 @@ Expected result:
 - API, downstream simulator, loadgen, worker replicas, and dashboard start.
 - Health endpoints return `{"status":"ok", ...}`.
 - Dashboard renders the scaffold page.
-
-If Compose fails, fix the scaffold before starting database or API work.
+- Alembic version is `20260625_0002`.
+- Tables exist: `orders`, `order_tasks`, `order_events`, and `workers`.
+- `updated_at` fallback triggers exist on `orders` and `order_tasks`.
 
 ## Next Target
 
-Build idempotent order intake:
-
-- Add migration bootstrap.
-- Add the first real schema table through Alembic.
-- Add a real DB readiness check.
-- Add `POST /orders` with idempotency.
-
-The first meaningful behavior should be independently testable with only
-Postgres and the API.
+Build idempotent order intake. Keep this split into small PRs so each step is
+independently reviewable and testable.
 
 ## Implementation Slice Breakdown
 
@@ -158,15 +144,40 @@ Expected: order intake and worker heartbeat tables exist after migrations.
 
 Goal: prove the first correctness rule in isolation.
 
+Break this into smaller quick PRs:
+
+#### Slice 4A: API Foundation
+
+Scope:
+
+- Add shared DB connection/readiness helpers.
+- Add shared order lifecycle constants and transition helpers.
+- Keep existing API behavior unchanged except reusing the DB helper in
+  `/readyz`.
+
+Acceptance checks:
+
+```bash
+python3 -m py_compile backend/common/db.py backend/common/state_machine.py backend/api/app.py
+curl http://localhost:8080/readyz
+```
+
+Expected:
+
+- Compile succeeds.
+- `/readyz` still returns Postgres healthy.
+
+#### Slice 4B: Create Order Only
+
 Scope:
 
 - Implement `POST /orders`.
 - Read idempotency key from `Idempotency-Key` header.
-- First request creates:
-  - one `orders` row in `placed`
-  - one `order_created` event
-  - one initial `order_tasks` row
+- Validate request body with required `restaurant_ref` and optional
+  `customer_ref`.
+- First request creates one `orders` row in `placed`.
 - Duplicate request with the same key returns the existing order.
+- Do not create `order_events` or `order_tasks` yet.
 
 Acceptance checks:
 
@@ -187,7 +198,48 @@ Expected:
 - First response: `201 Created`.
 - Second response: `200 OK`.
 - Both responses contain the same order id.
-- Database has one order, one creation event, and one initial task for that key.
+- Database has one order for that idempotency key.
+
+#### Slice 4C: Add Creation Event
+
+Scope:
+
+- Insert one `order_created` row in the same transaction as the new order.
+- Duplicate requests must not create another event.
+
+Acceptance checks:
+
+- First create produces one order and one creation event.
+- Duplicate create returns the existing order and event count stays one.
+
+#### Slice 4D: Add Initial Task
+
+Scope:
+
+- Insert the first `order_tasks` row in the same transaction:
+  - `task_type = advance_state`
+  - `target_state = confirmed`
+  - `status = pending`
+  - `next_run_at = created_at`
+- Duplicate requests must not create another task.
+
+Acceptance checks:
+
+- First create produces one order, one creation event, and one initial task.
+- Duplicate create returns the existing order and all counts stay one.
+
+#### Slice 4E: API Error/Response Polish
+
+Scope:
+
+- Missing `Idempotency-Key` returns `400`.
+- Missing or invalid `restaurant_ref` returns `422`.
+- Response shape is documented and stable before loadgen depends on it.
+
+Acceptance checks:
+
+- Happy path and duplicate path still pass.
+- Error cases return predictable JSON responses.
 
 ### Slice 5: `downstream_calls` Crash-Recovery Table
 
