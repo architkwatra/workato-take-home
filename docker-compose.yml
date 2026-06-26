@@ -27,8 +27,8 @@ services:
     ports:
       - "8080:8000"
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
     healthcheck:
       test:
         [
@@ -47,12 +47,8 @@ services:
     command: uvicorn downstream_sim.app:app --host 0.0.0.0 --port 8000
     environment:
       SERVICE_NAME: downstream-sim
-      DATABASE_URL: postgresql://app:app@postgres:5432/orders
     ports:
       - "8081:8000"
-    depends_on:
-      postgres:
-        condition: service_healthy
     healthcheck:
       test:
         [
@@ -97,10 +93,20 @@ services:
       SERVICE_NAME: worker
       DATABASE_URL: postgresql://app:app@postgres:5432/orders
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
     deploy:
       replicas: 3
+
+  migrator:
+    build:
+      context: ./backend
+    command: alembic upgrade head
+    environment:
+      DATABASE_URL: postgresql://app:app@postgres:5432/orders
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   dashboard:
     build:
