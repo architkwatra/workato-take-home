@@ -3,6 +3,8 @@ import os
 import psycopg
 from fastapi import FastAPI, HTTPException
 
+from common.db import DatabaseConfigError, check_database_ready
+
 
 app = FastAPI(title="Order Pipeline API")
 
@@ -16,15 +18,10 @@ async def healthz() -> dict[str, str]:
 @app.get("/readyz")
 async def readyz() -> dict[str, object]:
     """Report API readiness by checking the Postgres connection."""
-    database_url = os.getenv("DATABASE_URL")
-    if not database_url:
-        raise HTTPException(status_code=503, detail="DATABASE_URL is not configured")
-
     try:
-        with psycopg.connect(database_url, connect_timeout=2) as conn:
-            with conn.cursor() as cur:
-                cur.execute("select 1")
-                cur.fetchone()
+        check_database_ready()
+    except DatabaseConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except psycopg.Error as exc:
         raise HTTPException(status_code=503, detail="postgres is not reachable") from exc
 
