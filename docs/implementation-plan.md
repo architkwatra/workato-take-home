@@ -295,16 +295,24 @@ Design notes:
   running.
 - The background producer should use `asyncio` and an async HTTP client so it can
   issue requests without blocking the loadgen API.
-- `POST /load/start` should be idempotent from an operator perspective: if a run
-  is already active, either return the current run or update the requested rate,
-  but do not create a second producer loop.
+- `POST /load/start` starts a new run only when no run is active. If a run is
+  already active, it returns `409 Conflict` with the current run status and does
+  not modify the rate. Operators must use `PATCH /load/rate` for rate changes;
+  this avoids a silent no-op or hidden rate update during the demo.
 - `POST /load/stop` should stop the background producer gracefully and leave the
   last counters visible through `GET /status`.
 - `PATCH /load/rate` should change the rate for the active run without restarting
   the service.
-- Idempotency keys should include a run id and sequence number, for example
-  `loadgen-{run_id}-{sequence}`. This makes generated traffic easy to query in
-  Postgres and avoids accidental key reuse across runs.
+- Rate changes should wake the producer promptly. Use a shared `asyncio.Event`
+  that is set by `PATCH /load/rate` and `POST /load/stop`; the producer waits on
+  either the next scheduled send time or that event, then recalculates cadence
+  from the latest rate. This avoids multi-second stale sleeps and makes
+  dinner-rush ramp-up/ramp-down visible quickly.
+- `run_id` is generated fresh on each successful `POST /load/start`, not once per
+  container lifetime. Idempotency keys should include that run id and sequence
+  number, for example `loadgen-{run_id}-{sequence}`. This makes generated
+  traffic easy to query in Postgres and avoids accidental key reuse across
+  start/stop/start cycles.
 - Keep the first implementation single-process/in-memory because Docker Compose
   runs one loadgen replica. If loadgen is scaled later, each replica needs a
   unique run/producer identity.
@@ -318,19 +326,30 @@ curl -X POST http://localhost:8082/load/start \
 
 curl http://localhost:8082/status
 
+curl -i -X POST http://localhost:8082/load/start \
+  -H 'content-type: application/json' \
+  -d '{"rate_per_second":20,"max_orders":10,"restaurant_ref":"restaurant-1"}'
+
 curl -X PATCH http://localhost:8082/load/rate \
   -H 'content-type: application/json' \
   -d '{"rate_per_second":2}'
 
 curl -X POST http://localhost:8082/load/stop
+
+curl -X POST http://localhost:8082/load/start \
+  -H 'content-type: application/json' \
+  -d '{"rate_per_second":5,"max_orders":10,"restaurant_ref":"restaurant-1"}'
 ```
 
 Expected:
 
 - Loadgen starts without restarting Docker Compose.
 - `GET /status` shows running state and counters while work is active.
+- A second `POST /load/start` during an active run returns `409 Conflict`, does
+  not change the active run's rate, and does not create a second producer loop.
 - Rate can be changed while the producer is running.
 - Stop prevents new order requests and status remains readable.
+- A new `POST /load/start` after stop creates a fresh `run_id`.
 - For a completed `max_orders = 10` run, Postgres shows:
   - 10 generated orders for the run id
   - 10 `order_created` events
