@@ -241,7 +241,103 @@ Acceptance checks:
 - Happy path and duplicate path still pass.
 - Error cases return predictable JSON responses.
 
-### Slice 5: `downstream_calls` Crash-Recovery Table
+### Slice 5: Minimal Loadgen Control API
+
+Goal: make realistic order volume controllable while the system is running.
+
+Why now:
+
+- `POST /orders` now creates the full intake contract: one order, one
+  `order_created` event, and one initial `advance_state -> confirmed` task.
+- Loadgen can test 1-N order intake before workers and downstream simulators add
+  more moving parts.
+- The original requirement says evaluators should be able to dial load up and
+  down during the demo, which means loadgen should be a persistent service, not
+  a one-shot CLI job.
+
+Scope:
+
+- Keep loadgen as the existing `loadgen` Docker Compose service.
+- Implement a small in-memory controller inside that service:
+  - `GET /healthz`
+  - `GET /status`
+  - `POST /load/start`
+  - `POST /load/stop`
+  - `PATCH /load/rate`
+- Generate HTTP `POST /orders` calls against `API_BASE_URL`.
+- Generate a fresh client-side idempotency key for every simulated order.
+- Support low-rate and burst-like traffic with:
+  - `rate_per_second`
+  - optional `max_orders`
+  - optional `restaurant_ref`
+  - optional `customer_ref_prefix`
+- Track simple runtime counters in memory:
+  - running/stopped
+  - current configured rate
+  - started_at/stopped_at
+  - attempted order count
+  - successful create/reuse count
+  - failed request count
+  - last_error
+
+Out of scope:
+
+- Dashboard controls. For this slice, use direct HTTP calls to loadgen.
+- Durable loadgen history. If the loadgen container restarts, counters reset.
+- Sophisticated traffic distributions. Start with a steady rate; richer burst
+  profiles can be added later.
+- Retrying failed generated requests. The API idempotency behavior is already
+  tested directly; loadgen should surface failures rather than hide them.
+
+Design notes:
+
+- Loadgen must be a long-running service so rate can be changed while it is
+  running.
+- The background producer should use `asyncio` and an async HTTP client so it can
+  issue requests without blocking the loadgen API.
+- `POST /load/start` should be idempotent from an operator perspective: if a run
+  is already active, either return the current run or update the requested rate,
+  but do not create a second producer loop.
+- `POST /load/stop` should stop the background producer gracefully and leave the
+  last counters visible through `GET /status`.
+- `PATCH /load/rate` should change the rate for the active run without restarting
+  the service.
+- Idempotency keys should include a run id and sequence number, for example
+  `loadgen-{run_id}-{sequence}`. This makes generated traffic easy to query in
+  Postgres and avoids accidental key reuse across runs.
+- Keep the first implementation single-process/in-memory because Docker Compose
+  runs one loadgen replica. If loadgen is scaled later, each replica needs a
+  unique run/producer identity.
+
+Acceptance checks:
+
+```bash
+curl -X POST http://localhost:8082/load/start \
+  -H 'content-type: application/json' \
+  -d '{"rate_per_second":5,"max_orders":10,"restaurant_ref":"restaurant-1"}'
+
+curl http://localhost:8082/status
+
+curl -X PATCH http://localhost:8082/load/rate \
+  -H 'content-type: application/json' \
+  -d '{"rate_per_second":2}'
+
+curl -X POST http://localhost:8082/load/stop
+```
+
+Expected:
+
+- Loadgen starts without restarting Docker Compose.
+- `GET /status` shows running state and counters while work is active.
+- Rate can be changed while the producer is running.
+- Stop prevents new order requests and status remains readable.
+- For a completed `max_orders = 10` run, Postgres shows:
+  - 10 generated orders for the run id
+  - 10 `order_created` events
+  - 10 initial `advance_state -> confirmed` tasks
+  - no duplicate orders for generated idempotency keys
+
+### Slice 6: `downstream_calls` Crash-Recovery Table
 
 Goal: add the pipeline-side idempotency table before any downstream simulator
 behavior depends on it.
@@ -266,7 +362,7 @@ Acceptance checks:
 - Upsert the same key again and verify it updates/reuses the existing row.
 - Verify a mismatched `request_hash` is treated as an error path.
 
-### Slice 6: Basic Worker Loop Without Downstream Calls
+### Slice 7: Basic Worker Loop Without Downstream Calls
 
 Goal: prove task claiming and lifecycle movement before adding external
 complexity.
