@@ -6,7 +6,8 @@ from psycopg.rows import dict_row
 
 from common.db import open_db_connection
 from common.event_types import EVENT_TYPE_ORDER_CREATED
-from common.state_machine import ORDER_STATE_PLACED
+from common.state_machine import ORDER_STATE_CONFIRMED, ORDER_STATE_PLACED
+from common.task_types import TASK_STATUS_PENDING, TASK_TYPE_ADVANCE_STATE
 
 
 def create_or_get_order(
@@ -76,6 +77,48 @@ def create_or_get_order(
                             order_id,
                             EVENT_TYPE_ORDER_CREATED,
                             ORDER_STATE_PLACED,
+                            created_at,
+                        ),
+                    )
+                    # The first durable task is created with the order so a
+                    # crash after accepting an order still leaves work for a
+                    # worker to claim. Duplicate idempotency requests skip this
+                    # path, and the active dedupe_key guards against accidental
+                    # duplicate initial tasks for the same order/target.
+                    cur.execute(
+                        """
+                        insert into order_tasks (
+                            id,
+                            order_id,
+                            task_type,
+                            target_state,
+                            status,
+                            next_run_at,
+                            dedupe_key,
+                            created_at,
+                            updated_at
+                        )
+                        values (
+                            %s,
+                            %s,
+                            %s::task_type,
+                            %s::order_state,
+                            %s::task_status,
+                            %s,
+                            %s,
+                            %s,
+                            %s
+                        )
+                        """,
+                        (
+                            uuid4(),
+                            order_id,
+                            TASK_TYPE_ADVANCE_STATE,
+                            ORDER_STATE_CONFIRMED,
+                            TASK_STATUS_PENDING,
+                            created_at,
+                            f"{order_id}:{TASK_TYPE_ADVANCE_STATE}:{ORDER_STATE_CONFIRMED}",
+                            created_at,
                             created_at,
                         ),
                     )
