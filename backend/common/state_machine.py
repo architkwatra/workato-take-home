@@ -1,23 +1,45 @@
+"""Order lifecycle constants shared by API and worker code.
+
+The string values must match the Postgres `order_state` enum values created by
+Alembic. Migrations intentionally keep their own copy of the enum values so old
+migrations stay self-contained and do not change when application code changes.
+"""
+
+ORDER_STATE_PLACED = "placed"  # API accepted the order; downstream work has not started.
+ORDER_STATE_CONFIRMED = "confirmed"  # Restaurant accepted the order.
+ORDER_STATE_PREPARING = "preparing"  # Restaurant is preparing the food.
+ORDER_STATE_READY = "ready"  # Restaurant marked the order ready for pickup.
+ORDER_STATE_OUT_FOR_DELIVERY = "out_for_delivery"  # Courier has the delivery flow.
+ORDER_STATE_DELIVERED = "delivered"  # Customer received the order; terminal success.
+ORDER_STATE_CANCELLED = "cancelled"  # Order was cancelled; terminal stop.
+ORDER_STATE_FAILED = "failed"  # Pipeline could not complete the order; terminal stop.
+
 ORDER_STATES = (
-    "placed",
-    "confirmed",
-    "preparing",
-    "ready",
-    "out_for_delivery",
-    "delivered",
-    "cancelled",
-    "failed",
+    ORDER_STATE_PLACED,
+    ORDER_STATE_CONFIRMED,
+    ORDER_STATE_PREPARING,
+    ORDER_STATE_READY,
+    ORDER_STATE_OUT_FOR_DELIVERY,
+    ORDER_STATE_DELIVERED,
+    ORDER_STATE_CANCELLED,
+    ORDER_STATE_FAILED,
 )
 
 ORDER_TRANSITIONS = {
-    "placed": "confirmed",
-    "confirmed": "preparing",
-    "preparing": "ready",
-    "ready": "out_for_delivery",
-    "out_for_delivery": "delivered",
+    ORDER_STATE_PLACED: ORDER_STATE_CONFIRMED,
+    ORDER_STATE_CONFIRMED: ORDER_STATE_PREPARING,
+    ORDER_STATE_PREPARING: ORDER_STATE_READY,
+    ORDER_STATE_READY: ORDER_STATE_OUT_FOR_DELIVERY,
+    ORDER_STATE_OUT_FOR_DELIVERY: ORDER_STATE_DELIVERED,
 }
 
-TERMINAL_ORDER_STATES = frozenset({"delivered", "cancelled", "failed"})
+TERMINAL_ORDER_STATES = frozenset(
+    {
+        ORDER_STATE_DELIVERED,
+        ORDER_STATE_CANCELLED,
+        ORDER_STATE_FAILED,
+    }
+)
 
 
 def next_order_state(current_state: str) -> str | None:
