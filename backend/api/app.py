@@ -19,6 +19,9 @@ from common.db import (
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Open the sync DB pool once per API process and close it on shutdown."""
+    # The API uses synchronous psycopg from normal `def` handlers. FastAPI runs
+    # those handlers in a threadpool, so blocking DB waits do not freeze the
+    # event loop that accepts other requests.
     configure_db_pool()
     try:
         yield
@@ -84,6 +87,8 @@ def create_order(
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> dict[str, Any]:
     """Create an order once, returning the existing row on duplicate submits."""
+    # The client/loadgen owns this key so request retries cannot accidentally
+    # create multiple orders when the API response is slow or dropped.
     cleaned_key = idempotency_key.strip() if idempotency_key else ""
     if not cleaned_key:
         raise HTTPException(

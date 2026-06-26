@@ -7,9 +7,11 @@ from psycopg_pool import ConnectionPool
 
 
 class DatabaseConfigError(RuntimeError):
-    """Raised when a service needs Postgres but DATABASE_URL is missing."""
+    """Raised when a service cannot safely configure its Postgres dependency."""
 
 
+# One pool is kept per service process. Sharing it avoids creating a new TCP
+# connection for every order request during bursty dinner-rush traffic.
 _db_pool: ConnectionPool | None = None
 
 
@@ -44,6 +46,9 @@ def configure_db_pool(*, connect_timeout: int = 2) -> None:
     if _db_pool is not None:
         return
 
+    # Keep the default pool intentionally modest for a single-machine demo.
+    # It gives the API concurrency without consuming most of Postgres'
+    # connection budget before workers and other services are added.
     min_size = _read_pool_size("DATABASE_POOL_MIN_SIZE", 1)
     max_size = _read_pool_size("DATABASE_POOL_MAX_SIZE", 10)
     if min_size > max_size:
@@ -81,6 +86,8 @@ def open_db_connection(*, connect_timeout: int = 2) -> Iterator[psycopg.Connecti
             yield conn
         return
 
+    # The fallback keeps one-off scripts, migrations, and tests usable before a
+    # web service lifespan has configured the process-wide pool.
     with psycopg.connect(get_database_url(), connect_timeout=connect_timeout) as conn:
         yield conn
 
