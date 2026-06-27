@@ -69,10 +69,10 @@ class LoadGenerator:
     """In-memory controller for one persistent, single-replica load generator."""
 
     def __init__(self) -> None:
-        # This cap makes the generator apply backpressure when the API slows
-        # down, instead of creating unbounded asyncio tasks or exhausting the
-        # HTTP connection pool during a dinner-rush demo.
-        self._max_inflight = positive_int_env("LOADGEN_MAX_INFLIGHT", 50)
+        # This is a high safety limit for the load generator itself, not a way
+        # to protect the API. If the API slows down during a demo, that should
+        # remain visible while preventing unbounded local task/memory growth.
+        self._max_inflight = positive_int_env("LOADGEN_MAX_INFLIGHT", 1000)
         self._inflight_semaphore = asyncio.Semaphore(self._max_inflight)
         # The lock protects run state shared by FastAPI handlers, the producer
         # loop, and request completion callbacks.

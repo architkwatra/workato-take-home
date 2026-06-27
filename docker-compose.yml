@@ -68,7 +68,7 @@ services:
     environment:
       SERVICE_NAME: loadgen
       API_BASE_URL: http://api:8000
-      LOADGEN_MAX_INFLIGHT: "50"
+      LOADGEN_MAX_INFLIGHT: "1000"
     ports:
       - "8082:8000"
     depends_on:
