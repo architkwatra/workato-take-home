@@ -5,7 +5,7 @@ import signal
 
 from common.db import close_db_pool, configure_db_pool
 from worker.heartbeat import create_worker_identity, record_worker_heartbeat
-from worker.tasks import claim_and_release_one_task
+from worker.tasks import claim_and_process_one_task
 
 
 logging.basicConfig(
@@ -45,13 +45,13 @@ async def run_heartbeat_loop(identity, stop_event: asyncio.Event) -> None:
 
 
 async def run_task_poll_loop(identity, stop_event: asyncio.Event) -> None:
-    """Poll for claimable tasks and release them for the Slice 7A milestone."""
+    """Poll for claimable tasks and process supported work."""
     idle_delay = TASK_POLL_INITIAL_IDLE_SECONDS
 
     while not stop_event.is_set():
         try:
             found_work = await asyncio.to_thread(
-                claim_and_release_one_task,
+                claim_and_process_one_task,
                 worker_id=identity.worker_id,
             )
         except Exception:
