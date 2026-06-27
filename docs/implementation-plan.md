@@ -423,7 +423,11 @@ Scope:
 - Claiming updates the task to `running`, sets `locked_by`, sets
   `locked_until = now() + interval '30 seconds'`, and updates `updated_at`.
 - For this slice only, immediately release claimed tasks back to `pending` after
-  logging or otherwise observing the claim.
+  logging or otherwise observing the claim. The release update must set:
+  - `status = pending`;
+  - `locked_by = null`;
+  - `locked_until = null`;
+  - `updated_at = now()`.
 - Do not change order state.
 - Do not insert `order_events`.
 - Do not mark claimed tasks `completed`.
@@ -460,7 +464,10 @@ docker compose exec postgres psql -U app -d orders -c \
   "select state, count(*) from orders where idempotency_key like 'loadgen-<run_id>-%' group by state order by state;"
 
 docker compose exec postgres psql -U app -d orders -c \
-  "select task_type, target_state, status, count(*) from order_tasks t join orders o on o.id = t.order_id where o.idempotency_key like 'loadgen-<run_id>-%' group by task_type, target_state, status order by task_type, target_state, status;"
+  "select status, count(*) from order_tasks t join orders o on o.id = t.order_id where o.idempotency_key like 'loadgen-<run_id>-%' group by status order by status;"
+
+docker compose exec postgres psql -U app -d orders -c \
+  "select count(*) from order_tasks t join orders o on o.id = t.order_id where o.idempotency_key like 'loadgen-<run_id>-%' and status = 'pending' and (locked_by is not null or locked_until is not null);"
 
 docker compose exec postgres psql -U app -d orders -c \
   "select worker_id, hostname, last_seen_at from workers where last_seen_at >= now() - interval '30 seconds' order by worker_id;"
@@ -475,7 +482,9 @@ Expected:
   database during polling.
 - Workers do not crash when no work exists.
 - No generated order for the run moves out of `placed`.
-- All generated `advance_state -> confirmed` tasks remain `pending` after the
+- Generated tasks may be observed as `pending` or `running` while workers are
+  polling, but no generated task reaches `completed`.
+- Pending generated tasks have no `locked_by` or `locked_until` values after the
   controlled release.
 
 ### Slice 7B: Process Initial `placed -> confirmed`
