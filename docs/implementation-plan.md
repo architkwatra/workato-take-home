@@ -47,8 +47,9 @@ Expected result:
 
 ## Next Target
 
-Build idempotent order intake. Keep this split into small PRs so each step is
-independently reviewable and testable.
+Order intake and the persistent load generator are in place. The next target is
+worker processing: prove that workers can claim durable tasks exactly once,
+advance order state, and drain the queue before adding flaky downstream calls.
 
 ## Implementation Slice Breakdown
 
@@ -362,10 +363,161 @@ Expected:
     `target_state = confirmed`
   - no duplicate orders for generated idempotency keys
 
-### Slice 6: `downstream_calls` Crash-Recovery Table
+### Slice 6: Worker DB Pool and Heartbeat
 
-Goal: add the pipeline-side idempotency table before any downstream simulator
-behavior depends on it.
+Goal: make each worker visible as an active process before it starts claiming
+work.
+
+Scope:
+
+- Configure the shared Postgres pool in the worker startup path and close it on
+  shutdown.
+- Generate a stable `worker_id` per worker process from `WORKER_ID` or the
+  container hostname.
+- Upsert into `workers` every 10 seconds with `worker_id`, `last_seen_at`,
+  `started_at`, and metadata.
+- Keep the worker from claiming tasks in this slice.
+
+Design notes:
+
+- Add comments explaining that worker heartbeat measures liveness, while task
+  leases measure active work.
+- Keep heartbeat failure loud in logs, but do not crash the worker on one failed
+  heartbeat. A temporary DB hiccup should be visible and retried.
+
+Acceptance checks:
+
+```bash
+docker compose up --build -d
+docker compose exec postgres psql -U app -d orders -c \
+  "select worker_id, last_seen_at from workers order by worker_id;"
+```
+
+Expected:
+
+- Three worker rows appear within 30 seconds.
+- `last_seen_at` advances while workers are idle.
+- Stopping one worker makes its heartbeat go stale while the others continue.
+
+### Slice 7: Claim and Process Initial `placed -> confirmed` Tasks
+
+Goal: prove multiple workers can compete for work, claim each task once, and
+move accepted orders one real lifecycle step.
+
+Scope:
+
+- Add a worker task-claim helper that selects one eligible task inside a
+  transaction with `SELECT ... FOR UPDATE SKIP LOCKED`.
+- Eligible tasks are:
+  - `pending` with `next_run_at <= now()`;
+  - `running` with `locked_until < now()` for expired-lease recovery.
+- Claiming updates the task to `running`, sets `locked_by`, sets
+  `locked_until = now() + interval '30 seconds'`, and updates `updated_at`.
+- Handle only `task_type = advance_state` with `target_state = confirmed`.
+- In one transaction, the worker:
+  - loads the task and its order;
+  - verifies the order is still in `placed`;
+  - updates `orders.state` to `confirmed` with `WHERE id = ? AND version = ?`;
+  - increments `orders.version`;
+  - inserts `order_events.event_type = state_transition`;
+  - marks the task `completed` with `completed_at`.
+- If the order is terminal, mark the task `completed` as a safe no-op.
+- If the optimistic update affects zero rows, mark the task `completed` as a
+  stale no-op because another actor won the race.
+
+Design notes:
+
+- `SKIP LOCKED` prevents two live workers from seeing the same claimable row.
+- The 30-second lease is the crash recovery window, not the expected processing
+  duration.
+- Use existing constants from `common.state_machine`, `common.task_types`, and
+  `common.event_types`; do not add duplicate raw strings.
+- The optimistic-locking comment should explain that `orders.version` protects
+  against stale workers, cancellation races, and expired leases.
+- Add comments around the claim query; this is the first concurrency-sensitive
+  worker code.
+- Do not call `downstream-sim` yet. This slice proves the DB worker loop only.
+
+Acceptance checks:
+
+```bash
+curl -X POST http://localhost:8082/load/start \
+  -H 'content-type: application/json' \
+  -d '{"rate_per_second":10,"max_orders":10,"restaurant_ref":"restaurant-1"}'
+
+docker compose exec postgres psql -U app -d orders -c \
+  "select state, count(*) from orders group by state order by state;"
+
+docker compose exec postgres psql -U app -d orders -c \
+  "select task_type, target_state, status, count(*) from order_tasks group by task_type, target_state, status order by task_type, target_state, status;"
+
+docker compose exec postgres psql -U app -d orders -c \
+  "select event_type, from_state, to_state, count(*) from order_events group by event_type, from_state, to_state order by event_type, from_state, to_state;"
+```
+
+Expected:
+
+- The 10 generated orders move from `placed` to `confirmed`.
+- The 10 initial `advance_state -> confirmed` tasks become `completed`.
+- The event table has 10 `order_created` events and 10
+  `state_transition placed -> confirmed` events for the run.
+
+### Slice 8: Insert the Next Fake Advance Task
+
+Goal: keep the pipeline moving one task at a time without downstream calls.
+
+Scope:
+
+- After completing `placed -> confirmed`, insert the next active task:
+  `task_type = advance_state`, `target_state = preparing`.
+- Use the existing active `dedupe_key` pattern:
+  `{order_id}:{task_type}:{target_state}`.
+- Insert the next task in the same transaction as the order transition and task
+  completion.
+
+Design notes:
+
+- Inserting the next task only after the guarded state update succeeds prevents
+  a stale worker from scheduling future work for an order it did not advance.
+- Duplicate next-task insertion should be prevented by the active
+  `dedupe_key` unique index.
+
+Acceptance checks:
+
+- Create 10 orders through loadgen.
+- Verify orders reach `preparing`.
+- Verify each order has exactly one completed `advance_state -> confirmed` task
+  and one `advance_state -> preparing` task that is completed or pending,
+  depending on how quickly workers drain.
+
+### Slice 9: Complete Fake Lifecycle Without Downstream Calls
+
+Goal: prove the full worker loop and dashboard-ready event trail before adding
+flaky downstream systems.
+
+Scope:
+
+- Extend fake `advance_state` handling through the happy path:
+  - `confirmed -> preparing`
+  - `preparing -> ready`
+  - `ready -> out_for_delivery`
+  - `out_for_delivery -> delivered`
+- Each transition writes one `state_transition` event, completes the current
+  task, and inserts the next task until `delivered`.
+- Do not create `check_ready`, `check_pickup`, or `check_delivery` tasks yet.
+  Those belong to simulator-backed behavior.
+
+Acceptance checks:
+
+- Create a bounded loadgen run.
+- Verify all generated orders eventually reach `delivered`.
+- Verify queue depth drains to zero pending/running tasks for that run.
+- Verify transition events exist in lifecycle order for each generated order.
+
+### Slice 10: `downstream_calls` Crash-Recovery Table
+
+Goal: add the pipeline-side idempotency table before any real downstream
+simulator behavior depends on it.
 
 Scope:
 
@@ -387,31 +539,11 @@ Acceptance checks:
 - Upsert the same key again and verify it updates/reuses the existing row.
 - Verify a mismatched `request_hash` is treated as an error path.
 
-### Slice 7: Basic Worker Loop Without Downstream Calls
-
-Goal: prove task claiming and lifecycle movement before adding external
-complexity.
-
-Scope:
-
-- Worker heartbeat.
-- `SELECT ... FOR UPDATE SKIP LOCKED` task claiming.
-- Lease creation and renewal.
-- Direct fake lifecycle transitions with no simulator calls.
-- Multiple worker replicas.
-
-Acceptance checks:
-
-- Create several orders.
-- Verify each task is claimed by only one worker.
-- Verify orders advance through the fake lifecycle.
-- Verify queue depth drains.
-
 ### Later Slices
 
 - Add durable simulator support tables.
 - Add restaurant simulator behavior.
 - Add courier simulator behavior.
-- Add loadgen control API.
+- Add dashboard controls for loadgen and chaos settings.
 - Add SSE/dashboard live updates.
 - Add chaos controls and metrics.
