@@ -40,8 +40,8 @@ def _read_pool_size(env_name: str, default: int) -> int:
     return value
 
 
-def configure_db_pool(*, connect_timeout: int = 2) -> None:
-    """Create the process-wide Postgres connection pool for API request traffic."""
+def configure_db_pool(*, connect_timeout: int = 2, pool_wait_timeout: int = 30) -> None:
+    """Create the process-wide Postgres connection pool for service DB traffic."""
     global _db_pool
     if _db_pool is not None:
         return
@@ -64,7 +64,10 @@ def configure_db_pool(*, connect_timeout: int = 2) -> None:
         open=False,
     )
     pool.open()
-    pool.wait(timeout=connect_timeout)
+    # Connection timeout is per TCP attempt. Pool wait timeout is the total
+    # startup window for the pool to prepare its minimum connections while other
+    # Compose services may also be connecting to Postgres.
+    pool.wait(timeout=pool_wait_timeout)
     _db_pool = pool
 
 
