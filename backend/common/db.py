@@ -64,10 +64,16 @@ def configure_db_pool(*, connect_timeout: int = 2, pool_wait_timeout: int = 30) 
         open=False,
     )
     pool.open()
-    # Connection timeout is per TCP attempt. Pool wait timeout is the total
-    # startup window for the pool to prepare its minimum connections while other
-    # Compose services may also be connecting to Postgres.
-    pool.wait(timeout=pool_wait_timeout)
+    try:
+        # Connection timeout is per TCP attempt. Pool wait timeout is the total
+        # startup window for the pool to prepare its minimum connections while
+        # other Compose services may also be connecting to Postgres.
+        pool.wait(timeout=pool_wait_timeout)
+    except Exception:
+        # If wait fails, close the locally opened pool before re-raising. The
+        # global pool is assigned only after readiness succeeds.
+        pool.close()
+        raise
     _db_pool = pool
 
 

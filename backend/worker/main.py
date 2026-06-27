@@ -30,12 +30,12 @@ async def run_worker() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, request_stop)
 
-    # Workers keep a process-wide DB pool just like the API. The heartbeat uses
-    # it now; task claiming and order transitions will reuse it in later slices.
-    configure_db_pool()
-    logger.info("worker started", extra={"worker_id": identity.worker_id})
-
     try:
+        # Pool setup is synchronous and can wait while Postgres is busy. Run it
+        # off the event loop so SIGTERM/SIGINT can still be handled promptly.
+        await asyncio.to_thread(configure_db_pool)
+        logger.info("worker started", extra={"worker_id": identity.worker_id})
+
         while not stop_event.is_set():
             try:
                 # The DB helper is synchronous. Running it in a thread keeps the
@@ -58,7 +58,7 @@ async def run_worker() -> None:
             except asyncio.TimeoutError:
                 continue
     finally:
-        close_db_pool()
+        await asyncio.to_thread(close_db_pool)
         logger.info("worker stopped", extra={"worker_id": identity.worker_id})
 
 
