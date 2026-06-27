@@ -26,6 +26,20 @@ def api_base_url() -> str:
     return os.getenv("API_BASE_URL", "http://api:8000").rstrip("/")
 
 
+def positive_int_env(name: str, default: int) -> int:
+    """Read a positive integer env var while keeping a safe default."""
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+
+    try:
+        parsed_value = int(raw_value)
+    except ValueError:
+        return default
+
+    return parsed_value if parsed_value > 0 else default
+
+
 class StartLoadRequest(BaseModel):
     """Operator request to start one bounded or unbounded loadgen run."""
 
@@ -55,6 +69,11 @@ class LoadGenerator:
     """In-memory controller for one persistent, single-replica load generator."""
 
     def __init__(self) -> None:
+        # This cap makes the generator apply backpressure when the API slows
+        # down, instead of creating unbounded asyncio tasks or exhausting the
+        # HTTP connection pool during a dinner-rush demo.
+        self._max_inflight = positive_int_env("LOADGEN_MAX_INFLIGHT", 50)
+        self._inflight_semaphore = asyncio.Semaphore(self._max_inflight)
         # The lock protects run state shared by FastAPI handlers, the producer
         # loop, and request completion callbacks.
         self._lock = asyncio.Lock()
@@ -186,6 +205,7 @@ class LoadGenerator:
             "reused_count": self._reused_count,
             "failed_count": self._failed_count,
             "inflight_count": inflight_count,
+            "max_inflight": self._max_inflight,
             "last_error": self._last_error,
         }
 
@@ -223,20 +243,36 @@ class LoadGenerator:
 
     async def _launch_order_request(self) -> None:
         """Reserve the next sequence number and launch one async order request."""
+        await self._inflight_semaphore.acquire()
         async with self._lock:
             if not self._running or self._run_config is None:
+                self._inflight_semaphore.release()
                 return
 
             self._attempted_count += 1
             sequence = self._attempted_count
             run_config = self._run_config
 
-        task = asyncio.create_task(self._send_order(run_config, sequence))
+        try:
+            task = asyncio.create_task(self._send_order(run_config, sequence))
+        except Exception:
+            self._inflight_semaphore.release()
+            raise
+
         self._inflight_tasks.add(task)
         task.add_done_callback(self._inflight_tasks.discard)
 
     async def _send_order(self, run_config: LoadgenRunConfig, sequence: int) -> None:
         """Send one order request and record whether the API accepted or reused it."""
+        try:
+            await self._send_order_with_reserved_slot(run_config, sequence)
+        finally:
+            self._inflight_semaphore.release()
+
+    async def _send_order_with_reserved_slot(
+        self, run_config: LoadgenRunConfig, sequence: int
+    ) -> None:
+        """Send one order request after the caller has reserved capacity."""
         if self._client is None:
             async with self._lock:
                 self._failed_count += 1
@@ -276,6 +312,13 @@ class LoadGenerator:
             self._last_error = f"{response.status_code}: {response.text[:200]}"
 
 
+async def probe_api_dependency() -> None:
+    """Verify the load generator can reach the API it will send orders to."""
+    async with httpx.AsyncClient(timeout=2.0) as probe_client:
+        response = await probe_client.get(f"{api_base_url()}/healthz")
+        response.raise_for_status()
+
+
 load_generator = LoadGenerator()
 
 
@@ -300,11 +343,20 @@ async def healthz() -> dict[str, str]:
 
 @app.get("/readyz")
 async def readyz() -> dict[str, object]:
-    """Report load generator readiness and its target API URL."""
+    """Report readiness only when the configured API dependency is reachable."""
+    try:
+        await probe_api_dependency()
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"API dependency is not reachable: {exc}",
+        ) from exc
+
     return {
         "status": "ok",
         "service": os.getenv("SERVICE_NAME", "loadgen"),
         "api_base_url": api_base_url(),
+        "dependencies": {"api": "ok"},
     }
 
 

@@ -68,6 +68,7 @@ services:
     environment:
       SERVICE_NAME: loadgen
       API_BASE_URL: http://api:8000
+      LOADGEN_MAX_INFLIGHT: "50"
     ports:
       - "8082:8000"
     depends_on:
@@ -79,7 +80,7 @@ services:
           "CMD",
           "python",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz')",
         ]
       interval: 10s
       timeout: 3s
