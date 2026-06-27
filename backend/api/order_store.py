@@ -59,24 +59,24 @@ def create_or_get_order(
                 if inserted_order is not None:
                     # The creation event is inserted in the same transaction as
                     # the order so the audit timeline cannot miss accepted
-                    # orders. Duplicate idempotency requests skip this path, so
-                    # they do not create duplicate events.
+                    # orders. This is a creation milestone, not a state
+                    # transition, so from_state/to_state stay null. Duplicate
+                    # idempotency requests skip this path, so they do not create
+                    # duplicate events.
                     cur.execute(
                         """
                         insert into order_events (
                             id,
                             order_id,
                             event_type,
-                            to_state,
                             occurred_at
                         )
-                        values (%s, %s, %s::event_type, %s::order_state, %s)
+                        values (%s, %s, %s::event_type, %s)
                         """,
                         (
                             uuid4(),
                             order_id,
                             EVENT_TYPE_ORDER_CREATED,
-                            ORDER_STATE_PLACED,
                             created_at,
                         ),
                     )
