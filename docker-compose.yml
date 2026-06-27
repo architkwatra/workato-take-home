@@ -73,7 +73,7 @@ services:
       - "8082:8000"
     depends_on:
       api:
-        condition: service_started
+        condition: service_healthy
     healthcheck:
       test:
         [
