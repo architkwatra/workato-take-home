@@ -372,16 +372,20 @@ Scope:
 
 - Configure the shared Postgres pool in the worker startup path and close it on
   shutdown.
-- Generate a stable `worker_id` per worker process from `WORKER_ID` or the
-  container hostname.
+- Generate `worker_id = worker-{uuid4}` once at worker process startup. Do not
+  use hostname as the primary id because Compose replica hostnames are
+  restart-scoped and can leave stale identities behind.
 - Upsert into `workers` every 10 seconds with `worker_id`, `last_seen_at`,
-  `started_at`, and metadata.
+  `started_at`, `hostname`, and metadata.
 - Keep the worker from claiming tasks in this slice.
 
 Design notes:
 
 - Add comments explaining that worker heartbeat measures liveness, while task
   leases measure active work.
+- `worker_id` only needs to be stable for the process lifetime. The dashboard
+  should count active workers with `last_seen_at >= now() - interval '30
+  seconds'`, so old rows from previous container starts do not count as active.
 - Keep heartbeat failure loud in logs, but do not crash the worker on one failed
   heartbeat. A temporary DB hiccup should be visible and retried.
 
@@ -390,12 +394,12 @@ Acceptance checks:
 ```bash
 docker compose up --build -d
 docker compose exec postgres psql -U app -d orders -c \
-  "select worker_id, last_seen_at from workers order by worker_id;"
+  "select worker_id, hostname, last_seen_at from workers where last_seen_at >= now() - interval '30 seconds' order by worker_id;"
 ```
 
 Expected:
 
-- Three worker rows appear within 30 seconds.
+- Three active worker rows appear within 30 seconds.
 - `last_seen_at` advances while workers are idle.
 - Stopping one worker makes its heartbeat go stale while the others continue.
 
@@ -419,7 +423,10 @@ Scope:
   - verifies the order is still in `placed`;
   - updates `orders.state` to `confirmed` with `WHERE id = ? AND version = ?`;
   - increments `orders.version`;
-  - inserts `order_events.event_type = state_transition`;
+  - inserts an `order_events` row with `event_type = state_transition`,
+    `from_state = placed`, `to_state = confirmed`, `task_id = <current task
+    id>`, `worker_id = <this worker id>`, and the same `occurred_at` timestamp
+    used for the order/task updates;
   - marks the task `completed` with `completed_at`.
 - If the order is terminal, mark the task `completed` as a safe no-op.
 - If the optimistic update affects zero rows, mark the task `completed` as a
@@ -430,6 +437,10 @@ Design notes:
 - `SKIP LOCKED` prevents two live workers from seeing the same claimable row.
 - The 30-second lease is the crash recovery window, not the expected processing
   duration.
+- Worker polling should use a short active interval and idle backoff: poll
+  immediately after completing a task, sleep 100ms after a no-work result, and
+  exponentially back off to a maximum 1s idle sleep. Reset the delay to 100ms
+  whenever work is found.
 - Use existing constants from `common.state_machine`, `common.task_types`, and
   `common.event_types`; do not add duplicate raw strings.
 - The optimistic-locking comment should explain that `orders.version` protects
@@ -513,6 +524,20 @@ Acceptance checks:
 - Verify all generated orders eventually reach `delivered`.
 - Verify queue depth drains to zero pending/running tasks for that run.
 - Verify transition events exist in lifecycle order for each generated order.
+
+Simulator handoff:
+
+- Treat this fake lifecycle as disposable demo scaffolding. Before the first
+  simulator-backed worker slice, clear local demo data with `docker compose down
+  -v` or an explicit truncate script so no pending fake `advance_state -> ready`,
+  `advance_state -> out_for_delivery`, or `advance_state -> delivered` tasks
+  remain.
+- At that handoff, remove direct fake handling for `advance_state -> ready`,
+  `advance_state -> out_for_delivery`, and `advance_state -> delivered`.
+  Replace it with simulator-backed flow: prep start schedules `check_ready`,
+  courier dispatch advances to `out_for_delivery` and schedules `check_pickup`,
+  pickup records a `courier_picked_up` milestone, and `check_delivery` advances
+  the order to `delivered`.
 
 ### Slice 10: `downstream_calls` Crash-Recovery Table
 
