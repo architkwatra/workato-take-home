@@ -1,9 +1,23 @@
 import os
 
 from fastapi import FastAPI
+from pydantic import BaseModel, Field
 
 
 app = FastAPI(title="Downstream Simulator")
+
+
+class RestaurantConfirmRequest(BaseModel):
+    """Restaurant confirmation request sent by the worker."""
+
+    order_id: str = Field(min_length=1)
+    restaurant_ref: str = Field(min_length=1)
+
+
+class RestaurantConfirmResponse(BaseModel):
+    """Deterministic restaurant confirmation response."""
+
+    status: str
 
 
 @app.get("/healthz")
@@ -26,3 +40,16 @@ async def readyz() -> dict[str, object]:
 async def root() -> dict[str, str]:
     """Return a simple scaffold response for humans hitting the simulator root."""
     return {"message": "Downstream simulator scaffold"}
+
+
+@app.post("/restaurant/confirm", response_model=RestaurantConfirmResponse)
+async def confirm_restaurant_order(
+    request: RestaurantConfirmRequest,
+) -> dict[str, str]:
+    """Confirm that a restaurant accepted an order.
+
+    This first simulator slice is deterministic and side-effect-free. Repeated
+    requests for the same order return the same response until durable
+    downstream idempotency is added in a later slice.
+    """
+    return {"status": "confirmed"}
