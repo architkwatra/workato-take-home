@@ -23,7 +23,11 @@ The merged `main` branch already does this:
 - Worker inserts a `state_transition placed -> confirmed` event.
 - Worker completes the task.
 - On downstream failure, worker leaves the order in `placed` and retries the
-  task until `max_attempts` is exhausted.
+  task with `last_error`, incrementing `attempts` on each retryable failure.
+  Once `attempts + 1 >= max_attempts`, the worker marks the task `failed`.
+- The task/order load locks only the task row with `FOR UPDATE OF task`. It does
+  not lock the order row, so `orders.version` remains a real optimistic
+  concurrency guard during finalization.
 
 ## Proposed Scope
 
@@ -90,7 +94,9 @@ Processing should mirror the confirm flow:
 6. On `{"status": "preparing"}`, reopen a transaction.
 7. Revalidate task ownership and order state.
 8. Update `orders.state` from `confirmed` to `preparing` using optimistic
-   locking:
+   locking. The task row may be locked for ownership, but the order row must not
+   be selected `FOR UPDATE`; the version predicate below is the concurrency
+   guard:
 
 ```sql
 where id = <order_id>
@@ -136,6 +142,13 @@ The shared processing shape should stay the same:
 ```text
 prepare/revalidate -> HTTP call outside transaction -> finalize or retry
 ```
+
+The refactor must preserve two existing correctness properties from `main`:
+
+- retryable downstream failures increment `attempts` and transition the task to
+  `failed` once `max_attempts` is exhausted;
+- transition finalization locks only the task row before updating `orders`, so
+  `WHERE version = <read_version>` can detect stale workers and races.
 
 ## Non-Goals
 
@@ -197,9 +210,12 @@ Runtime downstream outage:
 - Verify orders remain in their pre-transition state:
   - confirm failures leave orders in `placed`;
   - prep failures leave orders in `confirmed`.
-- Verify tasks become `pending` with `last_error` until retry budget is
+- Verify retryable failures increment `attempts` and leave tasks `pending` with
+  `last_error` while `attempts + 1 < max_attempts`.
+- Verify tasks become `failed` with `last_error` after `max_attempts` is
   exhausted.
-- Restart `downstream-sim` before `max_attempts` is exhausted.
+- For recovery testing, restart `downstream-sim` before `max_attempts` is
+  exhausted.
 - Verify those same tasks recover and orders continue to the intended state.
 
 ## Risks And Decisions To Review
@@ -208,6 +224,8 @@ Runtime downstream outage:
   During manual outage demos, tasks can legitimately fail if the simulator is
   left down for roughly 20-25 seconds. We can keep this because it proves the
   circuit breaker, or increase the default retry budget in a later schema slice.
+- If this slice is implemented from an older branch instead of current `main`,
+  first port the bounded-retry behavior and task-only row locking from PR #21.
 - The simulator remains side-effect-free, so repeated prep calls are acceptable
   for now. Durable downstream idempotency should still be added before courier
   dispatch or any non-idempotent simulator behavior.
