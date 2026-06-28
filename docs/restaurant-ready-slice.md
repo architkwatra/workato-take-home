@@ -125,8 +125,7 @@ Processing shape:
 6. If downstream returns `{"status": "not_ready"}`:
    - leave the order in `preparing`;
    - release the same task back to `pending`;
-   - set `next_run_at` using `retry_after_seconds` if valid, otherwise
-     `READY_CHECK_INTERVAL_SECONDS`;
+   - set `next_run_at` from a bounded poll delay;
    - do not increment `attempts`;
    - clear `last_error`.
 7. If downstream returns `{"status": "ready"}`:
@@ -144,11 +143,24 @@ Processing shape:
    - release the task back to `pending` for a normal retry;
    - mark the task `failed` once `attempts + 1 >= max_attempts`.
 
-The handler should also respect `deadline_at`. If the restaurant keeps returning
-`not_ready` after the deadline, fail the task with a clear `last_error` such as
-`restaurant ready deadline exceeded`. This deadline failure should not be
-counted as a transient downstream attempt; it is a business timeout, not a
-connection failure.
+For `not_ready`, compute the bounded poll delay like this:
+
+1. Use `retry_after_seconds` only when it is a positive numeric value.
+2. Otherwise use `READY_CHECK_INTERVAL_SECONDS`.
+3. Compute `proposed_next_run_at = now + poll_delay`.
+4. Set `next_run_at = min(proposed_next_run_at, deadline_at)`.
+
+This prevents a large downstream retry suggestion from hiding the task until
+well after its business deadline. The worker should perform the deadline check
+after receiving a valid `not_ready` response, so a task scheduled exactly at
+`deadline_at` still gets one final chance to observe `ready`.
+
+If the restaurant keeps returning `not_ready` at or after `deadline_at`, fail the
+task with a clear `last_error` such as `restaurant ready deadline exceeded`.
+This deadline failure must not increment `attempts`; `attempts` is reserved for
+transient downstream errors such as timeouts, connection failures, 5xx, invalid
+JSON, or unexpected bodies. If the task had previous transient errors,
+preserve that existing `attempts` value when marking the deadline failure.
 
 ## Prep Start Time Source
 
@@ -180,6 +192,7 @@ Add or reuse helper comments around:
 - why `not_ready` does not increment `attempts`;
 - why the HTTP call still happens outside DB transactions;
 - why `deadline_at` exists for poll tasks;
+- why deadline failure does not increment `attempts`;
 - why no response is different from `not_ready`.
 
 ## Non-Goals
@@ -263,8 +276,12 @@ Runtime deadline behavior:
 - Configure `RESTAURANT_READY_AFTER_SECONDS` greater than
   `READY_CHECK_DEADLINE_SECONDS`.
 - Verify `not_ready` polling does not increment `attempts`.
+- Verify `next_run_at` is capped at or before `deadline_at` when the simulator's
+  `retry_after_seconds` exceeds the remaining deadline window.
 - Verify the `check_ready` task eventually becomes `failed` with a deadline
   error once `deadline_at` passes.
+- Verify deadline failure does not increment `attempts`; after a pure
+  `not_ready` deadline run, `attempts` should still be `0`.
 
 ## Risks And Decisions To Review
 
@@ -272,7 +289,9 @@ Runtime deadline behavior:
   the restaurant/POS system would usually be preferred if available.
 - `deadline_at` prevents infinite business polling, while `max_attempts`
   prevents infinite transient-error retries. They are separate controls and
-  should not be collapsed.
+  should not be collapsed. Deadline failure should use a task-fail update path
+  that does not increment `attempts`; do not reuse `_fail_claimed_task` unless
+  it has an explicit `increment_attempts=False` option.
 - The simulator is time-based but still side-effect-free. Durable downstream
   idempotency remains a later slice.
 - The order remains in `preparing` when `check_ready` fails. Moving the order to
