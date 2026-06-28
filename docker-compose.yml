@@ -93,6 +93,9 @@ services:
     environment:
       SERVICE_NAME: worker
       DATABASE_URL: postgresql://app:app@postgres:5432/orders
+      DOWNSTREAM_SIM_BASE_URL: http://downstream-sim:8000
+      DOWNSTREAM_REQUEST_TIMEOUT_SECONDS: "2"
+      TASK_RETRY_DELAY_SECONDS: "5"
     depends_on:
       migrator:
         condition: service_completed_successfully
