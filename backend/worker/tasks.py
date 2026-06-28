@@ -25,6 +25,29 @@ logger = logging.getLogger("worker.tasks")
 LEASE_SECONDS = 30
 _logged_claimed_task_ids: set[str] = set()
 
+PROCESSING_ACTION_TRANSITIONED = "transitioned"
+PROCESSING_ACTION_MISSING_TASK = "missing_task"
+PROCESSING_ACTION_NOT_RUNNING = "not_running"
+PROCESSING_ACTION_LOST_OWNERSHIP = "lost_ownership"
+PROCESSING_ACTION_COMPLETED_TERMINAL_NOOP = "completed_terminal_noop"
+PROCESSING_ACTION_COMPLETED_STALE_NOOP = "completed_stale_noop"
+PROCESSING_ACTION_COMPLETED_OPTIMISTIC_NOOP = "completed_optimistic_noop"
+
+COMPLETED_NOOP_ACTIONS = frozenset(
+    {
+        PROCESSING_ACTION_COMPLETED_TERMINAL_NOOP,
+        PROCESSING_ACTION_COMPLETED_STALE_NOOP,
+        PROCESSING_ACTION_COMPLETED_OPTIMISTIC_NOOP,
+    }
+)
+SKIPPED_AFTER_CLAIM_ACTIONS = frozenset(
+    {
+        PROCESSING_ACTION_MISSING_TASK,
+        PROCESSING_ACTION_NOT_RUNNING,
+        PROCESSING_ACTION_LOST_OWNERSHIP,
+    }
+)
+
 
 @dataclass(frozen=True)
 class ClaimedTask:
@@ -198,15 +221,15 @@ def process_confirm_task(*, task: ClaimedTask, worker_id: str) -> ProcessingResu
                 )
                 row = cur.fetchone()
                 if row is None:
-                    return ProcessingResult(action="missing_task")
+                    return ProcessingResult(action=PROCESSING_ACTION_MISSING_TASK)
                 if row["task_status"] != TASK_STATUS_RUNNING:
                     return ProcessingResult(
-                        action="not_running",
+                        action=PROCESSING_ACTION_NOT_RUNNING,
                         order_id=row["order_id"],
                     )
                 if row["locked_by"] != worker_id:
                     return ProcessingResult(
-                        action="lost_ownership",
+                        action=PROCESSING_ACTION_LOST_OWNERSHIP,
                         order_id=row["order_id"],
                     )
 
@@ -220,7 +243,7 @@ def process_confirm_task(*, task: ClaimedTask, worker_id: str) -> ProcessingResu
                         completed_at=occurred_at,
                     )
                     return ProcessingResult(
-                        action="completed_terminal_noop",
+                        action=PROCESSING_ACTION_COMPLETED_TERMINAL_NOOP,
                         order_id=order_id,
                         from_state=order_state,
                     )
@@ -233,7 +256,7 @@ def process_confirm_task(*, task: ClaimedTask, worker_id: str) -> ProcessingResu
                         completed_at=occurred_at,
                     )
                     return ProcessingResult(
-                        action="completed_stale_noop",
+                        action=PROCESSING_ACTION_COMPLETED_STALE_NOOP,
                         order_id=order_id,
                         from_state=order_state,
                     )
@@ -269,7 +292,7 @@ def process_confirm_task(*, task: ClaimedTask, worker_id: str) -> ProcessingResu
                         completed_at=occurred_at,
                     )
                     return ProcessingResult(
-                        action="completed_optimistic_noop",
+                        action=PROCESSING_ACTION_COMPLETED_OPTIMISTIC_NOOP,
                         order_id=order_id,
                         from_state=ORDER_STATE_PLACED,
                     )
@@ -315,7 +338,7 @@ def process_confirm_task(*, task: ClaimedTask, worker_id: str) -> ProcessingResu
                     completed_at=occurred_at,
                 )
                 return ProcessingResult(
-                    action="transitioned",
+                    action=PROCESSING_ACTION_TRANSITIONED,
                     order_id=order_id,
                     from_state=ORDER_STATE_PLACED,
                     to_state=ORDER_STATE_CONFIRMED,
@@ -346,25 +369,21 @@ def claim_and_process_one_task(*, worker_id: str) -> bool:
         return True
 
     result = process_confirm_task(task=task, worker_id=worker_id)
-    if result.action == "transitioned":
+    if result.action == PROCESSING_ACTION_TRANSITIONED:
         logger.info(
             "confirmed order %s with task %s by %s",
             result.order_id,
             task.id,
             worker_id,
         )
-    elif result.action in {
-        "completed_terminal_noop",
-        "completed_stale_noop",
-        "completed_optimistic_noop",
-    }:
+    elif result.action in COMPLETED_NOOP_ACTIONS:
         logger.info(
             "completed task %s as %s for order %s",
             task.id,
             result.action,
             result.order_id,
         )
-    elif result.action in {"missing_task", "not_running", "lost_ownership"}:
+    elif result.action in SKIPPED_AFTER_CLAIM_ACTIONS:
         logger.warning("skipped task %s after claim: %s", task.id, result.action)
     else:
         logger.warning("task %s returned unknown result %s", task.id, result.action)
