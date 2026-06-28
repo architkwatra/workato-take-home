@@ -403,13 +403,18 @@ Expected:
 - `last_seen_at` advances while workers are idle.
 - Stopping one worker makes its heartbeat go stale while the others continue.
 
-### Slice 7: Claim and Process Initial `placed -> confirmed` Tasks
+### Slice 7A: Claim Pending Tasks Without Processing
 
-Goal: prove multiple workers can compete for work, claim each task once, and
-move accepted orders one real lifecycle step.
+Goal: prove multiple workers can safely compete for durable tasks without
+changing order state yet.
 
 Scope:
 
+- Add a worker polling loop with idle backoff:
+  - poll immediately after work is found;
+  - sleep 100ms after no work;
+  - exponentially back off to a maximum 1s idle sleep;
+  - reset the delay to 100ms whenever work is found.
 - Add a worker task-claim helper that selects one eligible task inside a
   transaction with `SELECT ... FOR UPDATE SKIP LOCKED`.
 - Eligible tasks are:
@@ -417,61 +422,152 @@ Scope:
   - `running` with `locked_until < now()` for expired-lease recovery.
 - Claiming updates the task to `running`, sets `locked_by`, sets
   `locked_until = now() + interval '30 seconds'`, and updates `updated_at`.
-- Handle only `task_type = advance_state` with `target_state = confirmed`.
-- In one transaction, the worker:
-  - loads the task and its order;
-  - verifies the order is still in `placed`;
-  - updates `orders.state` to `confirmed` with `WHERE id = ? AND version = ?`;
-  - increments `orders.version`;
-  - inserts an `order_events` row with `event_type = state_transition`,
-    `from_state = placed`, `to_state = confirmed`, `task_id = <current task
-    id>`, `worker_id = <this worker id>`, and the same `occurred_at` timestamp
-    used for the order/task updates;
-  - marks the task `completed` with `completed_at`.
-- If the order is terminal, mark the task `completed` as a safe no-op.
-- If the optimistic update affects zero rows, mark the task `completed` as a
-  stale no-op because another actor won the race.
+- For this slice only, immediately release claimed tasks back to `pending` after
+  logging or otherwise observing the claim. The release update must set:
+  - `status = pending`;
+  - `locked_by = null`;
+  - `locked_until = null`;
+  - `updated_at = now()`.
+- Do not change order state.
+- Do not insert `order_events`.
+- Do not mark claimed tasks `completed`.
 
 Design notes:
 
 - `SKIP LOCKED` prevents two live workers from seeing the same claimable row.
 - The 30-second lease is the crash recovery window, not the expected processing
   duration.
-- Worker polling should use a short active interval and idle backoff: poll
-  immediately after completing a task, sleep 100ms after a no-work result, and
-  exponentially back off to a maximum 1s idle sleep. Reset the delay to 100ms
-  whenever work is found.
 - Use existing constants from `common.state_machine`, `common.task_types`, and
   `common.event_types`; do not add duplicate raw strings.
-- The optimistic-locking comment should explain that `orders.version` protects
-  against stale workers, cancellation races, and expired leases.
 - Add comments around the claim query; this is the first concurrency-sensitive
   worker code.
-- Do not call `downstream-sim` yet. This slice proves the DB worker loop only.
+- Keep `downstream-sim`, next-task insertion, and the fake lifecycle out of this
+  PR.
 
 Acceptance checks:
 
 ```bash
+python3 -m py_compile backend/worker/*.py backend/common/*.py
+git diff --check
+
+docker compose up --build -d
+
 curl -X POST http://localhost:8082/load/start \
   -H 'content-type: application/json' \
   -d '{"rate_per_second":10,"max_orders":10,"restaurant_ref":"restaurant-1"}'
 
-docker compose exec postgres psql -U app -d orders -c \
-  "select state, count(*) from orders group by state order by state;"
+curl http://localhost:8082/status
+
+docker compose logs worker
 
 docker compose exec postgres psql -U app -d orders -c \
-  "select task_type, target_state, status, count(*) from order_tasks group by task_type, target_state, status order by task_type, target_state, status;"
+  "select state, count(*) from orders where idempotency_key like 'loadgen-<run_id>-%' group by state order by state;"
 
 docker compose exec postgres psql -U app -d orders -c \
-  "select event_type, from_state, to_state, count(*) from order_events group by event_type, from_state, to_state order by event_type, from_state, to_state;"
+  "select status, count(*) from order_tasks t join orders o on o.id = t.order_id where o.idempotency_key like 'loadgen-<run_id>-%' group by status order by status;"
+
+docker compose exec postgres psql -U app -d orders -c \
+  "select count(*) from order_tasks t join orders o on o.id = t.order_id where o.idempotency_key like 'loadgen-<run_id>-%' and status = 'pending' and (locked_by is not null or locked_until is not null);"
+
+docker compose exec postgres psql -U app -d orders -c \
+  "select worker_id, hostname, last_seen_at from workers where last_seen_at >= now() - interval '30 seconds' order by worker_id;"
 ```
 
 Expected:
 
+- 10 generated orders are created through loadgen.
+- Use the `run_id` returned by `GET /status` in the SQL placeholders so local
+  demo data from previous runs does not affect the counts.
+- Tasks are claimable, with `locked_by` values visible in worker logs or in the
+  database during polling.
+- Workers do not crash when no work exists.
+- No generated order for the run moves out of `placed`.
+- Generated tasks may be observed as `pending` or `running` while workers are
+  polling, but no generated task reaches `completed`.
+- Pending generated tasks have no `locked_by` or `locked_until` values after the
+  controlled release.
+
+### Slice 7B: Process Initial `placed -> confirmed`
+
+Goal: build on the claim helper and move accepted orders one real lifecycle
+step.
+
+Scope:
+
+- Reuse the Slice 7A task-claim helper and worker polling loop.
+- Process only claimed tasks where:
+  - `task_type = advance_state`;
+  - `target_state = confirmed`;
+  - the current order state is `placed`.
+- In one transaction, the worker:
+  - loads the claimed task and its order;
+  - reads the current `orders.version`;
+  - updates `orders.state` to `confirmed` with `WHERE id = ? AND version = ?`;
+  - increments `orders.version`;
+  - sets `orders.updated_at = now()`;
+  - inserts an `order_events` row with `event_type = state_transition`,
+    `from_state = placed`, `to_state = confirmed`, `task_id = <current task
+    id>`, `worker_id = <this worker id>`, and `occurred_at`;
+  - marks the task `completed`, sets `completed_at`, and clears or leaves lease
+    fields according to the documented implementation choice.
+- If the order is terminal, mark the task `completed` as a safe no-op.
+- If the optimistic update affects zero rows, mark the task `completed` as a
+  stale no-op because another actor won the race.
+- For this slice, log unknown task types or unsupported target states and leave
+  them `pending` so later slices can handle them.
+
+Design notes:
+
+- Use existing constants from `common.state_machine`, `common.task_types`, and
+  `common.event_types`; do not add duplicate raw strings.
+- Add a comment around the optimistic-locking update explaining that
+  `orders.version` protects against stale workers, cancellation races, and
+  expired leases.
+- Add comments around the claim query if Slice 7A has not already done so.
+- Keep the lease duration at 30 seconds.
+- Keep `downstream-sim`, next-task insertion, and the full fake lifecycle out of
+  this PR.
+
+Acceptance checks:
+
+```bash
+python3 -m py_compile backend/worker/*.py backend/common/*.py
+git diff --check
+
+docker compose up --build -d
+
+curl -X POST http://localhost:8082/load/start \
+  -H 'content-type: application/json' \
+  -d '{"rate_per_second":10,"max_orders":10,"restaurant_ref":"restaurant-1"}'
+
+curl http://localhost:8082/status
+
+docker compose exec postgres psql -U app -d orders -c \
+  "select state, count(*) from orders where idempotency_key like 'loadgen-<run_id>-%' group by state order by state;"
+
+docker compose exec postgres psql -U app -d orders -c \
+  "select task_type, target_state, status, count(*) from order_tasks t join orders o on o.id = t.order_id where o.idempotency_key like 'loadgen-<run_id>-%' group by task_type, target_state, status order by task_type, target_state, status;"
+
+docker compose exec postgres psql -U app -d orders -c \
+  "select event_type, from_state, to_state, count(*) from order_events e join orders o on o.id = e.order_id where o.idempotency_key like 'loadgen-<run_id>-%' group by event_type, from_state, to_state order by event_type, from_state, to_state;"
+
+docker compose exec postgres psql -U app -d orders -c \
+  "select count(*) from order_events e join orders o on o.id = e.order_id where o.idempotency_key like 'loadgen-<run_id>-%' and e.event_type = 'state_transition' and e.from_state = 'placed' and e.to_state = 'confirmed' and e.task_id is not null and e.worker_id is not null;"
+
+docker compose exec postgres psql -U app -d orders -c \
+  "select e.order_id, e.task_id, count(*) from order_events e join orders o on o.id = e.order_id where o.idempotency_key like 'loadgen-<run_id>-%' and e.event_type = 'state_transition' and e.from_state = 'placed' and e.to_state = 'confirmed' group by e.order_id, e.task_id having count(*) > 1;"
+```
+
+Expected:
+
+- Use the `run_id` returned by `GET /status` in the SQL placeholders so local
+  demo data from previous runs does not affect the counts.
 - The 10 generated orders move from `placed` to `confirmed`.
 - The 10 initial `advance_state -> confirmed` tasks become `completed`.
-- The event table has 10 `order_created` events and 10
-  `state_transition placed -> confirmed` events for the run.
+- The event table has 10 `state_transition placed -> confirmed` events for the
+  run with non-null `task_id` and `worker_id`.
+- No duplicate transition events exist for the same order/task.
+- No lifecycle transition beyond `confirmed` occurs.
 
 ### Slice 8: Insert the Next Fake Advance Task
 
