@@ -47,6 +47,8 @@ services:
     command: uvicorn downstream_sim.app:app --host 0.0.0.0 --port 8000
     environment:
       SERVICE_NAME: downstream-sim
+      RESTAURANT_READY_AFTER_SECONDS: "6"
+      RESTAURANT_READY_RETRY_AFTER_SECONDS: "2"
     ports:
       - "8081:8000"
     healthcheck:
@@ -96,6 +98,9 @@ services:
       DOWNSTREAM_SIM_BASE_URL: http://downstream-sim:8000
       DOWNSTREAM_REQUEST_TIMEOUT_SECONDS: "2"
       TASK_RETRY_DELAY_SECONDS: "5"
+      READY_CHECK_INITIAL_DELAY_SECONDS: "2"
+      READY_CHECK_INTERVAL_SECONDS: "2"
+      READY_CHECK_DEADLINE_SECONDS: "60"
     depends_on:
       migrator:
         condition: service_completed_successfully

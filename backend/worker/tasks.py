@@ -14,6 +14,7 @@ from common.state_machine import (
     ORDER_STATE_CONFIRMED,
     ORDER_STATE_PLACED,
     ORDER_STATE_PREPARING,
+    ORDER_STATE_READY,
     is_terminal_order_state,
 )
 from common.task_types import (
@@ -22,6 +23,7 @@ from common.task_types import (
     TASK_STATUS_PENDING,
     TASK_STATUS_RUNNING,
     TASK_TYPE_ADVANCE_STATE,
+    TASK_TYPE_CHECK_READY,
 )
 
 
@@ -31,6 +33,9 @@ LEASE_SECONDS = 30
 DEFAULT_DOWNSTREAM_SIM_BASE_URL = "http://downstream-sim:8000"
 DEFAULT_DOWNSTREAM_REQUEST_TIMEOUT_SECONDS = 2.0
 DEFAULT_TASK_RETRY_DELAY_SECONDS = 5.0
+DEFAULT_READY_CHECK_INITIAL_DELAY_SECONDS = 2.0
+DEFAULT_READY_CHECK_INTERVAL_SECONDS = 2.0
+DEFAULT_READY_CHECK_DEADLINE_SECONDS = 60.0
 MAX_LAST_ERROR_LENGTH = 300
 MAX_CLAIM_LOG_CACHE_SIZE = 1000
 _logged_claimed_task_ids: set[str] = set()
@@ -45,6 +50,7 @@ PROCESSING_ACTION_LOST_OWNERSHIP = "lost_ownership"
 PROCESSING_ACTION_COMPLETED_TERMINAL_NOOP = "completed_terminal_noop"
 PROCESSING_ACTION_COMPLETED_STALE_NOOP = "completed_stale_noop"
 PROCESSING_ACTION_COMPLETED_OPTIMISTIC_NOOP = "completed_optimistic_noop"
+PROCESSING_ACTION_POLL_SCHEDULED = "poll_scheduled"
 
 COMPLETED_NOOP_ACTIONS = frozenset(
     {
@@ -95,6 +101,7 @@ class RestaurantTransitionSpec:
     endpoint_path: str
     expected_status: str
     action_name: str
+    next_task_type: str | None = None
     next_target_state: str | None = None
 
 
@@ -107,6 +114,27 @@ class RestaurantTransitionCall:
     spec: RestaurantTransitionSpec
 
 
+@dataclass(frozen=True)
+class RestaurantReadyCheckCall:
+    """Details needed for one restaurant readiness poll."""
+
+    order_id: str
+    restaurant_ref: str
+    prep_started_at: datetime
+
+
+@dataclass(frozen=True)
+class RestaurantReadyCheckOutcome:
+    """Validated response from the restaurant readiness simulator endpoint."""
+
+    status: str
+    retry_after_seconds: float | None = None
+
+
+READY_CHECK_STATUS_READY = "ready"
+READY_CHECK_STATUS_NOT_READY = "not_ready"
+
+
 # This slice is command-style, not polling/callback-driven: each supported
 # target state maps to one downstream command and one expected success body.
 RESTAURANT_TRANSITION_SPECS = {
@@ -116,6 +144,7 @@ RESTAURANT_TRANSITION_SPECS = {
         endpoint_path="/restaurant/confirm",
         expected_status=ORDER_STATE_CONFIRMED,
         action_name="restaurant confirm",
+        next_task_type=TASK_TYPE_ADVANCE_STATE,
         next_target_state=ORDER_STATE_PREPARING,
     ),
     ORDER_STATE_PREPARING: RestaurantTransitionSpec(
@@ -124,8 +153,18 @@ RESTAURANT_TRANSITION_SPECS = {
         endpoint_path="/restaurant/start-prep",
         expected_status=ORDER_STATE_PREPARING,
         action_name="restaurant start-prep",
+        next_task_type=TASK_TYPE_CHECK_READY,
+        next_target_state=ORDER_STATE_READY,
     ),
 }
+
+READY_FINALIZATION_SPEC = RestaurantTransitionSpec(
+    source_state=ORDER_STATE_PREPARING,
+    target_state=ORDER_STATE_READY,
+    endpoint_path="/restaurant/check-ready",
+    expected_status=READY_CHECK_STATUS_READY,
+    action_name="restaurant check-ready",
+)
 
 
 def _read_positive_float_env(env_name: str, default: float) -> float:
@@ -169,6 +208,30 @@ def _task_retry_delay_seconds() -> float:
     )
 
 
+def _ready_check_initial_delay_seconds() -> float:
+    """Return how long to wait before the first restaurant ready check."""
+    return _read_positive_float_env(
+        "READY_CHECK_INITIAL_DELAY_SECONDS",
+        DEFAULT_READY_CHECK_INITIAL_DELAY_SECONDS,
+    )
+
+
+def _ready_check_interval_seconds() -> float:
+    """Return the fallback wait between normal not-ready polls."""
+    return _read_positive_float_env(
+        "READY_CHECK_INTERVAL_SECONDS",
+        DEFAULT_READY_CHECK_INTERVAL_SECONDS,
+    )
+
+
+def _ready_check_deadline_seconds() -> float:
+    """Return the max wall-clock wait for restaurant readiness polling."""
+    return _read_positive_float_env(
+        "READY_CHECK_DEADLINE_SECONDS",
+        DEFAULT_READY_CHECK_DEADLINE_SECONDS,
+    )
+
+
 def _short_error(message: str) -> str:
     """Keep task last_error small enough for dashboards and logs."""
     cleaned = " ".join(message.split())
@@ -190,6 +253,25 @@ def _should_log_claim_at_info(task_id: str) -> bool:
         expired_task_id = _logged_claimed_task_order.popleft()
         _logged_claimed_task_ids.discard(expired_task_id)
     return True
+
+
+def _valid_positive_number(value) -> float | None:
+    """Return a positive numeric JSON value, rejecting bools and strings."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if value > 0 else None
+
+
+def _bounded_ready_check_next_run_at(
+    *,
+    now: datetime,
+    retry_after_seconds: float | None,
+    deadline_at: datetime,
+) -> datetime:
+    """Return the next poll time, capped so the deadline gets a final check."""
+    poll_delay_seconds = retry_after_seconds or _ready_check_interval_seconds()
+    proposed_next_run_at = now + timedelta(seconds=poll_delay_seconds)
+    return min(proposed_next_run_at, deadline_at)
 
 
 def claim_one_task(*, worker_id: str) -> ClaimedTask | None:
@@ -348,6 +430,54 @@ def _load_transition_task_row(cur, *, task_id: str) -> dict | None:
     return cur.fetchone()
 
 
+def _load_ready_check_task_row(cur, *, task_id: str) -> dict | None:
+    """Lock the check_ready task row and return current order/prep details."""
+    # Keep the order row unlocked for the same reason as command transitions:
+    # the final UPDATE ... WHERE version = <read_version> is the concurrency
+    # guard, while FOR UPDATE OF task proves task ownership.
+    cur.execute(
+        """
+        select
+            task.id::text as task_id,
+            task.order_id::text,
+            task.status::text as task_status,
+            task.locked_by,
+            task.attempts,
+            task.max_attempts,
+            task.deadline_at,
+            orders.state::text as order_state,
+            orders.version,
+            orders.restaurant_ref,
+            prep_event.occurred_at as prep_started_at
+        from order_tasks as task
+        join orders on orders.id = task.order_id
+        -- The preparing transition event is the durable clock source for the
+        -- simulator. It was committed with the state change, so workers do not
+        -- need simulator-side state to know when prep started.
+        left join lateral (
+            select occurred_at
+            from order_events
+            where
+                order_id = orders.id
+                and event_type = %s::event_type
+                and from_state = %s::order_state
+                and to_state = %s::order_state
+            order by occurred_at desc
+            limit 1
+        ) as prep_event on true
+        where task.id = %s::uuid
+        for update of task
+        """,
+        (
+            EVENT_TYPE_STATE_TRANSITION,
+            ORDER_STATE_CONFIRMED,
+            ORDER_STATE_PREPARING,
+            task_id,
+        ),
+    )
+    return cur.fetchone()
+
+
 def _owned_task_check_result(
     row: dict | None,
     *,
@@ -411,6 +541,44 @@ def _reschedule_claimed_task(
     return cur.rowcount == 1
 
 
+def _reschedule_poll_task(
+    cur,
+    *,
+    task_id: str,
+    worker_id: str,
+    next_run_at: datetime,
+    updated_at: datetime,
+) -> bool:
+    """Release a poll task after a normal not-ready response."""
+    # not_ready is expected business progress, not a downstream error. Keep the
+    # retry budget intact and clear any older transient last_error.
+    cur.execute(
+        """
+        update order_tasks
+        set
+            status = %s::task_status,
+            next_run_at = %s,
+            last_error = null,
+            locked_by = null,
+            locked_until = null,
+            updated_at = %s
+        where
+            id = %s::uuid
+            and status = %s::task_status
+            and locked_by = %s
+        """,
+        (
+            TASK_STATUS_PENDING,
+            next_run_at,
+            updated_at,
+            task_id,
+            TASK_STATUS_RUNNING,
+            worker_id,
+        ),
+    )
+    return cur.rowcount == 1
+
+
 def _fail_claimed_task(
     cur,
     *,
@@ -445,6 +613,111 @@ def _fail_claimed_task(
         ),
     )
     return cur.rowcount == 1
+
+
+def _fail_claimed_task_without_attempt_increment(
+    cur,
+    *,
+    task_id: str,
+    worker_id: str,
+    last_error: str,
+    updated_at: datetime,
+) -> bool:
+    """Mark a claimed task failed for a non-transient business timeout."""
+    # Deadline failure is a separate control from max_attempts. Preserve
+    # attempts so dashboards can distinguish business timeout from transport
+    # errors that consumed retry budget.
+    cur.execute(
+        """
+        update order_tasks
+        set
+            status = %s::task_status,
+            last_error = %s,
+            locked_by = null,
+            locked_until = null,
+            updated_at = %s
+        where
+            id = %s::uuid
+            and status = %s::task_status
+            and locked_by = %s
+        """,
+        (
+            TASK_STATUS_FAILED,
+            last_error,
+            updated_at,
+            task_id,
+            TASK_STATUS_RUNNING,
+            worker_id,
+        ),
+    )
+    return cur.rowcount == 1
+
+
+def _retry_or_fail_claimed_task(
+    cur,
+    *,
+    task_id: str,
+    worker_id: str,
+    order_id: str,
+    from_state: str,
+    to_state: str,
+    attempts: int,
+    max_attempts: int,
+    next_run_at: datetime,
+    last_error: str,
+    updated_at: datetime,
+) -> ProcessingResult:
+    """Consume one retryable failure and either reschedule or fail the task."""
+    next_attempts = attempts + 1
+    if next_attempts >= max_attempts:
+        failed = _fail_claimed_task(
+            cur,
+            task_id=task_id,
+            worker_id=worker_id,
+            last_error=last_error,
+            updated_at=updated_at,
+        )
+        if failed:
+            return ProcessingResult(
+                action=PROCESSING_ACTION_FAILED,
+                order_id=order_id,
+                from_state=from_state,
+                to_state=to_state,
+                error=last_error,
+            )
+
+        return ProcessingResult(
+            action=PROCESSING_ACTION_LOST_OWNERSHIP,
+            order_id=order_id,
+            from_state=from_state,
+            to_state=to_state,
+            error=last_error,
+        )
+
+    scheduled = _reschedule_claimed_task(
+        cur,
+        task_id=task_id,
+        worker_id=worker_id,
+        next_run_at=next_run_at,
+        last_error=last_error,
+        updated_at=updated_at,
+    )
+    if scheduled:
+        return ProcessingResult(
+            action=PROCESSING_ACTION_RETRY_SCHEDULED,
+            order_id=order_id,
+            from_state=from_state,
+            to_state=to_state,
+            error=last_error,
+        )
+
+    return ProcessingResult(
+        action=PROCESSING_ACTION_LOST_OWNERSHIP,
+        order_id=order_id,
+        from_state=from_state,
+        to_state=to_state,
+        error=last_error,
+    )
 
 
 def _prepare_transition_call(
@@ -550,15 +823,338 @@ def _call_restaurant_transition(call: RestaurantTransitionCall) -> str | None:
     return None
 
 
-def _insert_next_transition_task(
+def _prepare_ready_check_call(
+    *,
+    task: ClaimedTask,
+    worker_id: str,
+) -> RestaurantReadyCheckCall | ProcessingResult:
+    """Validate the claimed check_ready task and return simulator call details."""
+    occurred_at = datetime.now(timezone.utc)
+    with open_db_connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                row = _load_ready_check_task_row(cur, task_id=task.id)
+                skip_result = _owned_task_check_result(row, worker_id=worker_id)
+                if skip_result is not None:
+                    return skip_result
+
+                order_state = row["order_state"]
+                order_id = row["order_id"]
+                if is_terminal_order_state(order_state):
+                    _complete_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        completed_at=occurred_at,
+                    )
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_COMPLETED_TERMINAL_NOOP,
+                        order_id=order_id,
+                        from_state=order_state,
+                    )
+
+                if order_state != ORDER_STATE_PREPARING:
+                    _complete_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        completed_at=occurred_at,
+                    )
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_COMPLETED_STALE_NOOP,
+                        order_id=order_id,
+                        from_state=order_state,
+                    )
+
+                if row["deadline_at"] is None:
+                    return _retry_or_fail_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        order_id=order_id,
+                        from_state=ORDER_STATE_PREPARING,
+                        to_state=ORDER_STATE_READY,
+                        attempts=row["attempts"],
+                        max_attempts=row["max_attempts"],
+                        next_run_at=occurred_at
+                        + timedelta(seconds=_task_retry_delay_seconds()),
+                        last_error="check_ready task is missing deadline_at",
+                        updated_at=occurred_at,
+                    )
+
+                if row["prep_started_at"] is None:
+                    return _retry_or_fail_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        order_id=order_id,
+                        from_state=ORDER_STATE_PREPARING,
+                        to_state=ORDER_STATE_READY,
+                        attempts=row["attempts"],
+                        max_attempts=row["max_attempts"],
+                        next_run_at=occurred_at
+                        + timedelta(seconds=_task_retry_delay_seconds()),
+                        last_error="missing confirmed -> preparing event for check_ready",
+                        updated_at=occurred_at,
+                    )
+
+                return RestaurantReadyCheckCall(
+                    order_id=order_id,
+                    restaurant_ref=row["restaurant_ref"],
+                    prep_started_at=row["prep_started_at"],
+                )
+
+
+def _call_restaurant_ready_check(
+    call: RestaurantReadyCheckCall,
+) -> RestaurantReadyCheckOutcome | str:
+    """Call the readiness simulator and return an outcome or retryable error."""
+    url = f"{_downstream_sim_base_url()}/restaurant/check-ready"
+    payload = {
+        "order_id": call.order_id,
+        "restaurant_ref": call.restaurant_ref,
+        "prep_started_at": call.prep_started_at.isoformat(),
+    }
+
+    # no response is different from not_ready: no response consumes error retry
+    # budget because the worker cannot trust downstream state; not_ready is a
+    # valid business response and keeps attempts unchanged.
+    try:
+        response = httpx.post(
+            url,
+            json=payload,
+            timeout=_downstream_request_timeout_seconds(),
+        )
+    except httpx.TimeoutException as exc:
+        return _short_error(f"downstream timeout calling restaurant check-ready: {exc}")
+    except httpx.RequestError as exc:
+        return _short_error(
+            f"downstream request failed calling restaurant check-ready: {exc}"
+        )
+
+    if response.status_code >= 500:
+        return _short_error(
+            f"downstream returned {response.status_code} from restaurant check-ready"
+        )
+    if response.status_code != 200:
+        return _short_error(
+            f"downstream returned unexpected {response.status_code} "
+            "from restaurant check-ready"
+        )
+
+    try:
+        body = response.json()
+    except ValueError as exc:
+        return _short_error(f"downstream returned invalid JSON: {exc}")
+
+    if not isinstance(body, dict):
+        return _short_error(f"downstream returned invalid check-ready body: {body!r}")
+
+    status = body.get("status")
+    if status == READY_CHECK_STATUS_READY:
+        return RestaurantReadyCheckOutcome(status=READY_CHECK_STATUS_READY)
+    if status == READY_CHECK_STATUS_NOT_READY:
+        return RestaurantReadyCheckOutcome(
+            status=READY_CHECK_STATUS_NOT_READY,
+            retry_after_seconds=_valid_positive_number(
+                body.get("retry_after_seconds")
+            ),
+        )
+
+    return _short_error(f"downstream returned invalid check-ready body: {body!r}")
+
+
+def _reschedule_ready_check_after_error(
+    *,
+    task: ClaimedTask,
+    worker_id: str,
+    order_id: str,
+    error: str,
+) -> ProcessingResult:
+    """Consume retry budget after a failed readiness check request."""
+    updated_at = datetime.now(timezone.utc)
+    next_run_at = updated_at + timedelta(seconds=_task_retry_delay_seconds())
+
+    with open_db_connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                row = _load_ready_check_task_row(cur, task_id=task.id)
+                skip_result = _owned_task_check_result(row, worker_id=worker_id)
+                if skip_result is not None:
+                    return skip_result
+
+                order_state = row["order_state"]
+                if is_terminal_order_state(order_state):
+                    _complete_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        completed_at=updated_at,
+                    )
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_COMPLETED_TERMINAL_NOOP,
+                        order_id=row["order_id"],
+                        from_state=order_state,
+                    )
+
+                if order_state != ORDER_STATE_PREPARING:
+                    _complete_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        completed_at=updated_at,
+                    )
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_COMPLETED_STALE_NOOP,
+                        order_id=row["order_id"],
+                        from_state=order_state,
+                    )
+
+                return _retry_or_fail_claimed_task(
+                    cur,
+                    task_id=task.id,
+                    worker_id=worker_id,
+                    order_id=order_id,
+                    from_state=ORDER_STATE_PREPARING,
+                    to_state=ORDER_STATE_READY,
+                    attempts=row["attempts"],
+                    max_attempts=row["max_attempts"],
+                    next_run_at=next_run_at,
+                    last_error=error,
+                    updated_at=updated_at,
+                )
+
+
+def _reschedule_ready_check_after_not_ready(
+    *,
+    task: ClaimedTask,
+    worker_id: str,
+    outcome: RestaurantReadyCheckOutcome,
+) -> ProcessingResult:
+    """Release check_ready after a normal not-ready response."""
+    updated_at = datetime.now(timezone.utc)
+
+    with open_db_connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                row = _load_ready_check_task_row(cur, task_id=task.id)
+                skip_result = _owned_task_check_result(row, worker_id=worker_id)
+                if skip_result is not None:
+                    return skip_result
+
+                order_state = row["order_state"]
+                order_id = row["order_id"]
+                if is_terminal_order_state(order_state):
+                    _complete_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        completed_at=updated_at,
+                    )
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_COMPLETED_TERMINAL_NOOP,
+                        order_id=order_id,
+                        from_state=order_state,
+                    )
+
+                if order_state != ORDER_STATE_PREPARING:
+                    _complete_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        completed_at=updated_at,
+                    )
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_COMPLETED_STALE_NOOP,
+                        order_id=order_id,
+                        from_state=order_state,
+                    )
+
+                if row["deadline_at"] is None:
+                    return _retry_or_fail_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        order_id=order_id,
+                        from_state=ORDER_STATE_PREPARING,
+                        to_state=ORDER_STATE_READY,
+                        attempts=row["attempts"],
+                        max_attempts=row["max_attempts"],
+                        next_run_at=updated_at
+                        + timedelta(seconds=_task_retry_delay_seconds()),
+                        last_error="check_ready task is missing deadline_at",
+                        updated_at=updated_at,
+                    )
+
+                if updated_at >= row["deadline_at"]:
+                    # Deadline failure is a business timeout after valid
+                    # not_ready responses. It fails the task but keeps attempts
+                    # unchanged because no transient downstream error occurred.
+                    error = "restaurant ready deadline exceeded"
+                    failed = _fail_claimed_task_without_attempt_increment(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        last_error=error,
+                        updated_at=updated_at,
+                    )
+                    if failed:
+                        return ProcessingResult(
+                            action=PROCESSING_ACTION_FAILED,
+                            order_id=order_id,
+                            from_state=ORDER_STATE_PREPARING,
+                            to_state=ORDER_STATE_READY,
+                            error=error,
+                        )
+
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_LOST_OWNERSHIP,
+                        order_id=order_id,
+                        from_state=ORDER_STATE_PREPARING,
+                        to_state=ORDER_STATE_READY,
+                        error=error,
+                    )
+
+                next_run_at = _bounded_ready_check_next_run_at(
+                    now=updated_at,
+                    retry_after_seconds=outcome.retry_after_seconds,
+                    deadline_at=row["deadline_at"],
+                )
+                scheduled = _reschedule_poll_task(
+                    cur,
+                    task_id=task.id,
+                    worker_id=worker_id,
+                    next_run_at=next_run_at,
+                    updated_at=updated_at,
+                )
+                if scheduled:
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_POLL_SCHEDULED,
+                        order_id=order_id,
+                        from_state=ORDER_STATE_PREPARING,
+                        to_state=ORDER_STATE_READY,
+                    )
+
+    return ProcessingResult(
+        action=PROCESSING_ACTION_LOST_OWNERSHIP,
+        order_id=task.order_id,
+        from_state=ORDER_STATE_PREPARING,
+        to_state=ORDER_STATE_READY,
+    )
+
+
+def _insert_followup_task(
     cur,
     *,
     order_id: str,
+    task_type: str,
     target_state: str,
+    next_run_at: datetime,
+    deadline_at: datetime | None,
     created_at: datetime,
 ) -> None:
-    """Insert the next advance_state task for a committed lifecycle transition."""
-    dedupe_key = f"{order_id}:{TASK_TYPE_ADVANCE_STATE}:{target_state}"
+    """Insert the next task for a committed lifecycle transition."""
+    dedupe_key = f"{order_id}:{task_type}:{target_state}"
     # The partial unique index only prevents duplicate active follow-up tasks;
     # completed historical tasks with the same dedupe key remain queryable.
     cur.execute(
@@ -570,6 +1166,7 @@ def _insert_next_transition_task(
             target_state,
             status,
             next_run_at,
+            deadline_at,
             dedupe_key,
             created_at,
             updated_at
@@ -580,6 +1177,7 @@ def _insert_next_transition_task(
             %s::task_type,
             %s::order_state,
             %s::task_status,
+            %s,
             %s,
             %s,
             %s,
@@ -596,15 +1194,34 @@ def _insert_next_transition_task(
         (
             uuid4(),
             order_id,
-            TASK_TYPE_ADVANCE_STATE,
+            task_type,
             target_state,
             TASK_STATUS_PENDING,
-            created_at,
+            next_run_at,
+            deadline_at,
             dedupe_key,
             created_at,
             created_at,
         ),
     )
+
+
+def _followup_schedule_for_spec(
+    *,
+    spec: RestaurantTransitionSpec,
+    occurred_at: datetime,
+) -> tuple[datetime, datetime | None]:
+    """Return next_run_at and deadline_at for a transition follow-up task."""
+    if spec.next_task_type == TASK_TYPE_CHECK_READY:
+        # Poll tasks need a business deadline independent from transport
+        # max_attempts. A restaurant can keep saying "not ready" forever even
+        # when every HTTP request succeeds.
+        return (
+            occurred_at + timedelta(seconds=_ready_check_initial_delay_seconds()),
+            occurred_at + timedelta(seconds=_ready_check_deadline_seconds()),
+        )
+
+    return occurred_at, None
 
 
 def _finalize_transition_task(
@@ -724,14 +1341,24 @@ def _finalize_transition_task(
                         occurred_at,
                     ),
                 )
-                if spec.next_target_state is not None:
+                if (
+                    spec.next_task_type is not None
+                    and spec.next_target_state is not None
+                ):
                     # The follow-up task is created in the same transaction as
                     # the state transition. If the transition rolls back, the
                     # next stage cannot be claimed; if it commits, work exists.
-                    _insert_next_transition_task(
+                    next_run_at, deadline_at = _followup_schedule_for_spec(
+                        spec=spec,
+                        occurred_at=occurred_at,
+                    )
+                    _insert_followup_task(
                         cur,
                         order_id=order_id,
+                        task_type=spec.next_task_type,
                         target_state=spec.next_target_state,
+                        next_run_at=next_run_at,
+                        deadline_at=deadline_at,
                         created_at=occurred_at,
                     )
 
@@ -874,6 +1501,37 @@ def process_transition_task(
     return _finalize_transition_task(task=task, worker_id=worker_id, spec=spec)
 
 
+def process_ready_check_task(*, task: ClaimedTask, worker_id: str) -> ProcessingResult:
+    """Poll restaurant readiness and advance preparing orders to ready."""
+    prepared = _prepare_ready_check_call(task=task, worker_id=worker_id)
+    if isinstance(prepared, ProcessingResult):
+        return prepared
+
+    # The readiness poll is outside any transaction, just like command calls.
+    # Workers must not hold DB locks while waiting on downstream.
+    outcome = _call_restaurant_ready_check(prepared)
+    if isinstance(outcome, str):
+        return _reschedule_ready_check_after_error(
+            task=task,
+            worker_id=worker_id,
+            order_id=prepared.order_id,
+            error=outcome,
+        )
+
+    if outcome.status == READY_CHECK_STATUS_READY:
+        return _finalize_transition_task(
+            task=task,
+            worker_id=worker_id,
+            spec=READY_FINALIZATION_SPEC,
+        )
+
+    return _reschedule_ready_check_after_not_ready(
+        task=task,
+        worker_id=worker_id,
+        outcome=outcome,
+    )
+
+
 def claim_and_process_one_task(*, worker_id: str) -> bool:
     """Claim one task and process the first supported lifecycle transition."""
     task = claim_one_task(worker_id=worker_id)
@@ -883,8 +1541,25 @@ def claim_and_process_one_task(*, worker_id: str) -> bool:
     log = logger.info if _should_log_claim_at_info(task.id) else logger.debug
     log("claimed task %s for order %s by %s", task.id, task.order_id, worker_id)
 
-    spec = RESTAURANT_TRANSITION_SPECS.get(task.target_state)
-    if task.task_type != TASK_TYPE_ADVANCE_STATE or spec is None:
+    if task.task_type == TASK_TYPE_ADVANCE_STATE:
+        spec = RESTAURANT_TRANSITION_SPECS.get(task.target_state)
+        if spec is not None:
+            result = process_transition_task(
+                task=task,
+                worker_id=worker_id,
+                spec=spec,
+            )
+        else:
+            result = None
+    elif (
+        task.task_type == TASK_TYPE_CHECK_READY
+        and task.target_state == ORDER_STATE_READY
+    ):
+        result = process_ready_check_task(task=task, worker_id=worker_id)
+    else:
+        result = None
+
+    if result is None:
         # Unsupported tasks are not failed here. Releasing them preserves forward
         # compatibility with the next lifecycle slices that will claim the same
         # durable rows after their handlers are added.
@@ -897,7 +1572,6 @@ def claim_and_process_one_task(*, worker_id: str) -> bool:
         release_claimed_task(task_id=task.id, worker_id=worker_id)
         return True
 
-    result = process_transition_task(task=task, worker_id=worker_id, spec=spec)
     if result.action == PROCESSING_ACTION_TRANSITIONED:
         logger.info(
             "advanced order %s %s -> %s with task %s by %s",
@@ -914,9 +1588,15 @@ def claim_and_process_one_task(*, worker_id: str) -> bool:
             result.order_id,
             result.error,
         )
+    elif result.action == PROCESSING_ACTION_POLL_SCHEDULED:
+        logger.info(
+            "rescheduled poll task %s for order %s after not-ready response",
+            task.id,
+            result.order_id,
+        )
     elif result.action == PROCESSING_ACTION_FAILED:
         logger.error(
-            "failed task %s for order %s after exhausting retries: %s",
+            "failed task %s for order %s: %s",
             task.id,
             result.order_id,
             result.error,
