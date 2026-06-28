@@ -150,6 +150,9 @@ def claim_one_task(*, worker_id: str) -> ClaimedTask | None:
                 # behind it, so replicas can claim different tasks in parallel.
                 # updated_at keeps rows released back to pending from being
                 # repeatedly selected ahead of other due work.
+                # The CTE selects only one task id; the outer UPDATE then claims
+                # exactly that row in the same statement, avoiding a read/write
+                # gap where another worker could claim it first.
                 cur.execute(
                     """
                     with candidate as (
@@ -266,6 +269,9 @@ def _complete_claimed_task(cur, *, task_id: str, worker_id: str, completed_at) -
 
 def _load_confirm_task_row(cur, *, task_id: str) -> dict | None:
     """Lock the task row and return current order details for confirmation."""
+    # Lock only the task row here. The order row is intentionally left unlocked
+    # so the later UPDATE ... WHERE version = <read_version> is the real
+    # optimistic concurrency guard for cancellation races and stale workers.
     cur.execute(
         """
         select
@@ -317,6 +323,9 @@ def _reschedule_claimed_task(
     updated_at: datetime,
 ) -> bool:
     """Release a claimed task back to pending after a retryable failure."""
+    # attempts counts consumed downstream tries, not claim attempts. Completing a
+    # task successfully leaves attempts unchanged; only retryable failures and
+    # final failure consume the retry budget.
     cur.execute(
         """
         update order_tasks
@@ -392,6 +401,9 @@ def _prepare_confirm_call(
     with open_db_connection() as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
+                # This first DB phase is deliberately short: verify we still own
+                # the task and either return the data needed for the HTTP call or
+                # complete the task as a no-op. The network call happens later.
                 row = _load_confirm_task_row(cur, task_id=task.id)
                 skip_result = _owned_task_check_result(row, worker_id=worker_id)
                 if skip_result is not None:
@@ -483,6 +495,9 @@ def _finalize_confirm_task(
     with open_db_connection() as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
+                # The downstream call may have taken longer than the task lease,
+                # or another actor may have changed the order. Re-read and
+                # re-check ownership before committing any local state change.
                 row = _load_confirm_task_row(cur, task_id=task.id)
                 skip_result = _owned_task_check_result(row, worker_id=worker_id)
                 if skip_result is not None:
@@ -586,6 +601,9 @@ def _finalize_confirm_task(
                         occurred_at,
                     ),
                 )
+                # Event insertion and task completion stay in the same
+                # transaction as the order transition so the audit trail cannot
+                # show a completed task without the matching state event.
                 _complete_claimed_task(
                     cur,
                     task_id=task.id,
@@ -615,6 +633,9 @@ def _reschedule_confirm_task(
     with open_db_connection() as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
+                # Lock the task before deciding whether this failure consumes
+                # the final attempt. That keeps concurrent expired-lease
+                # claimants from double-counting retries.
                 cur.execute(
                     """
                     select
@@ -718,6 +739,9 @@ def claim_and_process_one_task(*, worker_id: str) -> bool:
         task.task_type != TASK_TYPE_ADVANCE_STATE
         or task.target_state != ORDER_STATE_CONFIRMED
     ):
+        # Unsupported tasks are not failed here. Releasing them preserves forward
+        # compatibility with the next lifecycle slices that will claim the same
+        # durable rows after their handlers are added.
         logger.warning(
             "unsupported task %s type=%s target=%s; releasing for later slice",
             task.id,

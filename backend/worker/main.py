@@ -100,6 +100,9 @@ async def run_worker() -> None:
         await asyncio.to_thread(configure_db_pool)
         logger.info("worker started", extra={"worker_id": identity.worker_id})
 
+        # Heartbeat and task polling are independent long-lived loops. Scheduling
+        # both as tasks keeps the worker visible in the heartbeat table while it
+        # is also draining work from the durable queue.
         worker_tasks = [
             asyncio.create_task(run_heartbeat_loop(identity, stop_event)),
             asyncio.create_task(run_task_poll_loop(identity, stop_event)),
