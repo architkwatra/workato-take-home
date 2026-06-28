@@ -20,6 +20,19 @@ class RestaurantConfirmResponse(BaseModel):
     status: str
 
 
+class RestaurantStartPrepRequest(BaseModel):
+    """Restaurant start-prep request sent by the worker."""
+
+    order_id: str = Field(min_length=1)
+    restaurant_ref: str = Field(min_length=1)
+
+
+class RestaurantStartPrepResponse(BaseModel):
+    """Deterministic restaurant start-prep response."""
+
+    status: str
+
+
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     """Report that the downstream simulator process is alive."""
@@ -53,3 +66,16 @@ async def confirm_restaurant_order(
     downstream idempotency is added in a later slice.
     """
     return {"status": "confirmed"}
+
+
+@app.post("/restaurant/start-prep", response_model=RestaurantStartPrepResponse)
+async def start_restaurant_prep(
+    request: RestaurantStartPrepRequest,
+) -> dict[str, str]:
+    """Start restaurant preparation for an order.
+
+    Like confirmation, this is a deterministic command endpoint for the current
+    demo slice. Repeated requests for the same order return the same response;
+    durable idempotency records remain a later step.
+    """
+    return {"status": "preparing"}

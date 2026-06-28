@@ -110,6 +110,18 @@ where id = <order_id>
 
 Do not insert the next `preparing -> ready` task yet.
 
+This slice remains command-style rather than callback- or polling-driven. The
+worker sends a command to `downstream-sim` and advances local state only when the
+simulator returns the expected success body. If the simulator gives no response
+because of a timeout, connection failure, container stop, 5xx, invalid JSON, or
+unexpected status body, the worker treats that as a retryable downstream error:
+
+- the order remains in the source state (`placed` for confirmation, `confirmed`
+  for start-prep);
+- the claimed task is released back to `pending` with `last_error`;
+- `attempts` increments on each retryable failure;
+- once `attempts + 1 >= max_attempts`, the task becomes `failed`.
+
 ## Expected Refactor
 
 The current worker code is confirm-specific. Rather than duplicate the entire
@@ -154,6 +166,7 @@ The refactor must preserve two existing correctness properties from `main`:
 
 - No `preparing -> ready` task yet.
 - No `check_ready` polling yet.
+- No downstream callback/webhook handling yet.
 - No courier flow.
 - No `downstream_calls` table yet.
 - No simulator persistence or idempotency records yet.
