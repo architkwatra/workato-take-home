@@ -15,7 +15,13 @@ logging.basicConfig(
 logger = logging.getLogger("worker")
 
 HEARTBEAT_INTERVAL_SECONDS = 10
+
+# When the queue is empty, workers start with a short 100ms idle sleep so fresh
+# tasks are picked up quickly without a tight DB-polling loop.
 TASK_POLL_INITIAL_IDLE_SECONDS = 0.1
+
+# Idle polling backs off only to 1s so a quiet worker stays cheap but still
+# notices new loadgen-created tasks promptly during demos.
 TASK_POLL_MAX_IDLE_SECONDS = 1.0
 
 
@@ -62,6 +68,8 @@ async def run_task_poll_loop(identity, stop_event: asyncio.Event) -> None:
             found_work = False
 
         if found_work:
+            # Do not sleep after successful work. Reset only the next no-work
+            # sleep so a busy queue drains quickly, then poll again immediately.
             idle_delay = TASK_POLL_INITIAL_IDLE_SECONDS
             continue
 
