@@ -99,6 +99,8 @@ services:
     depends_on:
       migrator:
         condition: service_completed_successfully
+      downstream-sim:
+        condition: service_healthy
     deploy:
       replicas: 3
 
