@@ -1,3 +1,4 @@
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -22,11 +23,13 @@ async def lifespan(app: FastAPI):
     # The API uses synchronous psycopg from normal `def` handlers. FastAPI runs
     # those handlers in a threadpool, so blocking DB waits do not freeze the
     # event loop that accepts other requests.
-    configure_db_pool()
+    # Pool startup/shutdown are synchronous too, so run them off the event loop
+    # to keep Uvicorn responsive to shutdown signals while Postgres is slow.
+    await asyncio.to_thread(configure_db_pool)
     try:
         yield
     finally:
-        close_db_pool()
+        await asyncio.to_thread(close_db_pool)
 
 
 app = FastAPI(title="Order Pipeline API", lifespan=lifespan)

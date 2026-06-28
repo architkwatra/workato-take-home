@@ -1,5 +1,6 @@
 import logging
 import os
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
@@ -31,7 +32,9 @@ DEFAULT_DOWNSTREAM_SIM_BASE_URL = "http://downstream-sim:8000"
 DEFAULT_DOWNSTREAM_REQUEST_TIMEOUT_SECONDS = 2.0
 DEFAULT_TASK_RETRY_DELAY_SECONDS = 5.0
 MAX_LAST_ERROR_LENGTH = 300
+MAX_CLAIM_LOG_CACHE_SIZE = 1000
 _logged_claimed_task_ids: set[str] = set()
+_logged_claimed_task_order: deque[str] = deque()
 
 PROCESSING_ACTION_TRANSITIONED = "transitioned"
 PROCESSING_ACTION_RETRY_SCHEDULED = "retry_scheduled"
@@ -172,6 +175,21 @@ def _short_error(message: str) -> str:
     if len(cleaned) <= MAX_LAST_ERROR_LENGTH:
         return cleaned
     return f"{cleaned[: MAX_LAST_ERROR_LENGTH - 3]}..."
+
+
+def _should_log_claim_at_info(task_id: str) -> bool:
+    """Return whether this task claim should use info-level logging."""
+    if task_id in _logged_claimed_task_ids:
+        return False
+
+    # Reclaimed tasks can appear repeatedly during downstream outages. Keep
+    # only a bounded recent-id cache so log suppression cannot grow forever.
+    _logged_claimed_task_ids.add(task_id)
+    _logged_claimed_task_order.append(task_id)
+    while len(_logged_claimed_task_order) > MAX_CLAIM_LOG_CACHE_SIZE:
+        expired_task_id = _logged_claimed_task_order.popleft()
+        _logged_claimed_task_ids.discard(expired_task_id)
+    return True
 
 
 def claim_one_task(*, worker_id: str) -> ClaimedTask | None:
@@ -569,7 +587,10 @@ def _insert_next_transition_task(
         )
         on conflict (dedupe_key)
             where dedupe_key is not null
-                and status in ('pending', 'running')
+                and status in (
+                    'pending'::task_status,
+                    'running'::task_status
+                )
         do nothing
         """,
         (
@@ -859,8 +880,7 @@ def claim_and_process_one_task(*, worker_id: str) -> bool:
     if task is None:
         return False
 
-    log = logger.info if task.id not in _logged_claimed_task_ids else logger.debug
-    _logged_claimed_task_ids.add(task.id)
+    log = logger.info if _should_log_claim_at_info(task.id) else logger.debug
     log("claimed task %s for order %s by %s", task.id, task.order_id, worker_id)
 
     spec = RESTAURANT_TRANSITION_SPECS.get(task.target_state)
