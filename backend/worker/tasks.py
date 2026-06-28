@@ -16,6 +16,7 @@ from common.state_machine import (
 )
 from common.task_types import (
     TASK_STATUS_COMPLETED,
+    TASK_STATUS_FAILED,
     TASK_STATUS_PENDING,
     TASK_STATUS_RUNNING,
     TASK_TYPE_ADVANCE_STATE,
@@ -33,6 +34,7 @@ _logged_claimed_task_ids: set[str] = set()
 
 PROCESSING_ACTION_TRANSITIONED = "transitioned"
 PROCESSING_ACTION_RETRY_SCHEDULED = "retry_scheduled"
+PROCESSING_ACTION_FAILED = "failed"
 PROCESSING_ACTION_MISSING_TASK = "missing_task"
 PROCESSING_ACTION_NOT_RUNNING = "not_running"
 PROCESSING_ACTION_LOST_OWNERSHIP = "lost_ownership"
@@ -263,7 +265,7 @@ def _complete_claimed_task(cur, *, task_id: str, worker_id: str, completed_at) -
 
 
 def _load_confirm_task_row(cur, *, task_id: str) -> dict | None:
-    """Lock and return the task/order row needed for confirmation work."""
+    """Lock the task row and return current order details for confirmation."""
     cur.execute(
         """
         select
@@ -277,7 +279,7 @@ def _load_confirm_task_row(cur, *, task_id: str) -> dict | None:
         from order_tasks as task
         join orders on orders.id = task.order_id
         where task.id = %s::uuid
-        for update of task, orders
+        for update of task
         """,
         (task_id,),
     )
@@ -320,6 +322,7 @@ def _reschedule_claimed_task(
         update order_tasks
         set
             status = %s::task_status,
+            attempts = attempts + 1,
             next_run_at = %s,
             last_error = %s,
             locked_by = null,
@@ -333,6 +336,42 @@ def _reschedule_claimed_task(
         (
             TASK_STATUS_PENDING,
             next_run_at,
+            last_error,
+            updated_at,
+            task_id,
+            TASK_STATUS_RUNNING,
+            worker_id,
+        ),
+    )
+    return cur.rowcount == 1
+
+
+def _fail_claimed_task(
+    cur,
+    *,
+    task_id: str,
+    worker_id: str,
+    last_error: str,
+    updated_at: datetime,
+) -> bool:
+    """Mark a claimed task failed after exhausting retry attempts."""
+    cur.execute(
+        """
+        update order_tasks
+        set
+            status = %s::task_status,
+            attempts = attempts + 1,
+            last_error = %s,
+            locked_by = null,
+            locked_until = null,
+            updated_at = %s
+        where
+            id = %s::uuid
+            and status = %s::task_status
+            and locked_by = %s
+        """,
+        (
+            TASK_STATUS_FAILED,
             last_error,
             updated_at,
             task_id,
@@ -575,11 +614,53 @@ def _reschedule_confirm_task(
 
     with open_db_connection() as conn:
         with conn.transaction():
-            with conn.cursor() as cur:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    select
+                        id::text as task_id,
+                        order_id::text,
+                        status::text as task_status,
+                        locked_by,
+                        attempts,
+                        max_attempts
+                    from order_tasks
+                    where id = %s::uuid
+                    for update
+                    """,
+                    (task.id,),
+                )
+                row = cur.fetchone()
+                skip_result = _owned_task_check_result(row, worker_id=worker_id)
+                if skip_result is not None:
+                    return skip_result
+
                 # A failed downstream call leaves the order in placed. The only
-                # durable change is releasing the task for a later retry, which
-                # keeps outage recovery visible without pretending the restaurant
-                # accepted the order.
+                # durable task change is either releasing it for a later retry
+                # or marking it failed after max_attempts is exhausted, without
+                # pretending the restaurant accepted the order.
+                next_attempts = row["attempts"] + 1
+                if next_attempts >= row["max_attempts"]:
+                    failed = _fail_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        last_error=error,
+                        updated_at=updated_at,
+                    )
+                    if failed:
+                        return ProcessingResult(
+                            action=PROCESSING_ACTION_FAILED,
+                            order_id=order_id,
+                            error=error,
+                        )
+
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_LOST_OWNERSHIP,
+                        order_id=order_id,
+                        error=error,
+                    )
+
                 scheduled = _reschedule_claimed_task(
                     cur,
                     task_id=task.id,
@@ -588,13 +669,12 @@ def _reschedule_confirm_task(
                     last_error=error,
                     updated_at=updated_at,
                 )
-
-    if scheduled:
-        return ProcessingResult(
-            action=PROCESSING_ACTION_RETRY_SCHEDULED,
-            order_id=order_id,
-            error=error,
-        )
+                if scheduled:
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_RETRY_SCHEDULED,
+                        order_id=order_id,
+                        error=error,
+                    )
 
     return ProcessingResult(
         action=PROCESSING_ACTION_LOST_OWNERSHIP,
@@ -658,6 +738,13 @@ def claim_and_process_one_task(*, worker_id: str) -> bool:
     elif result.action == PROCESSING_ACTION_RETRY_SCHEDULED:
         logger.warning(
             "rescheduled task %s for order %s after downstream failure: %s",
+            task.id,
+            result.order_id,
+            result.error,
+        )
+    elif result.action == PROCESSING_ACTION_FAILED:
+        logger.error(
+            "failed task %s for order %s after exhausting retries: %s",
             task.id,
             result.order_id,
             result.error,
