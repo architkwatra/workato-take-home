@@ -6,6 +6,12 @@ const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "http://localhost:808
   /\/$/,
   "",
 );
+// The dashboard reads pipeline state from the API but controls order creation
+// through the separate loadgen service, so both browser-visible base URLs are
+// configurable for Docker Compose and local development.
+const LOADGEN_BASE_URL = (
+  import.meta.env.VITE_LOADGEN_BASE_URL ?? "http://localhost:8082"
+).replace(/\/$/, "");
 // Polling keeps the dashboard operationally useful without adding websocket
 // infrastructure to this small local demo slice.
 const POLL_INTERVAL_MS = 3000;
@@ -42,6 +48,13 @@ function numberText(value) {
   return Number(value ?? 0).toLocaleString();
 }
 
+function rateText(value) {
+  const parsed = Number(value ?? 0);
+  return parsed.toLocaleString(undefined, {
+    maximumFractionDigits: 1,
+  });
+}
+
 function shortId(value) {
   if (!value) {
     return "None";
@@ -76,6 +89,26 @@ function formatAge(seconds) {
   return `${Math.floor(safeSeconds / 3600)}h ${Math.floor((safeSeconds % 3600) / 60)}m`;
 }
 
+async function requestLoadgen(path, { method = "GET", body, signal } = {}) {
+  const response = await fetch(`${LOADGEN_BASE_URL}${path}`, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+    signal,
+  });
+  if (!response.ok) {
+    let message = `loadgen returned ${response.status}`;
+    try {
+      const payload = await response.json();
+      message = payload.detail?.message ?? payload.detail ?? message;
+    } catch {
+      message = `${message}: ${response.statusText}`;
+    }
+    throw new Error(String(message));
+  }
+  return response.json();
+}
+
 function StatusBadge({ active, children }) {
   return <span className={`status-badge ${active ? "active" : "stale"}`}>{children}</span>;
 }
@@ -105,6 +138,18 @@ function App() {
   const [status, setStatus] = useState("loading");
   const [error, setError] = useState("");
   const [lastRefreshAt, setLastRefreshAt] = useState(null);
+  const [loadgenStatus, setLoadgenStatus] = useState(null);
+  const [loadgenConnection, setLoadgenConnection] = useState("loading");
+  const [loadgenError, setLoadgenError] = useState("");
+  const [loadgenActionError, setLoadgenActionError] = useState("");
+  const [loadgenLastRefreshAt, setLoadgenLastRefreshAt] = useState(null);
+  const [loadgenActionPending, setLoadgenActionPending] = useState("");
+  const [loadgenForm, setLoadgenForm] = useState({
+    ratePerSecond: "20",
+    maxOrders: "100",
+    restaurantRef: "dashboard-manual",
+    customerRefPrefix: "dashboard-customer",
+  });
 
   useEffect(() => {
     let stopped = false;
@@ -158,6 +203,55 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    let stopped = false;
+    let timerId = null;
+    let controller = null;
+
+    // Poll loadgen independently from /dashboard/overview. Load generation can
+    // be unavailable while the API is healthy, and the control panel should
+    // show that without marking the whole dashboard offline.
+    async function loadStatus() {
+      controller = new AbortController();
+      setLoadgenConnection((current) =>
+        current === "online" ? "refreshing" : "loading",
+      );
+
+      try {
+        const payload = await requestLoadgen("/status", {
+          signal: controller.signal,
+        });
+        if (stopped) {
+          return;
+        }
+
+        setLoadgenStatus(payload);
+        setLoadgenConnection("online");
+        setLoadgenError("");
+        setLoadgenLastRefreshAt(new Date());
+      } catch (caughtError) {
+        if (stopped || caughtError.name === "AbortError") {
+          return;
+        }
+
+        setLoadgenConnection("offline");
+        setLoadgenError(caughtError.message || "loadgen request failed");
+      } finally {
+        if (!stopped) {
+          timerId = window.setTimeout(loadStatus, POLL_INTERVAL_MS);
+        }
+      }
+    }
+
+    loadStatus();
+
+    return () => {
+      stopped = true;
+      window.clearTimeout(timerId);
+      controller?.abort();
+    };
+  }, []);
+
   const totals = useMemo(() => {
     const orderCounts = overview?.orders?.by_state ?? {};
     const taskCounts = overview?.tasks?.by_status ?? {};
@@ -167,6 +261,10 @@ function App() {
       failedTasks: taskCounts.failed ?? 0,
       duePending: overview?.tasks?.due_pending ?? 0,
       expiredRunning: overview?.tasks?.expired_running ?? 0,
+      tasksCompletedPerSecond:
+        overview?.throughput?.tasks_completed_per_second ?? 0,
+      tasksCompletedRecent: overview?.throughput?.tasks_completed ?? 0,
+      throughputWindowSeconds: overview?.throughput?.window_seconds ?? 30,
       activeWorkers: overview?.workers?.active_count ?? 0,
       seenWorkers: overview?.workers?.total_seen ?? 0,
     };
@@ -180,6 +278,93 @@ function App() {
           ? "Stale"
           : "Offline"
         : "Loading";
+
+  function updateLoadgenForm(field, value) {
+    setLoadgenForm((current) => ({ ...current, [field]: value }));
+  }
+
+  function readPositiveNumber(value, label) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      throw new Error(`${label} must be greater than zero`);
+    }
+    return parsed;
+  }
+
+  function readMaxOrders(value) {
+    if (!value.trim()) {
+      // The loadgen API treats null max_orders as an intentionally unbounded
+      // run; a blank field is the operator-facing way to request that mode.
+      return null;
+    }
+
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed <= 0) {
+      throw new Error("Max orders must be a positive integer");
+    }
+    return parsed;
+  }
+
+  async function runLoadgenAction(actionName, request) {
+    setLoadgenActionPending(actionName);
+    setLoadgenActionError("");
+    try {
+      const payload = await request();
+      // Control endpoints return the same status shape as GET /status. Replacing
+      // local status immediately keeps the UI responsive between poll ticks.
+      setLoadgenStatus(payload);
+      setLoadgenConnection("online");
+      setLoadgenError("");
+      setLoadgenLastRefreshAt(new Date());
+    } catch (caughtError) {
+      setLoadgenActionError(caughtError.message || "loadgen action failed");
+    } finally {
+      setLoadgenActionPending("");
+    }
+  }
+
+  async function startLoadgen() {
+    await runLoadgenAction("start", async () => {
+      const restaurantRef = loadgenForm.restaurantRef.trim();
+      const customerRefPrefix = loadgenForm.customerRefPrefix.trim();
+      if (!restaurantRef) {
+        throw new Error("Restaurant ref is required");
+      }
+      if (!customerRefPrefix) {
+        throw new Error("Customer prefix is required");
+      }
+
+      return requestLoadgen("/load/start", {
+        method: "POST",
+        body: {
+          rate_per_second: readPositiveNumber(
+            loadgenForm.ratePerSecond,
+            "Rate",
+          ),
+          max_orders: readMaxOrders(loadgenForm.maxOrders),
+          restaurant_ref: restaurantRef,
+          customer_ref_prefix: customerRefPrefix,
+        },
+      });
+    });
+  }
+
+  async function stopLoadgen() {
+    await runLoadgenAction("stop", () =>
+      requestLoadgen("/load/stop", { method: "POST" }),
+    );
+  }
+
+  async function updateLoadgenRate() {
+    await runLoadgenAction("rate", () =>
+      requestLoadgen("/load/rate", {
+        method: "PATCH",
+        body: {
+          rate_per_second: readPositiveNumber(loadgenForm.ratePerSecond, "Rate"),
+        },
+      }),
+    );
+  }
 
   return (
     <main className="dashboard-shell">
@@ -218,12 +403,34 @@ function App() {
           tone={totals.duePending > 0 ? "watch" : "neutral"}
         />
         <Metric
+          label="Task Rate"
+          value={`${rateText(totals.tasksCompletedPerSecond)}/s`}
+          detail={`${numberText(totals.tasksCompletedRecent)} in last ${
+            totals.throughputWindowSeconds
+          }s`}
+          tone={totals.tasksCompletedPerSecond > 0 ? "good" : "neutral"}
+        />
+        <Metric
           label="Task Issues"
           value={numberText(totals.failedTasks + totals.expiredRunning)}
           detail="failed or expired"
           tone={totals.failedTasks + totals.expiredRunning > 0 ? "bad" : "neutral"}
         />
       </section>
+
+      <LoadgenControlPanel
+        actionError={loadgenActionError}
+        actionPending={loadgenActionPending}
+        connection={loadgenConnection}
+        error={loadgenError}
+        form={loadgenForm}
+        lastRefreshAt={loadgenLastRefreshAt}
+        onChange={updateLoadgenForm}
+        onStart={startLoadgen}
+        onStop={stopLoadgen}
+        onUpdateRate={updateLoadgenRate}
+        status={loadgenStatus}
+      />
 
       <div className="content-grid">
         <LifecyclePanel overview={overview} />
@@ -239,6 +446,146 @@ function App() {
 
       <RecentEventsPanel overview={overview} />
     </main>
+  );
+}
+
+function LoadgenControlPanel({
+  actionError,
+  actionPending,
+  connection,
+  error,
+  form,
+  lastRefreshAt,
+  onChange,
+  onStart,
+  onStop,
+  onUpdateRate,
+  status,
+}) {
+  const running = Boolean(status?.running);
+  const disabled = Boolean(actionPending);
+  const connectionLabel =
+    connection === "online" || connection === "refreshing"
+      ? "Connected"
+      : connection === "offline"
+        ? "Offline"
+        : "Loading";
+
+  return (
+    <section className="section loadgen-panel">
+      <div className="section-heading">
+        <h2>Load Generator</h2>
+        <span>{lastRefreshAt ? `Updated ${formatTime(lastRefreshAt)}` : "Status pending"}</span>
+      </div>
+
+      <div className="loadgen-layout">
+        <div className="loadgen-controls">
+          <label className="field">
+            <span>Rate / second</span>
+            <input
+              min="0.1"
+              step="0.1"
+              type="number"
+              value={form.ratePerSecond}
+              onChange={(event) => onChange("ratePerSecond", event.target.value)}
+            />
+          </label>
+          <label className="field">
+            <span>Max orders</span>
+            <input
+              min="1"
+              step="1"
+              type="number"
+              value={form.maxOrders}
+              onChange={(event) => onChange("maxOrders", event.target.value)}
+            />
+          </label>
+          <label className="field">
+            <span>Restaurant ref</span>
+            <input
+              type="text"
+              value={form.restaurantRef}
+              onChange={(event) => onChange("restaurantRef", event.target.value)}
+            />
+          </label>
+          <label className="field">
+            <span>Customer prefix</span>
+            <input
+              type="text"
+              value={form.customerRefPrefix}
+              onChange={(event) => onChange("customerRefPrefix", event.target.value)}
+            />
+          </label>
+        </div>
+
+        <div className="loadgen-actions">
+          <div className="button-row">
+            <button
+              className="button primary"
+              disabled={disabled || running}
+              type="button"
+              onClick={onStart}
+            >
+              {actionPending === "start" ? "Starting" : "Start"}
+            </button>
+            <button
+              className="button danger"
+              disabled={disabled || !running}
+              type="button"
+              onClick={onStop}
+            >
+              {actionPending === "stop" ? "Stopping" : "Stop"}
+            </button>
+            <button
+              className="button"
+              disabled={disabled || !running}
+              type="button"
+              onClick={onUpdateRate}
+            >
+              {actionPending === "rate" ? "Updating" : "Update Rate"}
+            </button>
+          </div>
+
+          <dl className="loadgen-stats">
+            <div>
+              <dt>Status</dt>
+              <dd>
+                <span className={`run-status ${running ? "running" : "stopped"}`}>
+                  {running ? "Running" : "Stopped"}
+                </span>
+              </dd>
+            </div>
+            <div>
+              <dt>Connection</dt>
+              <dd>{connectionLabel}</dd>
+            </div>
+            <div>
+              <dt>Attempted</dt>
+              <dd>{numberText(status?.attempted_count ?? 0)}</dd>
+            </div>
+            <div>
+              <dt>Created</dt>
+              <dd>{numberText(status?.created_count ?? 0)}</dd>
+            </div>
+            <div>
+              <dt>Failed</dt>
+              <dd>{numberText(status?.failed_count ?? 0)}</dd>
+            </div>
+            <div>
+              <dt>Inflight</dt>
+              <dd>
+                {numberText(status?.inflight_count ?? 0)}/
+                {numberText(status?.max_inflight ?? 0)}
+              </dd>
+            </div>
+          </dl>
+
+          {status?.last_error ? <p className="inline-error">{status.last_error}</p> : null}
+          {error ? <p className="inline-error">{error}</p> : null}
+          {actionError ? <p className="inline-error">{actionError}</p> : null}
+        </div>
+      </div>
+    </section>
   );
 }
 
