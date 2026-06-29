@@ -851,47 +851,6 @@ h2 {
   background: #6251a4;
 }
 
-.status-grid {
-  display: grid;
-  gap: 10px;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  margin-bottom: 16px;
-}
-
-.status-count {
-  border-bottom: 1px solid #e1e6eb;
-  padding: 8px 0 12px;
-}
-
-.status-count span {
-  color: #66717d;
-  display: block;
-  font-size: 13px;
-  margin-bottom: 8px;
-  text-transform: capitalize;
-}
-
-.status-count strong {
-  font-size: 24px;
-}
-
-.health-lines {
-  border-top: 1px solid #e4e8ed;
-  display: grid;
-  gap: 10px;
-  padding-top: 14px;
-}
-
-.health-lines div {
-  align-items: center;
-  display: flex;
-  justify-content: space-between;
-}
-
-.health-lines span {
-  color: #4a5562;
-}
-
 .table-wrap {
   overflow-x: auto;
 }

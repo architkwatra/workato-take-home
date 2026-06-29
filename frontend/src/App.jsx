@@ -75,7 +75,6 @@ const PIPELINE_DELAY_WINDOWS = {
   },
 };
 
-const TASK_STATUSES = ["pending", "running", "completed", "failed", "cancelled"];
 const DOWNSTREAM_SERVICES = [
   "restaurant_confirm",
   "restaurant_start_prep",
@@ -937,8 +936,6 @@ function App() {
             />
             <RecentEventsPanel overview={overview} />
           </div>
-
-          <TaskHealthPanel overview={overview} />
         </>
       )}
     </main>
@@ -1472,37 +1469,6 @@ function LifecyclePanel({ overview }) {
             </div>
           );
         })}
-      </div>
-    </section>
-  );
-}
-
-function TaskHealthPanel({ overview }) {
-  const counts = overview?.tasks?.by_status ?? {};
-
-  return (
-    <section className="section">
-      <div className="section-heading">
-        <h2>Task Health</h2>
-        <span>{numberText(overview?.tasks?.total ?? 0)} total</span>
-      </div>
-      <div className="status-grid">
-        {TASK_STATUSES.map((taskStatus) => (
-          <div className="status-count" key={taskStatus}>
-            <span>{humanize(taskStatus)}</span>
-            <strong>{numberText(counts[taskStatus] ?? 0)}</strong>
-          </div>
-        ))}
-      </div>
-      <div className="health-lines">
-        <div>
-          <span>Due pending</span>
-          <strong>{numberText(overview?.tasks?.due_pending ?? 0)}</strong>
-        </div>
-        <div>
-          <span>Expired running</span>
-          <strong>{numberText(overview?.tasks?.expired_running ?? 0)}</strong>
-        </div>
       </div>
     </section>
   );
