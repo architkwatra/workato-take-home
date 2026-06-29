@@ -142,7 +142,7 @@ h2 {
 .summary-grid {
   display: grid;
   gap: 12px;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   margin-bottom: 16px;
 }
 
@@ -177,6 +177,13 @@ h2 {
   margin-bottom: 12px;
 }
 
+.label-with-help {
+  align-items: center;
+  display: inline-flex;
+  gap: 6px;
+  min-width: 0;
+}
+
 .metric-help {
   align-items: center;
   background: #edf3f5;
@@ -191,6 +198,7 @@ h2 {
   justify-content: center;
   line-height: 1;
   position: relative;
+  text-transform: none;
   width: 18px;
 }
 
@@ -241,6 +249,113 @@ h2 {
 .metric-detail {
   color: #66717d;
   font-size: 13px;
+}
+
+.latency-summary {
+  border-bottom: 1px solid #e4e8ed;
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding-bottom: 14px;
+}
+
+.latency-summary div,
+.secondary-metrics div {
+  min-width: 0;
+}
+
+.latency-summary .label-with-help {
+  color: #66717d;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.secondary-metrics dt {
+  color: #66717d;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.secondary-metrics small {
+  color: #66717d;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.stage-label {
+  align-items: center;
+  color: #3d4f5f;
+  display: inline-flex;
+  font-size: 13px;
+  font-weight: 600;
+  gap: 6px;
+  min-width: 0;
+}
+
+.latency-summary strong {
+  color: #263241;
+  display: block;
+  font-size: 26px;
+  line-height: 1;
+  margin-top: 8px;
+}
+
+.stage-latency-list {
+  display: grid;
+  gap: 0;
+}
+
+.stage-latency-row {
+  align-items: center;
+  border-bottom: 1px solid #e4e8ed;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  min-height: 44px;
+}
+
+.stage-latency-row:last-child {
+  border-bottom: 0;
+}
+
+.stage-latency-row strong {
+  color: #263241;
+  font-size: 15px;
+}
+
+.stage-latency-row small {
+  color: #66717d;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.secondary-metrics {
+  display: grid;
+  gap: 0;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0;
+}
+
+.secondary-metrics div {
+  border-bottom: 1px solid #e4e8ed;
+  display: grid;
+  gap: 5px;
+  padding: 0 12px 12px 0;
+}
+
+.secondary-metrics div:nth-last-child(-n + 2) {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.secondary-metrics dd {
+  color: #263241;
+  font-size: 24px;
+  font-weight: 900;
+  line-height: 1;
+  margin: 0;
 }
 
 .content-grid {
@@ -366,12 +481,19 @@ h2 {
 
 .loadgen-layout {
   display: grid;
-  gap: 18px;
-  grid-template-columns: minmax(0, 1.1fr) minmax(320px, 0.9fr);
+  gap: 0;
+}
+
+.loadgen-top {
+  align-items: flex-end;
+  display: flex;
+  gap: 12px;
+  padding-bottom: 18px;
 }
 
 .loadgen-controls {
   display: grid;
+  flex: 1;
   gap: 12px;
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
@@ -405,10 +527,6 @@ h2 {
   outline: none;
 }
 
-.loadgen-actions {
-  display: grid;
-  gap: 14px;
-}
 
 .button-row {
   display: flex;
@@ -460,12 +578,11 @@ h2 {
   border-top: 1px solid #e4e8ed;
   display: grid;
   gap: 0;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   margin: 0;
 }
 
 .loadgen-stats div {
-  border-bottom: 1px solid #e4e8ed;
   display: grid;
   gap: 4px;
   padding: 10px 8px 10px 0;
@@ -831,7 +948,7 @@ h2 {
   padding-bottom: 12px;
 }
 
-.section-heading span {
+.section-heading > span {
   color: #66717d;
   font-size: 13px;
   white-space: nowrap;
@@ -978,9 +1095,12 @@ tbody tr:last-child td {
   .summary-grid,
   .content-grid,
   .content-grid.wide,
-  .loadgen-layout,
   .order-summary {
     grid-template-columns: 1fr;
+  }
+
+  .loadgen-top {
+    flex-wrap: wrap;
   }
 
   .pipeline {
@@ -1016,10 +1136,29 @@ tbody tr:last-child td {
   }
 
   .loadgen-controls,
-  .loadgen-stats,
   .order-meta,
+  .secondary-metrics,
   .pipeline {
     grid-template-columns: 1fr;
+  }
+
+  .latency-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .secondary-metrics div,
+  .secondary-metrics div:nth-last-child(-n + 2) {
+    border-bottom: 1px solid #e4e8ed;
+    padding-bottom: 12px;
+  }
+
+  .secondary-metrics div:last-child {
+    border-bottom: 0;
+    padding-bottom: 0;
+  }
+
+  .loadgen-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .button-row {
@@ -1042,4 +1181,73 @@ tbody tr:last-child td {
   .detail-toolbar-meta {
     justify-content: flex-start;
   }
+}
+
+/* ── State badges ───────────────────────────────────────── */
+
+.state-badge {
+  border-radius: 999px;
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  padding: 3px 10px;
+  text-transform: capitalize;
+  white-space: nowrap;
+}
+
+.state-badge--placed         { background: #e9edf2; color: #4a5562; }
+.state-badge--confirmed      { background: #ddeef9; color: #1a5a8a; }
+.state-badge--preparing      { background: #fef3e2; color: #7a4a0a; }
+.state-badge--ready          { background: #fde8c8; color: #8a4010; }
+.state-badge--out-for-delivery { background: #ede8f9; color: #4a2fa0; }
+.state-badge--delivered      { background: #e2f4ea; color: #176b3a; }
+.state-badge--cancelled      { background: #edf1f4; color: #5c6875; }
+.state-badge--failed         { background: #fde8e6; color: #a33b2f; }
+.state-badge--unknown        { background: #edf1f4; color: #5c6875; }
+
+/* ── Task status badges ─────────────────────────────────── */
+
+.task-badge {
+  border-radius: 4px;
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  padding: 2px 8px;
+  text-transform: capitalize;
+  white-space: nowrap;
+}
+
+.task-badge--pending   { background: #edf1f4; color: #5c6875; }
+.task-badge--running   { background: #ddeef9; color: #1a5a8a; }
+.task-badge--completed { background: #e2f4ea; color: #176b3a; }
+.task-badge--failed    { background: #fde8e6; color: #a33b2f; }
+.task-badge--cancelled { background: #edf1f4; color: #5c6875; }
+.task-badge--unknown   { background: #edf1f4; color: #5c6875; }
+
+/* ── Problem reason badges ──────────────────────────────── */
+
+.reason-badge {
+  border-radius: 4px;
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 8px;
+  white-space: nowrap;
+}
+
+.reason-badge--failed         { background: #fde8e6; color: #a33b2f; }
+.reason-badge--expired_running { background: #fef3e2; color: #7a4a0a; }
+.reason-badge--pending_retry  { background: #ddeef9; color: #1a5a8a; }
+.reason-badge--due_retry      { background: #fef3e2; color: #7a4a0a; }
+.reason-badge--unknown        { background: #edf1f4; color: #5c6875; }
+
+/* ── Pipeline duration annotation ──────────────────────── */
+
+.pipeline-duration {
+  color: var(--color-muted, #8a9bb0);
+  display: block;
+  font-size: 11px;
+  margin-top: 1px;
 }
