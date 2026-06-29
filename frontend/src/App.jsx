@@ -105,7 +105,7 @@ const METRIC_HELP = {
   ordersDeliveredRate:
     "Orders delivered per minute over the rolling dashboard window.",
   pipelineLatency:
-    "End-to-end p95 time from order creation to delivery, across delivered orders.",
+    "End-to-end p95 time from order creation to delivery, across orders delivered in the current latency window.",
   stuckOrders:
     "Non-terminal orders whose time in the current lifecycle state is above that stage's configured stuck threshold.",
   taskCompletionRate:
@@ -118,13 +118,13 @@ const METRIC_HELP = {
 
 const DETAIL_HELP = {
   pipelineSamples:
-    "Delivered orders with both an order_created event and a delivered state_transition event.",
+    "Delivered orders in the current latency window with both an order_created event and a delivered state_transition event.",
   pipelineAvg:
-    "Average elapsed time from order_created to delivered across delivered orders.",
+    "Average elapsed time from order_created to delivered across delivered orders in the current latency window.",
   pipelineP95:
-    "95th percentile elapsed time from order_created to delivered. 95% of delivered orders completed at or below this value.",
+    "95th percentile elapsed time from order_created to delivered. 95% of delivered orders in the current latency window completed at or below this value.",
   stageLatency:
-    "95th percentile elapsed time between consecutive lifecycle events for this transition, calculated from order_events.",
+    "95th percentile elapsed time between consecutive lifecycle events for transitions reached in the current latency window, calculated from order_events.",
   stuckOrders:
     "Orders are marked stuck when they are not terminal and orders.updated_at is older than the configured threshold for the current state. Delivered, cancelled, and failed orders are excluded.",
   taskCompletionRate:
@@ -192,6 +192,24 @@ function formatDurationSeconds(seconds) {
     return "—";
   }
   return formatDuration(Number(seconds) * 1000) ?? "—";
+}
+
+function formatLatencySeconds(seconds) {
+  if (seconds == null || !Number.isFinite(Number(seconds))) {
+    return "—";
+  }
+
+  const parsed = Number(seconds);
+  if (parsed < 60) {
+    return `${parsed.toFixed(1)}s`;
+  }
+
+  return formatDurationSeconds(parsed);
+}
+
+function formatWindowLabel(seconds) {
+  const duration = formatDurationSeconds(seconds);
+  return duration === "—" ? "current window" : `last ${duration}`;
 }
 
 function stuckThresholdText(thresholds = {}) {
@@ -769,6 +787,7 @@ function App() {
       pipelineAvgSeconds: overview?.latency?.pipeline?.avg_seconds ?? null,
       pipelineP95Seconds: overview?.latency?.pipeline?.p95_seconds ?? null,
       pipelineSampleCount: overview?.latency?.pipeline?.sample_count ?? 0,
+      latencyWindowSeconds: overview?.latency?.window_seconds ?? 300,
       stuckOrderCount: overview?.stuck_orders?.total ?? 0,
       activeWorkers: overview?.workers?.active_count ?? 0,
       configuredWorkers: overview?.workers?.configured_count ?? 0,
@@ -1041,10 +1060,10 @@ function App() {
             />
             <Metric
               label="Pipeline P95"
-              value={formatDurationSeconds(totals.pipelineP95Seconds)}
-              detail={`Avg ${formatDurationSeconds(totals.pipelineAvgSeconds)} · ${
+              value={formatLatencySeconds(totals.pipelineP95Seconds)}
+              detail={`Avg ${formatLatencySeconds(totals.pipelineAvgSeconds)} · ${
                 numberText(totals.pipelineSampleCount)
-              } delivered`}
+              } delivered · ${formatWindowLabel(totals.latencyWindowSeconds)}`}
               helpText={METRIC_HELP.pipelineLatency}
               tone={totals.pipelineP95Seconds == null ? "neutral" : "good"}
             />
@@ -1117,6 +1136,7 @@ function PipelineLatencyPanel({ overview }) {
   const stages = overview?.latency?.stages ?? [];
   const stagesByTarget = new Map(stages.map((stage) => [stage.to_state, stage]));
   const hasSamples = (pipeline.sample_count ?? 0) > 0;
+  const latencyWindowLabel = formatWindowLabel(overview?.latency?.window_seconds);
 
   // Compute relative bar widths from the slowest stage p95
   const maxP95 = Math.max(
@@ -1129,7 +1149,7 @@ function PipelineLatencyPanel({ overview }) {
       <div className="section-heading">
         <h2>Pipeline Latency</h2>
         <span className="label-with-help">
-          {numberText(pipeline.sample_count ?? 0)} delivered samples
+          {numberText(pipeline.sample_count ?? 0)} delivered · {latencyWindowLabel}
           <HelpIcon text={DETAIL_HELP.pipelineSamples} />
         </span>
       </div>
@@ -1139,15 +1159,23 @@ function PipelineLatencyPanel({ overview }) {
             Avg
             <HelpIcon text={DETAIL_HELP.pipelineAvg} />
           </span>
-          <strong>{hasSamples ? formatDurationSeconds(pipeline.avg_seconds) : "—"}</strong>
+          <strong>{hasSamples ? formatLatencySeconds(pipeline.avg_seconds) : "—"}</strong>
         </div>
         <div>
           <span className="label-with-help">
             P95
             <HelpIcon text={DETAIL_HELP.pipelineP95} />
           </span>
-          <strong>{hasSamples ? formatDurationSeconds(pipeline.p95_seconds) : "—"}</strong>
+          <strong>{hasSamples ? formatLatencySeconds(pipeline.p95_seconds) : "—"}</strong>
         </div>
+      </div>
+      <div className="stage-latency-list-header">
+        <span className="label-with-help">
+          Stage
+          <HelpIcon text={DETAIL_HELP.stageLatency} />
+        </span>
+        <span>P95</span>
+        <span>Avg · n</span>
       </div>
       <div className="stage-latency-list">
         {PIPELINE_STATES.slice(1).map((state, index) => {
@@ -1163,15 +1191,10 @@ function PipelineLatencyPanel({ overview }) {
             <div className="stage-latency-row" key={state} style={rowStyle}>
               <span className="stage-label">
                 {humanize(fromState)} → {humanize(state)}
-                <HelpIcon
-                  text={`${DETAIL_HELP.stageLatency} Source: ${humanize(
-                    fromState,
-                  )} reached_at to ${humanize(state)} reached_at.`}
-                />
               </span>
-              <strong>{formatDurationSeconds(stage?.p95_seconds)}</strong>
+              <strong>{formatLatencySeconds(stage?.p95_seconds)}</strong>
               <small>
-                avg {formatDurationSeconds(stage?.avg_seconds)}
+                {formatLatencySeconds(stage?.avg_seconds)}
                 {" · "}n={numberText(stage?.sample_count ?? 0)}
               </small>
             </div>

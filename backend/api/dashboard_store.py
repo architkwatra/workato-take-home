@@ -39,6 +39,9 @@ ORDER_DETAIL_TASK_LIMIT = 50
 # read-model-only for the local dashboard; durable metrics storage can come
 # later if we need historical charts.
 THROUGHPUT_WINDOW_SECONDS = 30
+# Latency is also windowed, but over a longer interval so the dashboard remains
+# responsive to a new loadgen run without going blank between deliveries.
+DEFAULT_LATENCY_WINDOW_SECONDS = 300
 DEFAULT_STUCK_ORDER_THRESHOLDS_SECONDS = {
     ORDER_STATE_PLACED: 18,
     ORDER_STATE_CONFIRMED: 18,
@@ -82,6 +85,13 @@ def _positive_int_env(name: str, fallback: int) -> int:
         return fallback
 
     return parsed_value if parsed_value > 0 else fallback
+
+
+def _latency_window_seconds() -> int:
+    return _positive_int_env(
+        "DASHBOARD_LATENCY_WINDOW_SECONDS",
+        DEFAULT_LATENCY_WINDOW_SECONDS,
+    )
 
 
 def _stuck_order_thresholds() -> dict[str, int]:
@@ -183,7 +193,7 @@ def get_dashboard_overview() -> dict[str, Any]:
             task_health = dict(cur.fetchone())
 
             order_throughput = _load_order_throughput(cur)
-            latency = _load_latency_overview(cur)
+            latency = _load_latency_overview(cur, _latency_window_seconds())
             stuck_thresholds = _stuck_order_thresholds()
             stuck_orders = _load_stuck_order_overview(cur, stuck_thresholds)
             workers = _load_worker_overview(cur)
@@ -371,7 +381,7 @@ def _load_order_throughput(cur) -> dict[str, Any]:
     }
 
 
-def _load_latency_overview(cur) -> dict[str, Any]:
+def _load_latency_overview(cur, window_seconds: int) -> dict[str, Any]:
     """Return end-to-end and per-stage latency from order event timestamps."""
     cur.execute(
         """
@@ -387,6 +397,7 @@ def _load_latency_overview(cur) -> dict[str, Any]:
             where
                 event_type = %s::event_type
                 and to_state = %s::order_state
+                and occurred_at >= now() - (%s * interval '1 second')
             group by order_id
         ),
         durations as (
@@ -408,6 +419,7 @@ def _load_latency_overview(cur) -> dict[str, Any]:
             EVENT_TYPE_ORDER_CREATED,
             EVENT_TYPE_STATE_TRANSITION,
             ORDER_STATE_DELIVERED,
+            window_seconds,
         ),
     )
     pipeline = dict(cur.fetchone())
@@ -440,6 +452,7 @@ def _load_latency_overview(cur) -> dict[str, Any]:
                 order_id,
                 lag(reached_state) over event_sequence as from_state,
                 reached_state as to_state,
+                occurred_at as reached_at,
                 extract(
                     epoch from occurred_at - lag(occurred_at) over event_sequence
                 )::double precision as duration_seconds
@@ -461,12 +474,14 @@ def _load_latency_overview(cur) -> dict[str, Any]:
             from_state is not null
             and duration_seconds is not null
             and duration_seconds >= 0
+            and reached_at >= now() - (%s * interval '1 second')
         group by from_state, to_state
         """,
         (
             ORDER_STATE_PLACED,
             EVENT_TYPE_ORDER_CREATED,
             EVENT_TYPE_STATE_TRANSITION,
+            window_seconds,
         ),
     )
     stages = [
@@ -481,6 +496,7 @@ def _load_latency_overview(cur) -> dict[str, Any]:
     ]
 
     return {
+        "window_seconds": window_seconds,
         "pipeline": {
             "sample_count": pipeline["sample_count"],
             "avg_seconds": _rounded_float(pipeline["avg_seconds"]),

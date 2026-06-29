@@ -1,399 +1,150 @@
 # Workato Take-Home: Order Pipeline
 
-This project will model a food-delivery order pipeline from `placed` to
-`delivered`, including bursty traffic, flaky restaurant/courier integrations,
-live operations visibility, and failure recovery.
+A food-delivery order pipeline simulation: high-volume order intake, resilient downstream integrations, and live operational visibility — all on a single machine with Docker Compose.
 
-See [Design Doc](docs/design.md) for the high-level system design and
-[Implementation Plan](docs/implementation-plan.md) for the next build slices.
-
-## Current Scaffold
-
-The repository currently contains the first runnable slice: Docker Compose plus
-empty service frames. These containers start and expose basic health/status
-responses, but the order pipeline logic is not implemented yet.
-
-Run:
+## Quick Start
 
 ```bash
+git clone <repo>
+cd workato-take-home
 docker compose up --build
 ```
 
-Services:
+Services start in dependency order (Postgres → migrator → API/workers → rest). Once healthy (~30 seconds):
 
-- API: `http://localhost:8080/healthz`
-- Downstream simulator: `http://localhost:8081/healthz`
-- Load generator: `http://localhost:8082/healthz`
-- Dashboard: `http://localhost:3000`
-- Postgres: `localhost:5432`
+| Service | URL |
+|---------|-----|
+| Dashboard | http://localhost:3000 |
+| API | http://localhost:8080/healthz |
+| Downstream sim | http://localhost:8081/healthz |
+| Load generator | http://localhost:8082/readyz |
+| Postgres | localhost:5432 (user: `app`, pass: `app`, db: `orders`) |
 
-## What the System Should Prove
+Open the **dashboard** to see everything in one place. It polls every 3 seconds and shows live order counts, throughput, pipeline latency, worker health, and recent events.
 
-The goal is not to build a perfect production platform. The goal is to show a
-working local system with sound engineering judgment:
+## How to Drive Load
 
-- Orders can enter the system at high volume.
-- Each order moves through a valid lifecycle in order.
-- Flaky downstream systems can fail, recover, and slow down without losing
-  orders.
-- Duplicate work is handled safely through idempotency and state checks.
-- Operators can see throughput, failures, stuck orders, retries, and system
-  health in real time.
-- The demo can trigger normal traffic, a dinner rush, and intentional failures.
+### From the dashboard
 
-## Proposed Local Architecture
+In the **Load Generator** panel:
+1. Set **Rate / Second** (e.g. `5` for steady, `50` for dinner rush)
+2. Optionally set **Max Orders** to cap total creation
+3. Click **Start**
 
-Use Docker Compose to run everything on one machine:
+The pipeline processes orders automatically. Watch the Lifecycle bars fill and drain, the Pipeline Latency panel update, and delivery events stream in the Recent Events table.
 
-- `api`: accepts orders, exposes control endpoints, serves health/readiness, and
-  streams live updates to the dashboard from Postgres notifications.
-- `worker`: advances orders through the lifecycle by claiming pending work from
-  the database. Run multiple replicas locally so killing one worker does not stop
-  processing.
-- `postgres`: durable source of truth for orders, lifecycle events, attempts,
-  and worker leases.
-- `downstream-sim`: fake restaurant and courier services with configurable
-  latency, random failures, rate limits, and recovery.
-- `dashboard`: web UI for the operations/business view.
-- `loadgen`: persistent traffic simulator that starts idle, exposes a control
-  API, and can change order rate while running.
-- `prometheus`/`grafana` or a lightweight metrics endpoint: health and runtime
-  observability.
-
-Chosen implementation stack:
-
-- Backend/workers/load generator: Python with FastAPI, asyncio, SQLAlchemy,
-  Alembic, and psycopg.
-- Database: Postgres.
-- Frontend: React/Vite.
-- Local orchestration: Docker Compose.
-
-`docker-compose.yml` should set the project name to `workato-take-home`, run
-three worker replicas by default with `deploy.replicas: 3`, and avoid a fixed
-`container_name` for the worker service so scaling works. Use
-`docker compose up --scale worker=1` only when debugging a single worker.
-
-I would keep Postgres as the source of truth instead of relying on an in-memory
-queue. For a take-home, a durable `order_tasks` table with worker leases is
-simple, inspectable, and defensible. If a worker dies mid-order, another worker
-can reclaim the task after the lease expires.
-
-## Order Lifecycle
-
-Primary states:
-
-```text
-placed -> confirmed -> preparing -> ready -> out_for_delivery -> delivered
-```
-
-Terminal/exception states:
-
-```text
-cancelled
-failed
-```
-
-The state machine should be explicit in code. Workers should only perform valid
-transitions, and the database should store every transition as an event so the
-dashboard and demo can explain what happened.
-
-## Correctness Model
-
-The system should assume at-least-once processing. Exactly-once delivery is not
-realistic across flaky systems, so correctness comes from durable state,
-idempotency, and guarded transitions.
-
-Core rules:
-
-- The client/load generator creates a UUID idempotency key for each intended
-  order and sends it with the request. The API stores it with a unique
-  constraint and returns the existing order if the same key is retried with the
-  same request body. Reusing the key with a different body returns `409`.
-- Every lifecycle change is written transactionally.
-- Workers claim work with a 30-second lease, for example `locked_by` and
-  `locked_until`, so tasks from a killed worker become reclaimable quickly during
-  the demo.
-- Task claiming uses `SELECT FOR UPDATE SKIP LOCKED` inside a transaction, so
-  concurrent workers never claim the same task row. Only one worker wins the
-  claim; others skip to the next available task.
-- Expired leases are recoverable by another worker.
-- Tasks retry up to 5 times by default. Retryable downstream/local errors use
-  exponential backoff from `TASK_RETRY_DELAY_SECONDS` as the base delay to
-  `TASK_RETRY_MAX_DELAY_SECONDS` as the cap. The compose defaults are 5 seconds
-  and 60 seconds. After the retry budget is exhausted, the task is marked
-  `failed`, while the order remains in its source state until an explicit
-  operator retry or a later order-failure policy handles it.
-- Expected poll results such as `not_ready`, `not_picked_up`, or `not_delivered`
-  are not errors and do not increment attempts; they only move `next_run_at`.
-- Rate limit responses (`429`) are handled separately from normal transient
-  errors. If the downstream service returns `Retry-After`, the worker schedules
-  the next attempt for that time instead of applying standard exponential
-  backoff. This prevents the system from hammering a rate-limited service.
-- Downstream calls include idempotency keys so repeated calls do not create
-  duplicate restaurant confirmations or courier dispatches.
-- Before doing work, a worker checks the current order state. If the order has
-  already moved on, the duplicate task becomes a no-op.
-
-This means the system can process some work more than once internally, but it
-should not produce duplicate business effects.
-
-### Preventing Duplicate Business Effects
-
-The specific failure to avoid is dispatching two couriers, confirming the same
-restaurant order twice, or charging twice if payment were included later.
-
-Every downstream call carries a stable idempotency key derived from
-`order_id` and the business action, for example
-`courier_dispatch:{order_id}` or `restaurant_confirm:{order_id}`. The
-downstream simulator stores the first result for that key and returns the same
-result for duplicate calls instead of creating a second dispatch or
-confirmation.
-
-If a downstream connection drops mid-request, the worker cannot know whether the
-restaurant or courier received the call. The worker still retries, but it retries
-with the same idempotency key. If the first request reached the downstream
-system, the duplicate request returns the already-created result. If it did not,
-the retry creates the result once.
-
-### Cancellation and Stale Work
-
-When an order is cancelled, outstanding tasks for that order are no longer
-eligible for useful work. A worker checks the latest order state before making a
-downstream call; if the order is already terminal (`cancelled`, `failed`, or
-`delivered`), the task is treated as a no-op.
-
-If cancellation happens while a downstream request is already in flight, the
-response is ignored unless the order is still in the expected state. The order
-remains cancelled, and any follow-up task insertion is skipped. Optimistic
-locking enforces this: cancellation increments `orders.version`, so a stale
-worker's `UPDATE ... WHERE version = ?` affects zero rows.
-
-## Suggested Data Model
-
-High-level tables:
-
-- `orders`: current state, customer/restaurant/courier metadata, timestamps,
-  version, terminal reason.
-- `order_events`: append-only history of state transitions and milestone events
-  with `event_type`, optional `from_state`/`to_state`, `occurred_at`, and
-  metadata, so stage duration can be computed from consecutive events.
-- `order_tasks`: durable work queue with order id, target stage, attempts,
-  status, next run time, lease owner, lease expiry, and `task_type` such as
-  `advance_state`, `check_ready`, `check_pickup`, or `check_delivery`.
-- `downstream_calls`: idempotency records for restaurant/courier requests and
-  responses.
-- `workers`: worker heartbeat rows with `worker_id` and `last_seen_at`.
-
-The dashboard can read current status from `orders` and historical flow from
-`order_events`.
-
-The `orders.version` column supports optimistic locking. A worker reads the
-current version and includes it in `UPDATE orders ... WHERE id = ? AND version = ?`.
-If another worker or cancellation already updated the row, the update affects
-zero rows and the worker retries or discards the stale task.
-
-`SELECT FOR UPDATE SKIP LOCKED` and optimistic locking protect different cases:
-the first prevents two workers from claiming the same task at once; the second
-prevents a stale worker from overwriting a newer state after its lease expired.
-
-`downstream_calls` does not need to grow forever. A retention job can prune
-successful idempotency records after a safe window, for example several days,
-while keeping failed or disputed calls longer for debugging. If a zombie worker
-retries after that retention window, idempotency protection is gone; this is an
-acceptable demo limitation and would need a production retention policy.
-
-## Pipeline Flow
-
-1. The load generator or API creates an order.
-2. The API stores the order as `placed` and inserts the first task.
-3. A worker claims the next eligible task.
-4. The worker calls the required downstream simulator if the stage needs it.
-5. On success, the worker advances the order and inserts the next task. If the
-   next step is waiting on slow external progress, it inserts a future task with
-   `next_run_at` and releases the lease.
-6. On transient failure, the worker records the attempt and schedules a retry.
-7. On repeated failure, the task is marked `failed` and can be reopened through
-   the operator retry endpoint. Invalid or stale work is completed as a safe
-   no-op.
-
-Manual recovery endpoint:
-
-- `POST /orders/{order_id}/tasks/retry-failed` resets failed task rows for that
-  order back to `pending` without changing the order state.
-
-Important downstream handoffs:
-
-- Restaurant simulator: confirmation advances `placed -> confirmed`, preparation
-  start advances `confirmed -> preparing`, then the worker inserts a future
-  `check_ready` task. Later workers claim that task, check readiness once, and
-  either advance `preparing -> ready` or reschedule another check without
-  incrementing attempts.
-- Courier simulator: assignment advances `ready -> out_for_delivery` and inserts
-  a future `check_pickup` task. When pickup happens, the worker appends a
-  `courier_picked_up` milestone event while the order state remains
-  `out_for_delivery`, then schedules `check_delivery`; delivery advances
-  `out_for_delivery -> delivered`.
-
-## Dashboard
-
-The dashboard should be useful during a dinner rush, not just pretty.
-
-Show:
-
-- Total orders by state.
-- Orders per minute and delivered per minute.
-- Average and p95 time in pipeline.
-- Retry counts and failure counts.
-- Oldest stuck orders.
-- Downstream health: restaurant/courier latency, error rate, and rate-limit
-  responses.
-- Worker health: active workers, queue depth, lease expirations, processing
-  rate.
-
-Workers heartbeat every 10 seconds into the `workers` table. The dashboard
-counts active workers as those seen within the last 30 seconds, which includes
-idle workers that are not currently holding a task lease.
-
-The UI should update through Server-Sent Events. Workers write `order_events`
-and issue `pg_notify` with only `order_id` and event type. The API listens with
-Postgres `LISTEN/NOTIFY`, fetches current state from Postgres, then pushes the
-SSE event to connected dashboard clients.
-
-If the SSE stream disconnects, the dashboard should reconnect automatically. On
-reconnect it should fetch a fresh REST snapshot before resuming the stream, so a
-dropped browser connection does not leave stale data on screen.
-
-After a dinner-rush burst ends, the dashboard should make the recovery arc
-visible: queue depth peaks and then drains, orders-per-minute returns to
-baseline, downstream error rate normalizes, and p95 time-in-stage falls as
-workers catch up.
-
-## Load Generation
-
-The load generator should be a long-running service started by
-`docker compose up`, not a one-shot job. It starts idle, creates a fresh
-client-side idempotency key for each intended order, and posts orders to the API
-at the configured rate.
-
-The dashboard is the primary control surface. It calls API load-control
-endpoints, and the API forwards those commands to the internal `loadgen`
-service. CLI commands are just curl wrappers around the same controls.
-
-The load generator should support:
-
-- Steady traffic: small number of orders per second.
-- Dinner rush: sharp burst of orders that can be dialed up and back down during
-  the demo.
-- Promotion mode: sustained high load.
-- Start, stop, and live rate changes without restarting the service.
-
-Example future commands:
+### From the CLI
 
 ```bash
-docker compose up
-curl -X POST http://localhost:8080/admin/load/start \
+# Start at 10 orders/second
+curl -X POST http://localhost:8082/load/start \
   -H 'content-type: application/json' \
-  -d '{"ratePerSecond":5,"profile":"steady"}'
-curl -X PATCH http://localhost:8080/admin/load/rate \
+  -d '{"rate_per_second": 10}'
+
+# Change rate live (no restart needed)
+curl -X PATCH http://localhost:8082/load/rate \
   -H 'content-type: application/json' \
-  -d '{"ratePerSecond":100}'
-curl -X PATCH http://localhost:8080/admin/load/rate \
-  -H 'content-type: application/json' \
-  -d '{"ratePerSecond":5}'
-curl -X POST http://localhost:8080/admin/load/stop
+  -d '{"rate_per_second": 50}'
+
+# Stop
+curl -X POST http://localhost:8082/load/stop
 ```
 
-## Failure Demo
+## How to Trigger Failures
 
-The demo should make failures easy to trigger:
+### Kill a downstream service
 
-- Dashboard: increase restaurant latency, random restaurant failures, courier
-  rate limits, and downstream recovery.
-- CLI: kill one worker replica while orders are in flight. Other replicas keep
-  working and reclaim the killed worker's tasks after the 30-second lease
-  expires. This is the only process-level failure action; dashboard chaos
-  controls are for downstream behavior. With the fixed Compose project name, the
-  demo command can be `docker stop workato-take-home-worker-3`.
+In the dashboard header, click **Downstream** and toggle any service off. Orders that depend on the killed service stall in that state (e.g. killing restaurant confirmation leaves orders stuck in `placed`). Workers retry with exponential backoff — the killed service is not hammered on recovery.
 
-Expected behavior:
+Re-enable the service to resume processing. Stalled orders pick up within the next retry window (5s → 60s cap).
 
-- Orders already stored in Postgres remain visible.
-- In-flight leased tasks become retryable after the lease expires.
-- Failed tasks stay terminal until an operator explicitly resets them.
-- Duplicate processing attempts do not create duplicate business effects.
-- The dashboard shows backlog growth, retries, failures, and recovery.
+### Kill a worker replica
 
-## Nice Touches
+```bash
+# Find a running worker container
+docker ps | grep worker
 
-To make the demo feel like an operations tool instead of a raw engineering
-console, build a few focused product touches:
+# Stop one (e.g. replica 3)
+docker stop workato-take-home-worker-3
+```
 
-- Chaos controls in the dashboard for restaurant failures, courier rate limits,
-  downstream latency, and recovery.
-- Per-stage p95 latency from `order_events`; pickup is a milestone event while
-  the order state remains `out_for_delivery`, so its timing is computed from
-  event timestamps rather than state-entry/state-exit pairs.
-- Stuck-order highlighting for orders that have not moved in more than a
-  configurable threshold.
-- A live delivery ETA estimate that updates from current queue depth and recent
-  stage latencies.
+Its in-flight tasks become reclaimable after the 30-second lease expires. The remaining 4 workers claim them automatically — no orders are lost. The **Workers** KPI card drops from `5/5` to `4/5` and recovers when you restart the container.
 
-## Observability
+### Trigger task failures
 
-Expose health and metrics:
+Use the **Downstream** panel to enable random failure mode on restaurant or courier. Tasks retry up to 5 times; on exhaustion the task is marked `failed` and appears in the **Problem Tasks** table. From there, click an order to open its detail view and retry individual failed tasks.
 
-- `/healthz`: process is alive.
-- `/readyz`: dependencies are reachable.
-- `/metrics`: counters, gauges, and histograms.
+### Cancel orders in-flight
 
-Useful metrics:
+Click any row in the **Recent Orders** table to open the order detail view and click **Cancel Order**. Workers check order state before every downstream call — a cancelled order's in-flight tasks become no-ops via optimistic locking, so no duplicate restaurant/courier actions occur.
 
-- Orders created/delivered/failed.
-- Queue depth by stage.
-- Task attempts and retries.
-- Worker claim rate and completion rate.
-- Downstream latency and error rate.
-- Lease expirations and recovered tasks.
+## Architecture
 
-Logs should include `order_id`, `task_id`, `stage`, and `attempt` so a single
-order can be traced during the walkthrough.
+```
+                        ┌──────────────────┐
+Dashboard (React) ──────► API (FastAPI)    │
+:3000                   │ :8080            │
+                        └──────┬───────────┘
+                               │ Postgres task queue
+                        ┌──────▼───────────┐
+                        │ Workers (×5)      │──► Downstream Sim :8081
+                        │ poll / 250ms      │    (restaurant + courier)
+                        └──────────────────┘
+Load Generator ─────────► API /orders
+:8082
+```
 
-## Trade-Offs to Defend
+**Order lifecycle:** `placed → confirmed → preparing → ready → out_for_delivery → delivered`
 
-- Postgres-backed queue is simpler and durable, but less horizontally scalable
-  than Kafka/RabbitMQ. That is acceptable for a single-machine take-home.
-- At-least-once processing is realistic. Idempotency and state checks prevent
-  duplicate business effects.
-- SSE is simpler than WebSockets for a live dashboard if the UI only needs
-  server-to-client updates.
-- Simulated downstream systems should be controllably unreliable so the demo can
-  show recovery, not just random chaos.
+Terminal states: `cancelled`, `failed`
 
-## Final README Shape
+**Key correctness mechanisms:**
 
-This file is currently an implementation blueprint. Before submission, rewrite
-the README around the evaluator workflow:
+| Mechanism | What it prevents |
+|-----------|-----------------|
+| `SELECT FOR UPDATE SKIP LOCKED` in claim CTE | Two workers claiming the same task |
+| 30-second leases (`locked_by`, `locked_until`) | Work stuck when a worker dies |
+| Optimistic locking (`orders.version`) | Stale worker overwriting newer state |
+| Client-generated idempotency keys | Duplicate orders from retried creation requests |
+| Downstream idempotency keys (`restaurant_confirm:{order_id}`) | Duplicate restaurant confirmations or courier dispatches |
+| Exponential backoff (5s base → 60s cap, 5 attempts) | Thundering herd on downstream recovery |
 
-1. Quick Start
-2. How to Drive Load
-3. How to Trigger Failures
-4. Architecture Summary
-5. Trade-offs
+**Task types:**
 
-Most of this planning content should move into the architecture and trade-off
-sections once the actual commands and endpoints exist.
+- `advance_state` — drives restaurant confirmation, prep start, courier assignment
+- `check_ready` — polls restaurant until food is ready (doesn't consume retry budget for normal "not ready" responses)
+- `check_delivery` — polls courier until delivered (same policy)
 
-## Implementation Order
+## Services
 
-1. Define order states, database schema, migrations, and `downstream_calls`
-   idempotency records.
-2. Build order intake API and basic order creation.
-3. Build worker task claiming, leases, retries, heartbeats, and lifecycle
-   transitions.
-4. Add restaurant/courier simulators with failure controls.
-5. Add persistent load generator service and dashboard/API controls for live
-   rate changes.
-6. Wire the SSE stream and REST snapshot path used by the dashboard.
-7. Build dashboard with live metrics and order state views.
-8. Add health/metrics endpoints and demo failure controls.
-9. Write final README instructions for running, load testing, and failure demos.
+| Service | Port | Tech | Role |
+|---------|------|------|------|
+| `api` | 8080 | FastAPI + psycopg | Order intake, dashboard data, health/readiness |
+| `worker` (×5) | — | asyncio | Task execution, lifecycle advances, heartbeats |
+| `postgres` | 5432 | PostgreSQL 16 | Durable source of truth for all state |
+| `downstream-sim` | 8081 | FastAPI | Configurable flaky restaurant + courier with kill switches |
+| `loadgen` | 8082 | FastAPI | Persistent rate-controlled traffic generator |
+| `dashboard` | 3000 | React/Vite | Live operations UI |
+| `migrator` | — | Alembic | One-shot schema migration on startup |
+
+## Trade-offs
+
+**Postgres-backed task queue over Kafka/RabbitMQ**
+
+A durable `order_tasks` table with worker leases is simpler to operate locally, fully inspectable via SQL, and requires no extra infrastructure. The trade-off is horizontal write throughput — Postgres works well up to hundreds of concurrent workers but would become a bottleneck before a distributed queue would. Acceptable for a single-machine demo and most early-stage production loads.
+
+**At-least-once processing with idempotency**
+
+Exactly-once delivery across flaky systems requires distributed transactions that add significant complexity. Instead, every downstream call carries a stable idempotency key derived from `order_id` and the business action. The downstream simulator stores the first result for each key and replays it on duplicates — a retry never creates a second restaurant confirmation or courier dispatch. Workers may process some work more than once internally; they never produce duplicate business effects.
+
+**SSE polling over WebSockets**
+
+The dashboard polls `/dashboard/overview` every 3 seconds rather than maintaining a live push connection. This keeps the server stateless, avoids connection lifecycle complexity, and is sufficient for an operational dashboard where sub-second updates are not required. The trade-off is a 0–3 second lag on any state change.
+
+**Fixed 5 worker replicas**
+
+Workers are stateless processes that race for Postgres leases; scaling is `docker compose up --scale worker=N`. Five replicas provide enough parallelism to demonstrate recovery after killing one without overwhelming the downstream simulator. The API reports configured vs. active worker count so operators see degradation immediately.
+
+**No separate metrics service**
+
+Health (`/healthz`) and readiness (`/readyz`) endpoints exist on every service. Runtime counters (throughput, latency, queue depth, worker health) are computed on-demand by the dashboard endpoint rather than pushed to a metrics store. This avoids Prometheus/Grafana setup overhead while still giving operators the numbers they need during a demo.
