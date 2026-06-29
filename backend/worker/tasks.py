@@ -50,6 +50,10 @@ MAX_CLAIM_LOG_CACHE_SIZE = 1000
 _logged_claimed_task_ids: set[str] = set()
 _logged_claimed_task_order: deque[str] = deque()
 
+# Extra columns written by generic transition finalization must be explicitly
+# allowlisted because column names cannot be passed as SQL parameters.
+ALLOWED_EXTRA_ORDER_COLUMNS = frozenset({"courier_ref"})
+
 DELIVERY_CHECK_STATUS_DELIVERED = "delivered"
 DELIVERY_CHECK_STATUS_IN_TRANSIT = "in_transit"
 
@@ -127,6 +131,14 @@ class RestaurantTransitionCall:
 
 
 @dataclass(frozen=True)
+class CourierAssignCall:
+    """Details needed for one courier assignment request."""
+
+    order_id: str
+    restaurant_ref: str
+
+
+@dataclass(frozen=True)
 class RestaurantReadyCheckCall:
     """Details needed for one restaurant readiness poll."""
 
@@ -193,6 +205,11 @@ READY_FINALIZATION_SPEC = RestaurantTransitionSpec(
     endpoint_path="/restaurant/check-ready",
     expected_status=READY_CHECK_STATUS_READY,
     action_name="restaurant check-ready",
+    # Once the restaurant marks food ready, the next durable command is courier
+    # assignment. Insert it in the same transaction as preparing -> ready so
+    # ready orders cannot be stranded without dispatch work.
+    next_task_type=TASK_TYPE_ADVANCE_STATE,
+    next_target_state=ORDER_STATE_OUT_FOR_DELIVERY,
 )
 
 # Courier assign is a command task like restaurant confirm/start-prep, but it
@@ -975,8 +992,31 @@ def _call_restaurant_transition(call: RestaurantTransitionCall) -> str | None:
     return None
 
 
+def _prepare_courier_assign_call(
+    *,
+    task: ClaimedTask,
+    worker_id: str,
+) -> CourierAssignCall | ProcessingResult:
+    """Validate courier assignment work and return courier-named call details."""
+    # Courier assignment uses the same short DB validation as command-style
+    # restaurant transitions, then adapts the result to a courier-specific type
+    # so the HTTP callsite does not look like a restaurant integration.
+    prepared = _prepare_transition_call(
+        task=task,
+        worker_id=worker_id,
+        spec=COURIER_ASSIGN_SPEC,
+    )
+    if isinstance(prepared, ProcessingResult):
+        return prepared
+
+    return CourierAssignCall(
+        order_id=prepared.order_id,
+        restaurant_ref=prepared.restaurant_ref,
+    )
+
+
 def _call_courier_assign(
-    call: RestaurantTransitionCall,
+    call: CourierAssignCall,
 ) -> tuple[str | None, str | None]:
     """Call the courier assign endpoint; return (error, courier_ref)."""
     url = f"{_downstream_sim_base_url()}/courier/assign"
@@ -1443,8 +1483,15 @@ def _finalize_transition_task(
 
     extra_order_fields is for caller-supplied columns that must be written
     alongside the state change (e.g. {"courier_ref": "..."} for courier assign).
-    Column names come from internal callsites only — never from user input.
+    Column names come from internal callsites only and must be allowlisted here.
     """
+    if extra_order_fields:
+        unknown_columns = set(extra_order_fields) - ALLOWED_EXTRA_ORDER_COLUMNS
+        if unknown_columns:
+            raise ValueError(
+                f"unknown extra_order_fields columns: {sorted(unknown_columns)}"
+            )
+
     occurred_at = datetime.now(timezone.utc)
     with open_db_connection() as conn:
         with conn.transaction():
@@ -1489,11 +1536,16 @@ def _finalize_transition_task(
                 # cancellation race, or expired-lease claimant from committing a
                 # state transition after another actor already changed the row.
                 extra_set_sql = (
-                    "".join(f",\n                        {col} = %s" for col in extra_order_fields)
+                    "".join(
+                        f",\n                        {col} = %s"
+                        for col in extra_order_fields
+                    )
                     if extra_order_fields
                     else ""
                 )
-                extra_set_params = tuple(extra_order_fields.values()) if extra_order_fields else ()
+                extra_set_params = (
+                    tuple(extra_order_fields.values()) if extra_order_fields else ()
+                )
                 cur.execute(
                     f"""
                     update orders
@@ -1723,9 +1775,7 @@ def process_courier_assign_task(*, task: ClaimedTask, worker_id: str) -> Process
     Separated from process_transition_task so the courier_ref from the HTTP
     response can flow into the finalization transaction via extra_order_fields.
     """
-    prepared = _prepare_transition_call(
-        task=task, worker_id=worker_id, spec=COURIER_ASSIGN_SPEC
-    )
+    prepared = _prepare_courier_assign_call(task=task, worker_id=worker_id)
     if isinstance(prepared, ProcessingResult):
         return prepared
 

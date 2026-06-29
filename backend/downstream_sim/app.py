@@ -8,7 +8,11 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(title="Downstream Simulator")
 
+# Demo prep duration used when RESTAURANT_READY_AFTER_SECONDS is not set. The
+# simulator returns "ready" once now >= prep_started_at + this many seconds.
 DEFAULT_RESTAURANT_READY_AFTER_SECONDS = 6.0
+# Poll hint used when RESTAURANT_READY_RETRY_AFTER_SECONDS is not set. Workers
+# cap this by the task deadline before scheduling the next check_ready attempt.
 DEFAULT_RESTAURANT_READY_RETRY_AFTER_SECONDS = 2.0
 # Courier delivery gate: "delivered" once now >= dispatched_at + this many seconds.
 DEFAULT_COURIER_DELIVERED_AFTER_SECONDS = 8.0
@@ -188,7 +192,11 @@ async def assign_courier(request: CourierAssignRequest) -> dict[str, str]:
     return the same courier. No persistence is needed; the worker writes the ref
     to orders.courier_ref in the finalization transaction.
     """
-    courier_ref = f"courier-{hashlib.md5(request.order_id.encode()).hexdigest()[:12]}"
+    digest = hashlib.md5(
+        request.order_id.encode(),
+        usedforsecurity=False,
+    ).hexdigest()
+    courier_ref = f"courier-{digest[:12]}"
     return {"status": "assigned", "courier_ref": courier_ref}
 
 
