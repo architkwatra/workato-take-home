@@ -25,6 +25,9 @@ services:
       SERVICE_NAME: api
       DATABASE_URL: postgresql://app:app@postgres:5432/orders
       DASHBOARD_CORS_ORIGINS: http://localhost:3000
+      # The API cannot inspect Compose's worker replica count at runtime.
+      # Keep this value in sync with worker.deploy.replicas below.
+      DASHBOARD_CONFIGURED_WORKER_COUNT: "3"
     ports:
       - "8080:8000"
     depends_on:
@@ -119,7 +122,7 @@ services:
       downstream-sim:
         condition: service_healthy
     deploy:
-      replicas: 20
+      replicas: 3
 
   migrator:
     build:
