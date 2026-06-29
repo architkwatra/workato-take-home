@@ -1,25 +1,62 @@
 import hashlib
 import os
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 
 app = FastAPI(title="Downstream Simulator")
 
-# Demo prep duration used when neither a fixed restaurant delay nor a restaurant
-# delay range is configured. The simulator returns "ready" once now is past the
-# per-order ready_at timestamp.
+# Demo delays are deterministic per order and stage. The simulator responds
+# immediately with a "not yet" status until now is past source_started_at +
+# delay; it never sleeps inside an HTTP request.
+DEFAULT_RESTAURANT_CONFIRM_AFTER_SECONDS = 3.0
+DEFAULT_RESTAURANT_CONFIRM_RETRY_AFTER_SECONDS = 1.0
+DEFAULT_RESTAURANT_START_PREP_AFTER_SECONDS = 3.0
+DEFAULT_RESTAURANT_START_PREP_RETRY_AFTER_SECONDS = 1.0
 DEFAULT_RESTAURANT_READY_AFTER_SECONDS = 6.0
-# Poll hint used when RESTAURANT_READY_RETRY_AFTER_SECONDS is not set. Workers
-# cap this by the task deadline before scheduling the next check_ready attempt.
 DEFAULT_RESTAURANT_READY_RETRY_AFTER_SECONDS = 2.0
-# Courier delivery duration used when neither a fixed courier delay nor a
-# courier delay range is configured.
+DEFAULT_COURIER_ASSIGN_AFTER_SECONDS = 3.0
+DEFAULT_COURIER_ASSIGN_RETRY_AFTER_SECONDS = 1.0
 DEFAULT_COURIER_DELIVERED_AFTER_SECONDS = 8.0
-# Poll hint returned with "in_transit". Workers cap this by the task deadline.
 DEFAULT_COURIER_DELIVERED_RETRY_AFTER_SECONDS = 3.0
+SIMULATED_SERVICE_RESTAURANT_CONFIRM = "restaurant_confirm"
+SIMULATED_SERVICE_RESTAURANT_START_PREP = "restaurant_start_prep"
+SIMULATED_SERVICE_RESTAURANT_CHECK_READY = "restaurant_check_ready"
+SIMULATED_SERVICE_COURIER_ASSIGN = "courier_assign"
+SIMULATED_SERVICE_COURIER_CHECK_DELIVERY = "courier_check_delivery"
+SIMULATED_SERVICES = (
+    SIMULATED_SERVICE_RESTAURANT_CONFIRM,
+    SIMULATED_SERVICE_RESTAURANT_START_PREP,
+    SIMULATED_SERVICE_RESTAURANT_CHECK_READY,
+    SIMULATED_SERVICE_COURIER_ASSIGN,
+    SIMULATED_SERVICE_COURIER_CHECK_DELIVERY,
+)
+
+_kill_switch_lock = Lock()
+_kill_switches = {service_name: False for service_name in SIMULATED_SERVICES}
+
+
+def _dashboard_cors_origins() -> list[str]:
+    """Return browser origins allowed to use the simulator control API."""
+    raw_origins = os.getenv("DOWNSTREAM_SIM_CORS_ORIGINS")
+    if raw_origins is None:
+        return ["http://localhost:3000"]
+
+    origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+    return origins or ["http://localhost:3000"]
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_dashboard_cors_origins(),
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 
 class RestaurantConfirmRequest(BaseModel):
@@ -27,12 +64,14 @@ class RestaurantConfirmRequest(BaseModel):
 
     order_id: str = Field(min_length=1)
     restaurant_ref: str = Field(min_length=1)
+    placed_at: datetime
 
 
 class RestaurantConfirmResponse(BaseModel):
     """Deterministic restaurant confirmation response."""
 
     status: str
+    retry_after_seconds: float | None = None
 
 
 class RestaurantStartPrepRequest(BaseModel):
@@ -40,12 +79,14 @@ class RestaurantStartPrepRequest(BaseModel):
 
     order_id: str = Field(min_length=1)
     restaurant_ref: str = Field(min_length=1)
+    confirmed_at: datetime
 
 
 class RestaurantStartPrepResponse(BaseModel):
     """Deterministic restaurant start-prep response."""
 
     status: str
+    retry_after_seconds: float | None = None
 
 
 class RestaurantCheckReadyRequest(BaseModel):
@@ -68,13 +109,15 @@ class CourierAssignRequest(BaseModel):
 
     order_id: str = Field(min_length=1)
     restaurant_ref: str = Field(min_length=1)
+    ready_at: datetime
 
 
 class CourierAssignResponse(BaseModel):
     """Deterministic courier assignment response."""
 
     status: str
-    courier_ref: str
+    courier_ref: str | None = None
+    retry_after_seconds: float | None = None
 
 
 class CourierCheckDeliveryRequest(BaseModel):
@@ -90,6 +133,73 @@ class CourierCheckDeliveryResponse(BaseModel):
 
     status: str
     retry_after_seconds: float | None = None
+
+
+class KillSwitchUpdateRequest(BaseModel):
+    """Operator request to kill or restore one simulated downstream service."""
+
+    killed: bool
+
+
+class KillSwitchState(BaseModel):
+    """Current kill-switch state for one simulated downstream service."""
+
+    service: str
+    killed: bool
+    status: str
+
+
+class KillSwitchOverviewResponse(BaseModel):
+    """Dashboard response listing all simulator kill-switch states."""
+
+    services: list[KillSwitchState]
+
+
+def _kill_switch_state(service_name: str) -> dict[str, bool | str]:
+    """Return the dashboard-facing state for one simulated dependency."""
+    killed = _kill_switches[service_name]
+    return {
+        "service": service_name,
+        "killed": killed,
+        "status": "killed" if killed else "online",
+    }
+
+
+def _kill_switch_snapshot() -> list[dict[str, bool | str]]:
+    """Return a consistent copy of all in-memory kill switches."""
+    with _kill_switch_lock:
+        return [_kill_switch_state(service_name) for service_name in SIMULATED_SERVICES]
+
+
+def _set_kill_switch(service_name: str, killed: bool) -> dict[str, bool | str]:
+    """Set one simulator kill switch after validating the service name."""
+    if service_name not in _kill_switches:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"unknown simulated service: {service_name}",
+        )
+
+    with _kill_switch_lock:
+        _kill_switches[service_name] = killed
+        return _kill_switch_state(service_name)
+
+
+def _raise_if_service_killed(service_name: str) -> None:
+    """Make worker-facing endpoints fail fast while a kill switch is enabled.
+
+    The simulator process stays healthy so the dashboard can restore the switch.
+    Kill switches are intentionally per endpoint so demos can break one stage
+    without taking every restaurant or courier operation down at once. Workers
+    see this as a real downstream 503 and exercise their retry paths.
+    """
+    with _kill_switch_lock:
+        killed = _kill_switches[service_name]
+
+    if killed:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"{service_name.replace('_', ' ')} simulator is killed",
+        )
 
 
 def _read_positive_float_env(env_name: str, default: float) -> float:
@@ -172,6 +282,44 @@ def _deterministic_delay_seconds(
     )
 
 
+def _delayed_status_response(
+    *,
+    order_id: str,
+    source_started_at: datetime,
+    salt: str,
+    min_env_name: str,
+    max_env_name: str,
+    fixed_env_name: str,
+    default_delay_seconds: float,
+    retry_after_env_name: str,
+    default_retry_after_seconds: float,
+    ready_status: str,
+    pending_status: str,
+) -> dict[str, float | str]:
+    """Return success after the deterministic per-order delay has elapsed."""
+    delay_seconds = _deterministic_delay_seconds(
+        order_id=order_id,
+        salt=salt,
+        min_env_name=min_env_name,
+        max_env_name=max_env_name,
+        fixed_env_name=fixed_env_name,
+        default=default_delay_seconds,
+    )
+    retry_after_seconds = _read_positive_float_env(
+        retry_after_env_name,
+        default_retry_after_seconds,
+    )
+
+    ready_at = _utc_datetime(source_started_at) + timedelta(seconds=delay_seconds)
+    if datetime.now(timezone.utc) >= ready_at:
+        return {"status": ready_status}
+
+    return {
+        "status": pending_status,
+        "retry_after_seconds": retry_after_seconds,
+    }
+
+
 def _utc_datetime(value: datetime) -> datetime:
     """Normalize incoming timestamps so readiness math is timezone-safe."""
     if value.tzinfo is None:
@@ -191,7 +339,10 @@ async def readyz() -> dict[str, object]:
     return {
         "status": "ok",
         "service": os.getenv("SERVICE_NAME", "downstream-sim"),
-        "simulator": {"restaurant": "idle", "courier": "idle"},
+        "simulator": {
+            service["service"]: service["status"]
+            for service in _kill_switch_snapshot()
+        },
     }
 
 
@@ -201,30 +352,73 @@ async def root() -> dict[str, str]:
     return {"message": "Downstream simulator scaffold"}
 
 
+@app.get("/control/kill-switches", response_model=KillSwitchOverviewResponse)
+async def get_kill_switches() -> dict[str, list[dict[str, bool | str]]]:
+    """Return current kill-switch state for dashboard operators."""
+    return {"services": _kill_switch_snapshot()}
+
+
+@app.post(
+    "/control/kill-switches/{service_name}",
+    response_model=KillSwitchState,
+)
+async def update_kill_switch(
+    service_name: str,
+    request: KillSwitchUpdateRequest,
+) -> dict[str, bool | str]:
+    """Kill or restore one simulated downstream service for outage demos."""
+    return _set_kill_switch(service_name, request.killed)
+
+
 @app.post("/restaurant/confirm", response_model=RestaurantConfirmResponse)
 async def confirm_restaurant_order(
     request: RestaurantConfirmRequest,
-) -> dict[str, str]:
+) -> dict[str, float | str]:
     """Confirm that a restaurant accepted an order.
 
-    This first simulator slice is deterministic and side-effect-free. Repeated
-    requests for the same order return the same response until durable
-    downstream idempotency is added in a later slice.
+    Real restaurants may not acknowledge immediately. The simulator models that
+    as quick "not_confirmed" responses until this order's deterministic delay
+    from placed_at has elapsed.
     """
-    return {"status": "confirmed"}
+    _raise_if_service_killed(SIMULATED_SERVICE_RESTAURANT_CONFIRM)
+    return _delayed_status_response(
+        order_id=request.order_id,
+        source_started_at=request.placed_at,
+        salt="restaurant-confirm",
+        min_env_name="RESTAURANT_CONFIRM_AFTER_SECONDS_MIN",
+        max_env_name="RESTAURANT_CONFIRM_AFTER_SECONDS_MAX",
+        fixed_env_name="RESTAURANT_CONFIRM_AFTER_SECONDS",
+        default_delay_seconds=DEFAULT_RESTAURANT_CONFIRM_AFTER_SECONDS,
+        retry_after_env_name="RESTAURANT_CONFIRM_RETRY_AFTER_SECONDS",
+        default_retry_after_seconds=DEFAULT_RESTAURANT_CONFIRM_RETRY_AFTER_SECONDS,
+        ready_status="confirmed",
+        pending_status="not_confirmed",
+    )
 
 
 @app.post("/restaurant/start-prep", response_model=RestaurantStartPrepResponse)
 async def start_restaurant_prep(
     request: RestaurantStartPrepRequest,
-) -> dict[str, str]:
+) -> dict[str, float | str]:
     """Start restaurant preparation for an order.
 
-    Like confirmation, this is a deterministic command endpoint for the current
-    demo slice. Repeated requests for the same order return the same response;
-    durable idempotency records remain a later step.
+    Starting prep is also delayed to make every lifecycle hop visible in the
+    dashboard without blocking a worker thread or DB transaction.
     """
-    return {"status": "preparing"}
+    _raise_if_service_killed(SIMULATED_SERVICE_RESTAURANT_START_PREP)
+    return _delayed_status_response(
+        order_id=request.order_id,
+        source_started_at=request.confirmed_at,
+        salt="restaurant-start-prep",
+        min_env_name="RESTAURANT_START_PREP_AFTER_SECONDS_MIN",
+        max_env_name="RESTAURANT_START_PREP_AFTER_SECONDS_MAX",
+        fixed_env_name="RESTAURANT_START_PREP_AFTER_SECONDS",
+        default_delay_seconds=DEFAULT_RESTAURANT_START_PREP_AFTER_SECONDS,
+        retry_after_env_name="RESTAURANT_START_PREP_RETRY_AFTER_SECONDS",
+        default_retry_after_seconds=DEFAULT_RESTAURANT_START_PREP_RETRY_AFTER_SECONDS,
+        ready_status="preparing",
+        pending_status="not_preparing",
+    )
 
 
 @app.post("/restaurant/check-ready", response_model=RestaurantCheckReadyResponse)
@@ -232,38 +426,47 @@ async def check_restaurant_ready(
     request: RestaurantCheckReadyRequest,
 ) -> dict[str, float | str]:
     """Return whether enough deterministic prep time has elapsed for an order."""
-    ready_after_seconds = _deterministic_delay_seconds(
+    _raise_if_service_killed(SIMULATED_SERVICE_RESTAURANT_CHECK_READY)
+    return _delayed_status_response(
         order_id=request.order_id,
+        source_started_at=request.prep_started_at,
         salt="restaurant-ready",
         min_env_name="RESTAURANT_READY_AFTER_SECONDS_MIN",
         max_env_name="RESTAURANT_READY_AFTER_SECONDS_MAX",
         fixed_env_name="RESTAURANT_READY_AFTER_SECONDS",
-        default=DEFAULT_RESTAURANT_READY_AFTER_SECONDS,
+        default_delay_seconds=DEFAULT_RESTAURANT_READY_AFTER_SECONDS,
+        retry_after_env_name="RESTAURANT_READY_RETRY_AFTER_SECONDS",
+        default_retry_after_seconds=DEFAULT_RESTAURANT_READY_RETRY_AFTER_SECONDS,
+        ready_status="ready",
+        pending_status="not_ready",
     )
-    retry_after_seconds = _read_positive_float_env(
-        "RESTAURANT_READY_RETRY_AFTER_SECONDS",
-        DEFAULT_RESTAURANT_READY_RETRY_AFTER_SECONDS,
-    )
-
-    prep_started_at = _utc_datetime(request.prep_started_at)
-    ready_at = prep_started_at + timedelta(seconds=ready_after_seconds)
-    if datetime.now(timezone.utc) >= ready_at:
-        return {"status": "ready"}
-
-    return {
-        "status": "not_ready",
-        "retry_after_seconds": retry_after_seconds,
-    }
 
 
 @app.post("/courier/assign", response_model=CourierAssignResponse)
-async def assign_courier(request: CourierAssignRequest) -> dict[str, str]:
+async def assign_courier(request: CourierAssignRequest) -> dict[str, float | str]:
     """Assign a deterministic courier ref to an order.
 
     The ref is derived from order_id so repeated calls for the same order always
     return the same courier. No persistence is needed; the worker writes the ref
     to orders.courier_ref in the finalization transaction.
     """
+    _raise_if_service_killed(SIMULATED_SERVICE_COURIER_ASSIGN)
+    delay_response = _delayed_status_response(
+        order_id=request.order_id,
+        source_started_at=request.ready_at,
+        salt="courier-assign",
+        min_env_name="COURIER_ASSIGN_AFTER_SECONDS_MIN",
+        max_env_name="COURIER_ASSIGN_AFTER_SECONDS_MAX",
+        fixed_env_name="COURIER_ASSIGN_AFTER_SECONDS",
+        default_delay_seconds=DEFAULT_COURIER_ASSIGN_AFTER_SECONDS,
+        retry_after_env_name="COURIER_ASSIGN_RETRY_AFTER_SECONDS",
+        default_retry_after_seconds=DEFAULT_COURIER_ASSIGN_RETRY_AFTER_SECONDS,
+        ready_status="assigned",
+        pending_status="not_assigned",
+    )
+    if delay_response["status"] != "assigned":
+        return delay_response
+
     digest = hashlib.md5(
         request.order_id.encode(),
         usedforsecurity=False,
@@ -277,25 +480,17 @@ async def check_courier_delivery(
     request: CourierCheckDeliveryRequest,
 ) -> dict[str, float | str]:
     """Return whether enough deterministic delivery time has elapsed for an order."""
-    delivered_after_seconds = _deterministic_delay_seconds(
+    _raise_if_service_killed(SIMULATED_SERVICE_COURIER_CHECK_DELIVERY)
+    return _delayed_status_response(
         order_id=request.order_id,
+        source_started_at=request.dispatched_at,
         salt="courier-delivery",
         min_env_name="COURIER_DELIVERED_AFTER_SECONDS_MIN",
         max_env_name="COURIER_DELIVERED_AFTER_SECONDS_MAX",
         fixed_env_name="COURIER_DELIVERED_AFTER_SECONDS",
-        default=DEFAULT_COURIER_DELIVERED_AFTER_SECONDS,
+        default_delay_seconds=DEFAULT_COURIER_DELIVERED_AFTER_SECONDS,
+        retry_after_env_name="COURIER_DELIVERED_RETRY_AFTER_SECONDS",
+        default_retry_after_seconds=DEFAULT_COURIER_DELIVERED_RETRY_AFTER_SECONDS,
+        ready_status="delivered",
+        pending_status="in_transit",
     )
-    retry_after_seconds = _read_positive_float_env(
-        "COURIER_DELIVERED_RETRY_AFTER_SECONDS",
-        DEFAULT_COURIER_DELIVERED_RETRY_AFTER_SECONDS,
-    )
-
-    dispatched_at = _utc_datetime(request.dispatched_at)
-    delivered_at = dispatched_at + timedelta(seconds=delivered_after_seconds)
-    if datetime.now(timezone.utc) >= delivered_at:
-        return {"status": "delivered"}
-
-    return {
-        "status": "in_transit",
-        "retry_after_seconds": retry_after_seconds,
-    }

@@ -9,7 +9,7 @@ import httpx
 from psycopg.rows import dict_row
 
 from common.db import open_db_connection
-from common.event_types import EVENT_TYPE_STATE_TRANSITION
+from common.event_types import EVENT_TYPE_ORDER_CREATED, EVENT_TYPE_STATE_TRANSITION
 from common.state_machine import (
     ORDER_STATE_CONFIRMED,
     ORDER_STATE_DELIVERED,
@@ -56,6 +56,10 @@ ALLOWED_EXTRA_ORDER_COLUMNS = frozenset({"courier_ref"})
 
 DELIVERY_CHECK_STATUS_DELIVERED = "delivered"
 DELIVERY_CHECK_STATUS_IN_TRANSIT = "in_transit"
+TRANSITION_STATUS_NOT_CONFIRMED = "not_confirmed"
+TRANSITION_STATUS_NOT_PREPARING = "not_preparing"
+COURIER_ASSIGN_STATUS_ASSIGNED = "assigned"
+COURIER_ASSIGN_STATUS_NOT_ASSIGNED = "not_assigned"
 
 PROCESSING_ACTION_TRANSITIONED = "transitioned"
 PROCESSING_ACTION_RETRY_SCHEDULED = "retry_scheduled"
@@ -110,13 +114,20 @@ class ProcessingResult:
 
 @dataclass(frozen=True)
 class RestaurantTransitionSpec:
-    """One command-style restaurant transition handled by the worker."""
+    """One downstream transition handled by the worker.
+
+    expected_status commits the local state change. pending_status is a valid
+    business response meaning downstream has not reached the target yet; it
+    requeues the task without consuming transport retry attempts.
+    """
 
     source_state: str
     target_state: str
     endpoint_path: str
     expected_status: str
+    pending_status: str
     action_name: str
+    source_started_at_field: str
     next_task_type: str | None = None
     next_target_state: str | None = None
 
@@ -127,7 +138,16 @@ class RestaurantTransitionCall:
 
     order_id: str
     restaurant_ref: str
+    source_started_at: datetime
     spec: RestaurantTransitionSpec
+
+
+@dataclass(frozen=True)
+class TransitionCallOutcome:
+    """Validated command-style downstream response."""
+
+    status: str
+    retry_after_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -136,6 +156,16 @@ class CourierAssignCall:
 
     order_id: str
     restaurant_ref: str
+    ready_at: datetime
+
+
+@dataclass(frozen=True)
+class CourierAssignOutcome:
+    """Validated courier assignment response."""
+
+    status: str
+    retry_after_seconds: float | None = None
+    courier_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -176,15 +206,18 @@ READY_CHECK_STATUS_READY = "ready"
 READY_CHECK_STATUS_NOT_READY = "not_ready"
 
 
-# This slice is command-style, not polling/callback-driven: each supported
-# target state maps to one downstream command and one expected success body.
+# Each transition is modeled as a quick downstream check. Downstream either
+# returns the success status or a valid pending status with retry_after_seconds;
+# workers never hold DB locks while waiting for the simulated delay to pass.
 RESTAURANT_TRANSITION_SPECS = {
     ORDER_STATE_CONFIRMED: RestaurantTransitionSpec(
         source_state=ORDER_STATE_PLACED,
         target_state=ORDER_STATE_CONFIRMED,
         endpoint_path="/restaurant/confirm",
         expected_status=ORDER_STATE_CONFIRMED,
+        pending_status=TRANSITION_STATUS_NOT_CONFIRMED,
         action_name="restaurant confirm",
+        source_started_at_field="placed_at",
         next_task_type=TASK_TYPE_ADVANCE_STATE,
         next_target_state=ORDER_STATE_PREPARING,
     ),
@@ -193,7 +226,9 @@ RESTAURANT_TRANSITION_SPECS = {
         target_state=ORDER_STATE_PREPARING,
         endpoint_path="/restaurant/start-prep",
         expected_status=ORDER_STATE_PREPARING,
+        pending_status=TRANSITION_STATUS_NOT_PREPARING,
         action_name="restaurant start-prep",
+        source_started_at_field="confirmed_at",
         next_task_type=TASK_TYPE_CHECK_READY,
         next_target_state=ORDER_STATE_READY,
     ),
@@ -204,7 +239,9 @@ READY_FINALIZATION_SPEC = RestaurantTransitionSpec(
     target_state=ORDER_STATE_READY,
     endpoint_path="/restaurant/check-ready",
     expected_status=READY_CHECK_STATUS_READY,
+    pending_status=READY_CHECK_STATUS_NOT_READY,
     action_name="restaurant check-ready",
+    source_started_at_field="prep_started_at",
     # Once the restaurant marks food ready, the next durable command is courier
     # assignment. Insert it in the same transaction as preparing -> ready so
     # ready orders cannot be stranded without dispatch work.
@@ -219,8 +256,10 @@ COURIER_ASSIGN_SPEC = RestaurantTransitionSpec(
     source_state=ORDER_STATE_READY,
     target_state=ORDER_STATE_OUT_FOR_DELIVERY,
     endpoint_path="/courier/assign",
-    expected_status="assigned",
+    expected_status=COURIER_ASSIGN_STATUS_ASSIGNED,
+    pending_status=COURIER_ASSIGN_STATUS_NOT_ASSIGNED,
     action_name="courier assign",
+    source_started_at_field="ready_at",
     next_task_type=TASK_TYPE_CHECK_DELIVERY,
     next_target_state=ORDER_STATE_DELIVERED,
 )
@@ -230,7 +269,9 @@ DELIVERY_FINALIZATION_SPEC = RestaurantTransitionSpec(
     target_state=ORDER_STATE_DELIVERED,
     endpoint_path="/courier/check-delivery",
     expected_status=DELIVERY_CHECK_STATUS_DELIVERED,
+    pending_status=DELIVERY_CHECK_STATUS_IN_TRANSIT,
     action_name="courier check-delivery",
+    source_started_at_field="dispatched_at",
 )
 
 
@@ -528,7 +569,12 @@ def _complete_claimed_task(cur, *, task_id: str, worker_id: str, completed_at) -
     return cur.rowcount == 1
 
 
-def _load_transition_task_row(cur, *, task_id: str) -> dict | None:
+def _load_transition_task_row(
+    cur,
+    *,
+    task_id: str,
+    source_state: str,
+) -> dict | None:
     """Lock the task row and return current order details for a transition."""
     # Lock only the task row here. The order row is intentionally left unlocked
     # so the later UPDATE ... WHERE version = <read_version> is the real
@@ -542,13 +588,47 @@ def _load_transition_task_row(cur, *, task_id: str) -> dict | None:
             task.locked_by,
             orders.state::text as order_state,
             orders.version,
-            orders.restaurant_ref
+            orders.restaurant_ref,
+            -- downstream-sim is stateless, so the worker sends the durable
+            -- timestamp for when this source state began. For placed orders
+            -- that is order_created; for all later states it is the latest
+            -- state_transition into source_state. updated_at is a defensive
+            -- fallback for old rows if an event is missing.
+            coalesce(source_event.occurred_at, orders.updated_at) as source_started_at
         from order_tasks as task
         join orders on orders.id = task.order_id
+        left join lateral (
+            select occurred_at
+            from order_events
+            where
+                order_id = orders.id
+                and (
+                    (
+                        %s::order_state = %s::order_state
+                        and event_type = %s::event_type
+                    )
+                    or (
+                        %s::order_state <> %s::order_state
+                        and event_type = %s::event_type
+                        and to_state = %s::order_state
+                    )
+                )
+            order by occurred_at desc
+            limit 1
+        ) as source_event on true
         where task.id = %s::uuid
         for update of task
         """,
-        (task_id,),
+        (
+            source_state,
+            ORDER_STATE_PLACED,
+            EVENT_TYPE_ORDER_CREATED,
+            source_state,
+            ORDER_STATE_PLACED,
+            EVENT_TYPE_STATE_TRANSITION,
+            source_state,
+            task_id,
+        ),
     )
     return cur.fetchone()
 
@@ -903,7 +983,11 @@ def _prepare_transition_call(
                 # This first DB phase is deliberately short: verify we still own
                 # the task and either return the data needed for the HTTP call or
                 # complete the task as a no-op. The network call happens later.
-                row = _load_transition_task_row(cur, task_id=task.id)
+                row = _load_transition_task_row(
+                    cur,
+                    task_id=task.id,
+                    source_state=spec.source_state,
+                )
                 skip_result = _owned_task_check_result(row, worker_id=worker_id)
                 if skip_result is not None:
                     return skip_result
@@ -939,16 +1023,20 @@ def _prepare_transition_call(
                 return RestaurantTransitionCall(
                     order_id=order_id,
                     restaurant_ref=row["restaurant_ref"],
+                    source_started_at=row["source_started_at"],
                     spec=spec,
                 )
 
 
-def _call_restaurant_transition(call: RestaurantTransitionCall) -> str | None:
-    """Call the simulator and return a short retryable error on failure."""
+def _call_restaurant_transition(
+    call: RestaurantTransitionCall,
+) -> TransitionCallOutcome | str:
+    """Call the simulator and return an outcome or short retryable error."""
     url = f"{_downstream_sim_base_url()}{call.spec.endpoint_path}"
     payload = {
         "order_id": call.order_id,
         "restaurant_ref": call.restaurant_ref,
+        call.spec.source_started_at_field: call.source_started_at.isoformat(),
     }
 
     # This is intentionally not full durable downstream idempotency yet. These
@@ -984,12 +1072,23 @@ def _call_restaurant_transition(call: RestaurantTransitionCall) -> str | None:
     except ValueError as exc:
         return _short_error(f"downstream returned invalid JSON: {exc}")
 
-    if not isinstance(body, dict) or body.get("status") != call.spec.expected_status:
+    if not isinstance(body, dict):
         return _short_error(
             f"downstream returned invalid {call.spec.action_name} body: {body!r}"
         )
 
-    return None
+    status = body.get("status")
+    if status == call.spec.expected_status:
+        return TransitionCallOutcome(status=call.spec.expected_status)
+    if status == call.spec.pending_status:
+        return TransitionCallOutcome(
+            status=call.spec.pending_status,
+            retry_after_seconds=_valid_positive_number(body.get("retry_after_seconds")),
+        )
+
+    return _short_error(
+        f"downstream returned invalid {call.spec.action_name} body: {body!r}"
+    )
 
 
 def _prepare_courier_assign_call(
@@ -1012,15 +1111,20 @@ def _prepare_courier_assign_call(
     return CourierAssignCall(
         order_id=prepared.order_id,
         restaurant_ref=prepared.restaurant_ref,
+        ready_at=prepared.source_started_at,
     )
 
 
 def _call_courier_assign(
     call: CourierAssignCall,
-) -> tuple[str | None, str | None]:
-    """Call the courier assign endpoint; return (error, courier_ref)."""
+) -> CourierAssignOutcome | str:
+    """Call courier assign and return an outcome or retryable error."""
     url = f"{_downstream_sim_base_url()}/courier/assign"
-    payload = {"order_id": call.order_id, "restaurant_ref": call.restaurant_ref}
+    payload = {
+        "order_id": call.order_id,
+        "restaurant_ref": call.restaurant_ref,
+        "ready_at": call.ready_at.isoformat(),
+    }
 
     try:
         response = httpx.post(
@@ -1029,38 +1133,53 @@ def _call_courier_assign(
             timeout=_downstream_request_timeout_seconds(),
         )
     except httpx.TimeoutException as exc:
-        return _short_error(f"downstream timeout calling courier assign: {exc}"), None
+        return _short_error(f"downstream timeout calling courier assign: {exc}")
     except httpx.RequestError as exc:
         return _short_error(
             f"downstream request failed calling courier assign: {exc}"
-        ), None
+        )
 
     if response.status_code >= 500:
         return _short_error(
             f"downstream returned {response.status_code} from courier assign"
-        ), None
+        )
     if response.status_code != 200:
         return _short_error(
             f"downstream returned unexpected {response.status_code} from courier assign"
-        ), None
+        )
 
     try:
         body = response.json()
     except ValueError as exc:
-        return _short_error(f"downstream returned invalid JSON: {exc}"), None
+        return _short_error(f"downstream returned invalid JSON: {exc}")
 
-    if not isinstance(body, dict) or body.get("status") != "assigned":
+    if not isinstance(body, dict):
         return _short_error(
             f"downstream returned invalid courier assign body: {body!r}"
-        ), None
+        )
+
+    status = body.get("status")
+    if status == COURIER_ASSIGN_STATUS_NOT_ASSIGNED:
+        return CourierAssignOutcome(
+            status=COURIER_ASSIGN_STATUS_NOT_ASSIGNED,
+            retry_after_seconds=_valid_positive_number(body.get("retry_after_seconds")),
+        )
+
+    if status != COURIER_ASSIGN_STATUS_ASSIGNED:
+        return _short_error(
+            f"downstream returned invalid courier assign body: {body!r}"
+        )
 
     courier_ref = body.get("courier_ref")
     if not courier_ref or not isinstance(courier_ref, str):
         return _short_error(
             f"downstream returned missing courier_ref in assign response: {body!r}"
-        ), None
+        )
 
-    return None, courier_ref
+    return CourierAssignOutcome(
+        status=COURIER_ASSIGN_STATUS_ASSIGNED,
+        courier_ref=courier_ref,
+    )
 
 
 def _prepare_ready_check_call(
@@ -1499,7 +1618,11 @@ def _finalize_transition_task(
                 # The downstream call may have taken longer than the task lease,
                 # or another actor may have changed the order. Re-read and
                 # re-check ownership before committing any local state change.
-                row = _load_transition_task_row(cur, task_id=task.id)
+                row = _load_transition_task_row(
+                    cur,
+                    task_id=task.id,
+                    source_state=spec.source_state,
+                )
                 skip_result = _owned_task_check_result(row, worker_id=worker_id)
                 if skip_result is not None:
                     return skip_result
@@ -1647,6 +1770,84 @@ def _finalize_transition_task(
                 )
 
 
+def _reschedule_transition_after_pending(
+    *,
+    task: ClaimedTask,
+    worker_id: str,
+    spec: RestaurantTransitionSpec,
+    retry_after_seconds: float | None,
+) -> ProcessingResult:
+    """Release a transition task after a valid downstream "not yet" response."""
+    updated_at = datetime.now(timezone.utc)
+    # Pending statuses are normal business progress. Use downstream's retry
+    # hint when present; otherwise fall back to the task retry delay to avoid a
+    # hot loop while still leaving attempts untouched.
+    poll_delay_seconds = retry_after_seconds or _task_retry_delay_seconds()
+    next_run_at = updated_at + timedelta(seconds=poll_delay_seconds)
+
+    with open_db_connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                row = _load_transition_task_row(
+                    cur,
+                    task_id=task.id,
+                    source_state=spec.source_state,
+                )
+                skip_result = _owned_task_check_result(row, worker_id=worker_id)
+                if skip_result is not None:
+                    return skip_result
+
+                order_state = row["order_state"]
+                order_id = row["order_id"]
+                if is_terminal_order_state(order_state):
+                    _complete_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        completed_at=updated_at,
+                    )
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_COMPLETED_TERMINAL_NOOP,
+                        order_id=order_id,
+                        from_state=order_state,
+                    )
+
+                if order_state != spec.source_state:
+                    _complete_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        completed_at=updated_at,
+                    )
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_COMPLETED_STALE_NOOP,
+                        order_id=order_id,
+                        from_state=order_state,
+                    )
+
+                scheduled = _reschedule_poll_task(
+                    cur,
+                    task_id=task.id,
+                    worker_id=worker_id,
+                    next_run_at=next_run_at,
+                    updated_at=updated_at,
+                )
+                if scheduled:
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_POLL_SCHEDULED,
+                        order_id=order_id,
+                        from_state=spec.source_state,
+                        to_state=spec.target_state,
+                    )
+
+    return ProcessingResult(
+        action=PROCESSING_ACTION_LOST_OWNERSHIP,
+        order_id=task.order_id,
+        from_state=spec.source_state,
+        to_state=spec.target_state,
+    )
+
+
 def _reschedule_transition_task(
     *,
     task: ClaimedTask,
@@ -1756,14 +1957,22 @@ def process_transition_task(
     # The HTTP request happens outside any transaction or row lock. A slow or
     # dead downstream service should not block other workers from claiming tasks
     # or reading/updating unrelated orders.
-    error = _call_restaurant_transition(prepared)
-    if error is not None:
+    outcome = _call_restaurant_transition(prepared)
+    if isinstance(outcome, str):
         return _reschedule_transition_task(
             task=task,
             worker_id=worker_id,
             order_id=prepared.order_id,
-            error=error,
+            error=outcome,
             spec=spec,
+        )
+
+    if outcome.status == spec.pending_status:
+        return _reschedule_transition_after_pending(
+            task=task,
+            worker_id=worker_id,
+            spec=spec,
+            retry_after_seconds=outcome.retry_after_seconds,
         )
 
     return _finalize_transition_task(task=task, worker_id=worker_id, spec=spec)
@@ -1779,21 +1988,29 @@ def process_courier_assign_task(*, task: ClaimedTask, worker_id: str) -> Process
     if isinstance(prepared, ProcessingResult):
         return prepared
 
-    error, courier_ref = _call_courier_assign(prepared)
-    if error is not None:
+    outcome = _call_courier_assign(prepared)
+    if isinstance(outcome, str):
         return _reschedule_transition_task(
             task=task,
             worker_id=worker_id,
             order_id=prepared.order_id,
-            error=error,
+            error=outcome,
             spec=COURIER_ASSIGN_SPEC,
+        )
+
+    if outcome.status == COURIER_ASSIGN_STATUS_NOT_ASSIGNED:
+        return _reschedule_transition_after_pending(
+            task=task,
+            worker_id=worker_id,
+            spec=COURIER_ASSIGN_SPEC,
+            retry_after_seconds=outcome.retry_after_seconds,
         )
 
     return _finalize_transition_task(
         task=task,
         worker_id=worker_id,
         spec=COURIER_ASSIGN_SPEC,
-        extra_order_fields={"courier_ref": courier_ref},
+        extra_order_fields={"courier_ref": outcome.courier_ref},
     )
 
 
@@ -2269,7 +2486,7 @@ def claim_and_process_one_task(*, worker_id: str) -> bool:
         )
     elif result.action == PROCESSING_ACTION_POLL_SCHEDULED:
         logger.info(
-            "rescheduled poll task %s for order %s after not-ready response",
+            "rescheduled poll task %s for order %s after pending downstream response",
             task.id,
             result.order_id,
         )
