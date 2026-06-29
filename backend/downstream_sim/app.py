@@ -7,7 +7,11 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(title="Downstream Simulator")
 
+# Demo prep duration used when RESTAURANT_READY_AFTER_SECONDS is not set. The
+# simulator returns "ready" once now >= prep_started_at + this many seconds.
 DEFAULT_RESTAURANT_READY_AFTER_SECONDS = 6.0
+# Poll hint used when RESTAURANT_READY_RETRY_AFTER_SECONDS is not set. Workers
+# cap this by the task deadline before scheduling the next check_ready attempt.
 DEFAULT_RESTAURANT_READY_RETRY_AFTER_SECONDS = 2.0
 
 
