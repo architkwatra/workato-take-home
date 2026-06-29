@@ -340,6 +340,11 @@ h2 {
   color: #ffffff;
 }
 
+.button.small {
+  min-height: 30px;
+  padding: 5px 9px;
+}
+
 .loadgen-stats {
   border-top: 1px solid #e4e8ed;
   display: grid;
@@ -389,7 +394,6 @@ h2 {
 }
 
 .service-list {
-  border-top: 1px solid #e4e8ed;
   display: grid;
 }
 
@@ -448,6 +452,11 @@ h2 {
   color: #a33b2f;
   font-size: 13px;
   margin-bottom: 0;
+}
+
+.muted-text {
+  color: #8a95a1;
+  font-size: 13px;
 }
 
 .text-button {
@@ -673,8 +682,7 @@ h2 {
 }
 
 .pipeline-step strong,
-.pipeline-step small,
-.pipeline-verification {
+.pipeline-step small {
   display: block;
   min-width: 0;
   overflow-wrap: anywhere;
@@ -690,46 +698,6 @@ h2 {
   color: #66717d;
   font-size: 12px;
   margin-top: 4px;
-}
-
-.pipeline-verification {
-  align-items: center;
-  color: #3d5861;
-  display: inline-flex;
-  font-size: 12px;
-  gap: 6px;
-  font-weight: 800;
-  margin-top: 4px;
-}
-
-.pipeline-verification::before {
-  background: #8a97a6;
-  border-radius: 999px;
-  content: "";
-  flex: 0 0 auto;
-  height: 8px;
-  width: 8px;
-}
-
-.pipeline-verification.verified {
-  color: #2f7d4f;
-}
-
-.pipeline-verification.verified::before {
-  background: #2f7d4f;
-}
-
-.pipeline-verification.unverified {
-  color: #b42318;
-}
-
-.pipeline-verification.unverified::before {
-  background: #b42318;
-}
-
-.pipeline-verification.pending,
-.pipeline-verification.neutral {
-  color: #66717d;
 }
 
 .empty-state {
