@@ -249,6 +249,10 @@ function formatDelaySeconds(seconds) {
   return `${seconds}s`;
 }
 
+function maxOrdersText(value) {
+  return value == null ? "Unbounded" : numberText(value);
+}
+
 function delayWindowText(delayWindow) {
   if (!delayWindow) {
     return "No downstream delay.";
@@ -1644,8 +1648,8 @@ function LoadgenControlPanel({
             <dd>{numberText(status?.failed_count ?? 0)}</dd>
           </div>
           <div>
-            <dt>Inflight</dt>
-            <dd>{numberText(status?.inflight_count ?? 0)}</dd>
+            <dt>Run Total</dt>
+            <dd>{maxOrdersText(status?.max_orders)}</dd>
           </div>
         </dl>
 
@@ -1953,7 +1957,6 @@ function ProblemTaskPanel({
 }
 
 function RecentOrdersPanel({ overview, onSelectOrder }) {
-  const placedRows = overview?.placed_orders ?? [];
   const rows = overview?.recent_orders ?? [];
 
   return (
@@ -1962,27 +1965,6 @@ function RecentOrdersPanel({ overview, onSelectOrder }) {
         <h2>Recent Orders</h2>
         <span>{numberText(rows.length)} shown</span>
       </div>
-      {placedRows.length > 0 ? (
-        <div className="placed-watch">
-          <div className="placed-watch-heading">
-            <span>Placed — waiting for pickup</span>
-            <small>{numberText(placedRows.length)} shown</small>
-          </div>
-          <div className="placed-watch-list">
-            {placedRows.map((order) => (
-              <a
-                className="placed-watch-item"
-                href={orderDetailPath(order.order_id)}
-                key={order.order_id}
-                onClick={(event) => onSelectOrder(order.order_id, event)}
-              >
-                <span title={order.idempotency_key}>{shortKey(order.idempotency_key)}</span>
-                <small>{formatTime(order.created_at)}</small>
-              </a>
-            ))}
-          </div>
-        </div>
-      ) : null}
       <div className="table-wrap">
         <table>
           <thead>
