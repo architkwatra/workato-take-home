@@ -272,64 +272,94 @@ function shouldUseNativeLinkNavigation(event) {
   );
 }
 
+function networkErrorFor(serviceLabel, baseUrl, caughtError) {
+  if (caughtError?.name === "AbortError") {
+    return caughtError;
+  }
+
+  // Browsers collapse network failures, refused connections, and CORS blocks
+  // into the same TypeError with "Failed to fetch". Add the service and URL so
+  // operators know which local container or browser-visible port to check.
+  if (caughtError instanceof TypeError || caughtError?.message === "Failed to fetch") {
+    return new Error(
+      `${serviceLabel} is unreachable at ${baseUrl}. Check that the container is running, the port is exposed, and CORS allows this dashboard origin.`,
+    );
+  }
+
+  return caughtError;
+}
+
+function responseErrorMessage(serviceLabel, response, payload) {
+  const fallback = `${serviceLabel} returned ${response.status}: ${response.statusText}`;
+  const detail = payload?.detail;
+  if (typeof detail === "string") {
+    return detail;
+  }
+  if (detail?.message) {
+    return detail.message;
+  }
+  return fallback;
+}
+
+function clearIfReachabilityError(message) {
+  return message.includes("unreachable at") || message === "Failed to fetch"
+    ? ""
+    : message;
+}
+
+async function requestJson(
+  serviceLabel,
+  baseUrl,
+  path,
+  { method = "GET", body, signal } = {},
+) {
+  let response;
+  try {
+    response = await fetch(`${baseUrl}${path}`, {
+      method,
+      headers: body ? { "Content-Type": "application/json" } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+      signal,
+    });
+  } catch (caughtError) {
+    throw networkErrorFor(serviceLabel, baseUrl, caughtError);
+  }
+
+  if (!response.ok) {
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch {
+      // Keep the fallback with HTTP status and statusText.
+    }
+    throw new Error(responseErrorMessage(serviceLabel, response, payload));
+  }
+
+  return response.json();
+}
+
 async function requestDashboard(path, { method = "GET", body, signal } = {}) {
-  const response = await fetch(`${API_BASE_URL}${path}`, {
+  return requestJson("API", API_BASE_URL, path, {
     method,
-    headers: body ? { "Content-Type": "application/json" } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
+    body,
     signal,
   });
-  if (!response.ok) {
-    let message = `API returned ${response.status}`;
-    try {
-      const payload = await response.json();
-      message = payload.detail?.message ?? payload.detail ?? message;
-    } catch {
-      message = `${message}: ${response.statusText}`;
-    }
-    throw new Error(String(message));
-  }
-  return response.json();
 }
 
 async function requestLoadgen(path, { method = "GET", body, signal } = {}) {
-  const response = await fetch(`${LOADGEN_BASE_URL}${path}`, {
+  return requestJson("loadgen", LOADGEN_BASE_URL, path, {
     method,
-    headers: body ? { "Content-Type": "application/json" } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
+    body,
     signal,
   });
-  if (!response.ok) {
-    let message = `loadgen returned ${response.status}`;
-    try {
-      const payload = await response.json();
-      message = payload.detail?.message ?? payload.detail ?? message;
-    } catch {
-      message = `${message}: ${response.statusText}`;
-    }
-    throw new Error(String(message));
-  }
-  return response.json();
 }
 
 async function requestDownstreamSim(path, { method = "GET", body, signal } = {}) {
-  const response = await fetch(`${DOWNSTREAM_SIM_BASE_URL}${path}`, {
+  return requestJson("downstream-sim", DOWNSTREAM_SIM_BASE_URL, path, {
     method,
-    headers: body ? { "Content-Type": "application/json" } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
+    body,
     signal,
   });
-  if (!response.ok) {
-    let message = `downstream-sim returned ${response.status}`;
-    try {
-      const payload = await response.json();
-      message = payload.detail?.message ?? payload.detail ?? message;
-    } catch {
-      message = `${message}: ${response.statusText}`;
-    }
-    throw new Error(String(message));
-  }
-  return response.json();
 }
 
 function mergeKillSwitchState(currentServices, updatedService) {
@@ -410,6 +440,7 @@ function App() {
   const [downstreamActionError, setDownstreamActionError] = useState("");
   const [downstreamLastRefreshAt, setDownstreamLastRefreshAt] = useState(null);
   const [downstreamActionPending, setDownstreamActionPending] = useState("");
+  const [downstreamPanelOpen, setDownstreamPanelOpen] = useState(false);
   const [retryActionPendingOrderId, setRetryActionPendingOrderId] = useState("");
   const [retryActionError, setRetryActionError] = useState("");
   const [cancelActionPendingOrderId, setCancelActionPendingOrderId] = useState("");
@@ -447,6 +478,8 @@ function App() {
         setOverview(payload);
         setStatus("online");
         setError("");
+        setRetryActionError(clearIfReachabilityError);
+        setCancelActionError(clearIfReachabilityError);
         setLastRefreshAt(new Date());
       } catch (caughtError) {
         if (stopped || caughtError.name === "AbortError") {
@@ -498,6 +531,7 @@ function App() {
         setDownstreamServices(payload.services ?? []);
         setDownstreamConnection("online");
         setDownstreamError("");
+        setDownstreamActionError(clearIfReachabilityError);
         setDownstreamLastRefreshAt(new Date());
       } catch (caughtError) {
         if (stopped || caughtError.name === "AbortError") {
@@ -605,6 +639,7 @@ function App() {
         setLoadgenStatus(payload);
         setLoadgenConnection("online");
         setLoadgenError("");
+        setLoadgenActionError(clearIfReachabilityError);
         setLoadgenLastRefreshAt(new Date());
       } catch (caughtError) {
         if (stopped || caughtError.name === "AbortError") {
@@ -662,6 +697,16 @@ function App() {
     totals.expiredRunning +
     totals.retryingPending +
     totals.retryingRunning;
+  const downstreamServiceByName = new Map(
+    downstreamServices.map((serviceState) => [serviceState.service, serviceState]),
+  );
+  const downstreamKilledCount = DOWNSTREAM_SERVICES.filter((serviceName) =>
+    Boolean(downstreamServiceByName.get(serviceName)?.killed),
+  ).length;
+  const downstreamButtonText =
+    downstreamKilledCount > 0
+      ? `Downstream (${numberText(downstreamKilledCount)} killed)`
+      : "Downstream";
 
   function updateLoadgenForm(field, value) {
     setLoadgenForm((current) => ({ ...current, [field]: value }));
@@ -843,6 +888,33 @@ function App() {
           <span>
             Last refresh {pageLastRefreshAt ? formatTime(pageLastRefreshAt) : "pending"}
           </span>
+          <div className="topbar-popover-anchor">
+            <button
+              aria-controls="downstream-kill-switches"
+              aria-expanded={downstreamPanelOpen}
+              className={`button topbar-action ${
+                downstreamKilledCount > 0 ? "danger" : ""
+              }`}
+              type="button"
+              onClick={() => setDownstreamPanelOpen((current) => !current)}
+            >
+              {downstreamButtonText}
+            </button>
+            {downstreamPanelOpen ? (
+              <div className="topbar-popover" id="downstream-kill-switches">
+                <DownstreamControlPanel
+                  actionError={downstreamActionError}
+                  actionPending={downstreamActionPending}
+                  className="topbar-downstream"
+                  connection={downstreamConnection}
+                  error={downstreamError}
+                  lastRefreshAt={downstreamLastRefreshAt}
+                  onToggle={setDownstreamKilled}
+                  services={downstreamServices}
+                />
+              </div>
+            ) : null}
+          </div>
         </div>
       </header>
 
@@ -908,16 +980,6 @@ function App() {
               }
             />
           </section>
-
-          <DownstreamControlPanel
-            actionError={downstreamActionError}
-            actionPending={downstreamActionPending}
-            connection={downstreamConnection}
-            error={downstreamError}
-            lastRefreshAt={downstreamLastRefreshAt}
-            onToggle={setDownstreamKilled}
-            services={downstreamServices}
-          />
 
           <LoadgenControlPanel
             actionError={loadgenActionError}
@@ -1367,6 +1429,7 @@ function LoadgenControlPanel({
 function DownstreamControlPanel({
   actionError,
   actionPending,
+  className = "",
   connection,
   error,
   lastRefreshAt,
@@ -1396,60 +1459,58 @@ function DownstreamControlPanel({
         : "All enabled";
 
   return (
-    <details className="section downstream-panel dropdown-panel">
-      <summary className="dropdown-summary">
+    <section className={`section downstream-panel ${className}`.trim()}>
+      <div className="section-heading downstream-heading">
         <div>
           <h2>Downstream Kill Switches</h2>
           <span>{statusText}</span>
         </div>
         <strong>{killSummary}</strong>
-      </summary>
-
-      <div className="dropdown-content">
-        <div className="service-list">
-          {DOWNSTREAM_SERVICES.map((serviceName) => {
-            const serviceState = serviceByName.get(serviceName);
-            const killed = Boolean(serviceState?.killed);
-            const pendingKill = actionPending === `${serviceName}:kill`;
-            const pendingRestore = actionPending === `${serviceName}:restore`;
-            const pending = pendingKill || pendingRestore;
-            const disabled = Boolean(actionPending) || connection === "offline";
-
-            return (
-              <div className="service-row" key={serviceName}>
-                <div>
-                  <strong>{humanize(serviceName)}</strong>
-                  <span
-                    className={`service-state ${
-                      killed ? "killed" : serviceState ? "online" : "unknown"
-                    }`}
-                  >
-                    {killed ? "Killed" : serviceState ? "Online" : "Unknown"}
-                  </span>
-                </div>
-                <button
-                  className={`button ${killed ? "primary" : "danger"}`}
-                  disabled={disabled}
-                  type="button"
-                  onClick={() => onToggle(serviceName, !killed)}
-                >
-                  {pending
-                    ? pendingKill
-                      ? "Killing"
-                      : "Restoring"
-                    : killed
-                      ? "Restore"
-                      : "Kill"}
-                </button>
-              </div>
-            );
-          })}
-        </div>
-
-        {error ? <p className="inline-error">downstream-sim: {error}</p> : null}
-        {actionError ? <p className="inline-error">{actionError}</p> : null}
       </div>
-    </details>
+
+      <div className="service-list">
+        {DOWNSTREAM_SERVICES.map((serviceName) => {
+          const serviceState = serviceByName.get(serviceName);
+          const killed = Boolean(serviceState?.killed);
+          const pendingKill = actionPending === `${serviceName}:kill`;
+          const pendingRestore = actionPending === `${serviceName}:restore`;
+          const pending = pendingKill || pendingRestore;
+          const disabled = Boolean(actionPending) || connection === "offline";
+
+          return (
+            <div className="service-row" key={serviceName}>
+              <div>
+                <strong>{humanize(serviceName)}</strong>
+                <span
+                  className={`service-state ${
+                    killed ? "killed" : serviceState ? "online" : "unknown"
+                  }`}
+                >
+                  {killed ? "Killed" : serviceState ? "Online" : "Unknown"}
+                </span>
+              </div>
+              <button
+                className={`button ${killed ? "primary" : "danger"}`}
+                disabled={disabled}
+                type="button"
+                onClick={() => onToggle(serviceName, !killed)}
+              >
+                {pending
+                  ? pendingKill
+                    ? "Killing"
+                    : "Restoring"
+                  : killed
+                    ? "Restore"
+                    : "Kill"}
+              </button>
+            </div>
+          );
+        })}
+      </div>
+
+      {error ? <p className="inline-error">downstream-sim: {error}</p> : null}
+      {actionError ? <p className="inline-error">{actionError}</p> : null}
+    </section>
   );
 }
 
