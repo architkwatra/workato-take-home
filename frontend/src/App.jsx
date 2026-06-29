@@ -12,6 +12,9 @@ const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "http://localhost:808
 const LOADGEN_BASE_URL = (
   import.meta.env.VITE_LOADGEN_BASE_URL ?? "http://localhost:8082"
 ).replace(/\/$/, "");
+const DOWNSTREAM_SIM_BASE_URL = (
+  import.meta.env.VITE_DOWNSTREAM_SIM_BASE_URL ?? "http://localhost:8081"
+).replace(/\/$/, "");
 // Polling keeps the dashboard operationally useful without adding websocket
 // infrastructure to this small local demo slice.
 const POLL_INTERVAL_MS = 3000;
@@ -71,6 +74,13 @@ const PIPELINE_DELAY_WINDOWS = {
 };
 
 const TASK_STATUSES = ["pending", "running", "completed", "failed", "cancelled"];
+const DOWNSTREAM_SERVICES = [
+  "restaurant_confirm",
+  "restaurant_start_prep",
+  "restaurant_check_ready",
+  "courier_assign",
+  "courier_check_delivery",
+];
 
 const LABELS = {
   out_for_delivery: "out for delivery",
@@ -286,6 +296,42 @@ async function requestLoadgen(path, { method = "GET", body, signal } = {}) {
   return response.json();
 }
 
+async function requestDownstreamSim(path, { method = "GET", body, signal } = {}) {
+  const response = await fetch(`${DOWNSTREAM_SIM_BASE_URL}${path}`, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+    signal,
+  });
+  if (!response.ok) {
+    let message = `downstream-sim returned ${response.status}`;
+    try {
+      const payload = await response.json();
+      message = payload.detail?.message ?? payload.detail ?? message;
+    } catch {
+      message = `${message}: ${response.statusText}`;
+    }
+    throw new Error(String(message));
+  }
+  return response.json();
+}
+
+function mergeKillSwitchState(currentServices, updatedService) {
+  const servicesByName = new Map(
+    currentServices.map((serviceState) => [serviceState.service, serviceState]),
+  );
+  servicesByName.set(updatedService.service, updatedService);
+
+  return DOWNSTREAM_SERVICES.map(
+    (serviceName) =>
+      servicesByName.get(serviceName) ?? {
+        service: serviceName,
+        killed: false,
+        status: "unknown",
+      },
+  );
+}
+
 function Metric({ label, value, detail, helpText, tone = "neutral" }) {
   return (
     <section className={`metric ${tone}`}>
@@ -340,6 +386,12 @@ function App() {
     restaurantRef: "dashboard-manual",
     customerRefPrefix: "dashboard-customer",
   });
+  const [downstreamServices, setDownstreamServices] = useState([]);
+  const [downstreamConnection, setDownstreamConnection] = useState("loading");
+  const [downstreamError, setDownstreamError] = useState("");
+  const [downstreamActionError, setDownstreamActionError] = useState("");
+  const [downstreamLastRefreshAt, setDownstreamLastRefreshAt] = useState(null);
+  const [downstreamActionPending, setDownstreamActionPending] = useState("");
 
   useEffect(() => {
     function handlePopState() {
@@ -392,6 +444,54 @@ function App() {
     }
 
     loadOverview();
+
+    return () => {
+      stopped = true;
+      window.clearTimeout(timerId);
+      controller?.abort();
+    };
+  }, []);
+
+  useEffect(() => {
+    let stopped = false;
+    let timerId = null;
+    let controller = null;
+
+    // Kill switches live in downstream-sim memory, so poll that service
+    // directly instead of coupling this small operator control to Postgres.
+    async function loadKillSwitches() {
+      controller = new AbortController();
+      setDownstreamConnection((current) =>
+        current === "online" ? "refreshing" : "loading",
+      );
+
+      try {
+        const payload = await requestDownstreamSim("/control/kill-switches", {
+          signal: controller.signal,
+        });
+        if (stopped) {
+          return;
+        }
+
+        setDownstreamServices(payload.services ?? []);
+        setDownstreamConnection("online");
+        setDownstreamError("");
+        setDownstreamLastRefreshAt(new Date());
+      } catch (caughtError) {
+        if (stopped || caughtError.name === "AbortError") {
+          return;
+        }
+
+        setDownstreamConnection("offline");
+        setDownstreamError(caughtError.message || "downstream-sim request failed");
+      } finally {
+        if (!stopped) {
+          timerId = window.setTimeout(loadKillSwitches, POLL_INTERVAL_MS);
+        }
+      }
+    }
+
+    loadKillSwitches();
 
     return () => {
       stopped = true;
@@ -630,6 +730,33 @@ function App() {
     );
   }
 
+  async function runDownstreamAction(actionName, request) {
+    setDownstreamActionPending(actionName);
+    setDownstreamActionError("");
+    try {
+      const payload = await request();
+      setDownstreamServices((current) => mergeKillSwitchState(current, payload));
+      setDownstreamConnection("online");
+      setDownstreamError("");
+      setDownstreamLastRefreshAt(new Date());
+    } catch (caughtError) {
+      setDownstreamActionError(
+        caughtError.message || "downstream-sim action failed",
+      );
+    } finally {
+      setDownstreamActionPending("");
+    }
+  }
+
+  async function setDownstreamKilled(serviceName, killed) {
+    await runDownstreamAction(`${serviceName}:${killed ? "kill" : "restore"}`, () =>
+      requestDownstreamSim(`/control/kill-switches/${serviceName}`, {
+        method: "POST",
+        body: { killed },
+      }),
+    );
+  }
+
   return (
     <main className="dashboard-shell">
       <header className="topbar">
@@ -719,6 +846,16 @@ function App() {
             <LifecyclePanel overview={overview} />
             <RecentOrdersPanel overview={overview} onSelectOrder={openOrderDetail} />
           </div>
+
+          <DownstreamControlPanel
+            actionError={downstreamActionError}
+            actionPending={downstreamActionPending}
+            connection={downstreamConnection}
+            error={downstreamError}
+            lastRefreshAt={downstreamLastRefreshAt}
+            onToggle={setDownstreamKilled}
+            services={downstreamServices}
+          />
 
           <div className="content-grid wide">
             <ProblemTaskPanel overview={overview} />
@@ -1090,6 +1227,78 @@ function LoadgenControlPanel({
           {actionError ? <p className="inline-error">{actionError}</p> : null}
         </div>
       </div>
+    </section>
+  );
+}
+
+function DownstreamControlPanel({
+  actionError,
+  actionPending,
+  connection,
+  error,
+  lastRefreshAt,
+  onToggle,
+  services,
+}) {
+  const serviceByName = new Map(
+    services.map((serviceState) => [serviceState.service, serviceState]),
+  );
+  const connectionLabel =
+    connection === "online" || connection === "refreshing"
+      ? "Connected"
+      : connection === "offline"
+        ? "Offline"
+        : "Loading";
+
+  return (
+    <section className="section downstream-panel">
+      <div className="section-heading">
+        <h2>Downstream Kill Switches</h2>
+        <span>{lastRefreshAt ? `Updated ${formatTime(lastRefreshAt)}` : connectionLabel}</span>
+      </div>
+
+      <div className="service-list">
+        {DOWNSTREAM_SERVICES.map((serviceName) => {
+          const serviceState = serviceByName.get(serviceName);
+          const killed = Boolean(serviceState?.killed);
+          const pendingKill = actionPending === `${serviceName}:kill`;
+          const pendingRestore = actionPending === `${serviceName}:restore`;
+          const pending = pendingKill || pendingRestore;
+          const disabled = Boolean(actionPending) || connection === "offline";
+
+          return (
+            <div className="service-row" key={serviceName}>
+              <div>
+                <strong>{humanize(serviceName)}</strong>
+                <span
+                  className={`service-state ${
+                    killed ? "killed" : serviceState ? "online" : "unknown"
+                  }`}
+                >
+                  {killed ? "Killed" : serviceState ? "Online" : "Unknown"}
+                </span>
+              </div>
+              <button
+                className={`button ${killed ? "primary" : "danger"}`}
+                disabled={disabled}
+                type="button"
+                onClick={() => onToggle(serviceName, !killed)}
+              >
+                {pending
+                  ? pendingKill
+                    ? "Killing"
+                    : "Restoring"
+                  : killed
+                    ? "Restore"
+                    : "Kill"}
+              </button>
+            </div>
+          );
+        })}
+      </div>
+
+      {error ? <p className="inline-error">downstream-sim: {error}</p> : null}
+      {actionError ? <p className="inline-error">{actionError}</p> : null}
     </section>
   );
 }

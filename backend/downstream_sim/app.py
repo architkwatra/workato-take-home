@@ -1,8 +1,10 @@
 import hashlib
 import os
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 
@@ -21,6 +23,40 @@ DEFAULT_COURIER_ASSIGN_AFTER_SECONDS = 3.0
 DEFAULT_COURIER_ASSIGN_RETRY_AFTER_SECONDS = 1.0
 DEFAULT_COURIER_DELIVERED_AFTER_SECONDS = 8.0
 DEFAULT_COURIER_DELIVERED_RETRY_AFTER_SECONDS = 3.0
+SIMULATED_SERVICE_RESTAURANT_CONFIRM = "restaurant_confirm"
+SIMULATED_SERVICE_RESTAURANT_START_PREP = "restaurant_start_prep"
+SIMULATED_SERVICE_RESTAURANT_CHECK_READY = "restaurant_check_ready"
+SIMULATED_SERVICE_COURIER_ASSIGN = "courier_assign"
+SIMULATED_SERVICE_COURIER_CHECK_DELIVERY = "courier_check_delivery"
+SIMULATED_SERVICES = (
+    SIMULATED_SERVICE_RESTAURANT_CONFIRM,
+    SIMULATED_SERVICE_RESTAURANT_START_PREP,
+    SIMULATED_SERVICE_RESTAURANT_CHECK_READY,
+    SIMULATED_SERVICE_COURIER_ASSIGN,
+    SIMULATED_SERVICE_COURIER_CHECK_DELIVERY,
+)
+
+_kill_switch_lock = Lock()
+_kill_switches = {service_name: False for service_name in SIMULATED_SERVICES}
+
+
+def _dashboard_cors_origins() -> list[str]:
+    """Return browser origins allowed to use the simulator control API."""
+    raw_origins = os.getenv("DOWNSTREAM_SIM_CORS_ORIGINS")
+    if raw_origins is None:
+        return ["http://localhost:3000"]
+
+    origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+    return origins or ["http://localhost:3000"]
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_dashboard_cors_origins(),
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 
 class RestaurantConfirmRequest(BaseModel):
@@ -97,6 +133,73 @@ class CourierCheckDeliveryResponse(BaseModel):
 
     status: str
     retry_after_seconds: float | None = None
+
+
+class KillSwitchUpdateRequest(BaseModel):
+    """Operator request to kill or restore one simulated downstream service."""
+
+    killed: bool
+
+
+class KillSwitchState(BaseModel):
+    """Current kill-switch state for one simulated downstream service."""
+
+    service: str
+    killed: bool
+    status: str
+
+
+class KillSwitchOverviewResponse(BaseModel):
+    """Dashboard response listing all simulator kill-switch states."""
+
+    services: list[KillSwitchState]
+
+
+def _kill_switch_state(service_name: str) -> dict[str, bool | str]:
+    """Return the dashboard-facing state for one simulated dependency."""
+    killed = _kill_switches[service_name]
+    return {
+        "service": service_name,
+        "killed": killed,
+        "status": "killed" if killed else "online",
+    }
+
+
+def _kill_switch_snapshot() -> list[dict[str, bool | str]]:
+    """Return a consistent copy of all in-memory kill switches."""
+    with _kill_switch_lock:
+        return [_kill_switch_state(service_name) for service_name in SIMULATED_SERVICES]
+
+
+def _set_kill_switch(service_name: str, killed: bool) -> dict[str, bool | str]:
+    """Set one simulator kill switch after validating the service name."""
+    if service_name not in _kill_switches:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"unknown simulated service: {service_name}",
+        )
+
+    with _kill_switch_lock:
+        _kill_switches[service_name] = killed
+        return _kill_switch_state(service_name)
+
+
+def _raise_if_service_killed(service_name: str) -> None:
+    """Make worker-facing endpoints fail fast while a kill switch is enabled.
+
+    The simulator process stays healthy so the dashboard can restore the switch.
+    Kill switches are intentionally per endpoint so demos can break one stage
+    without taking every restaurant or courier operation down at once. Workers
+    see this as a real downstream 503 and exercise their retry paths.
+    """
+    with _kill_switch_lock:
+        killed = _kill_switches[service_name]
+
+    if killed:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"{service_name.replace('_', ' ')} simulator is killed",
+        )
 
 
 def _read_positive_float_env(env_name: str, default: float) -> float:
@@ -236,7 +339,10 @@ async def readyz() -> dict[str, object]:
     return {
         "status": "ok",
         "service": os.getenv("SERVICE_NAME", "downstream-sim"),
-        "simulator": {"restaurant": "idle", "courier": "idle"},
+        "simulator": {
+            service["service"]: service["status"]
+            for service in _kill_switch_snapshot()
+        },
     }
 
 
@@ -244,6 +350,24 @@ async def readyz() -> dict[str, object]:
 async def root() -> dict[str, str]:
     """Return a simple scaffold response for humans hitting the simulator root."""
     return {"message": "Downstream simulator scaffold"}
+
+
+@app.get("/control/kill-switches", response_model=KillSwitchOverviewResponse)
+async def get_kill_switches() -> dict[str, list[dict[str, bool | str]]]:
+    """Return current kill-switch state for dashboard operators."""
+    return {"services": _kill_switch_snapshot()}
+
+
+@app.post(
+    "/control/kill-switches/{service_name}",
+    response_model=KillSwitchState,
+)
+async def update_kill_switch(
+    service_name: str,
+    request: KillSwitchUpdateRequest,
+) -> dict[str, bool | str]:
+    """Kill or restore one simulated downstream service for outage demos."""
+    return _set_kill_switch(service_name, request.killed)
 
 
 @app.post("/restaurant/confirm", response_model=RestaurantConfirmResponse)
@@ -256,6 +380,7 @@ async def confirm_restaurant_order(
     as quick "not_confirmed" responses until this order's deterministic delay
     from placed_at has elapsed.
     """
+    _raise_if_service_killed(SIMULATED_SERVICE_RESTAURANT_CONFIRM)
     return _delayed_status_response(
         order_id=request.order_id,
         source_started_at=request.placed_at,
@@ -280,6 +405,7 @@ async def start_restaurant_prep(
     Starting prep is also delayed to make every lifecycle hop visible in the
     dashboard without blocking a worker thread or DB transaction.
     """
+    _raise_if_service_killed(SIMULATED_SERVICE_RESTAURANT_START_PREP)
     return _delayed_status_response(
         order_id=request.order_id,
         source_started_at=request.confirmed_at,
@@ -300,6 +426,7 @@ async def check_restaurant_ready(
     request: RestaurantCheckReadyRequest,
 ) -> dict[str, float | str]:
     """Return whether enough deterministic prep time has elapsed for an order."""
+    _raise_if_service_killed(SIMULATED_SERVICE_RESTAURANT_CHECK_READY)
     return _delayed_status_response(
         order_id=request.order_id,
         source_started_at=request.prep_started_at,
@@ -323,6 +450,7 @@ async def assign_courier(request: CourierAssignRequest) -> dict[str, float | str
     return the same courier. No persistence is needed; the worker writes the ref
     to orders.courier_ref in the finalization transaction.
     """
+    _raise_if_service_killed(SIMULATED_SERVICE_COURIER_ASSIGN)
     delay_response = _delayed_status_response(
         order_id=request.order_id,
         source_started_at=request.ready_at,
@@ -352,6 +480,7 @@ async def check_courier_delivery(
     request: CourierCheckDeliveryRequest,
 ) -> dict[str, float | str]:
     """Return whether enough deterministic delivery time has elapsed for an order."""
+    _raise_if_service_killed(SIMULATED_SERVICE_COURIER_CHECK_DELIVERY)
     return _delayed_status_response(
         order_id=request.order_id,
         source_started_at=request.dispatched_at,

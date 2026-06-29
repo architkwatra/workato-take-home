@@ -249,6 +249,10 @@ h2 {
   margin-bottom: 16px;
 }
 
+.downstream-panel {
+  margin-bottom: 16px;
+}
+
 .loadgen-layout {
   display: grid;
   gap: 18px;
@@ -382,6 +386,62 @@ h2 {
 .run-status.stopped {
   background: #edf1f4;
   color: #4a5562;
+}
+
+.service-list {
+  border-top: 1px solid #e4e8ed;
+  display: grid;
+}
+
+.service-row {
+  align-items: center;
+  border-bottom: 1px solid #e4e8ed;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding: 12px 0;
+}
+
+.service-row strong {
+  color: #263241;
+  display: block;
+  font-size: 15px;
+  text-transform: capitalize;
+}
+
+.service-state {
+  align-items: center;
+  color: #66717d;
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 800;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.service-state::before {
+  background: #8a97a6;
+  border-radius: 999px;
+  content: "";
+  flex: 0 0 auto;
+  height: 8px;
+  width: 8px;
+}
+
+.service-state.online {
+  color: #2f7d4f;
+}
+
+.service-state.online::before {
+  background: #2f7d4f;
+}
+
+.service-state.killed {
+  color: #b42318;
+}
+
+.service-state.killed::before {
+  background: #b42318;
 }
 
 .inline-error {
@@ -908,6 +968,14 @@ tbody tr:last-child td {
 
   .button-row {
     display: grid;
+  }
+
+  .service-row {
+    grid-template-columns: 1fr;
+  }
+
+  .service-row .button {
+    width: 100%;
   }
 
   .detail-toolbar {
