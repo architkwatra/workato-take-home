@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 
@@ -40,6 +41,19 @@ def positive_int_env(name: str, default: int) -> int:
     return parsed_value if parsed_value > 0 else default
 
 
+def _loadgen_cors_origins() -> list[str]:
+    """Return browser origins allowed to operate the local load generator."""
+    raw_origins = os.getenv("LOADGEN_CORS_ORIGINS")
+    if raw_origins is None:
+        # The dashboard controls traffic generation, so keep the default
+        # constrained to the local dashboard origin instead of allowing all
+        # browser origins.
+        return ["http://localhost:3000"]
+
+    origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+    return origins or ["http://localhost:3000"]
+
+
 class StartLoadRequest(BaseModel):
     """Operator request to start one bounded or unbounded loadgen run."""
 
@@ -69,10 +83,11 @@ class LoadGenerator:
     """In-memory controller for one persistent, single-replica load generator."""
 
     def __init__(self) -> None:
-        # This is a high safety limit for the load generator itself, not a way
-        # to protect the API. If the API slows down during a demo, that should
-        # remain visible while preventing unbounded local task/memory growth.
-        self._max_inflight = positive_int_env("LOADGEN_MAX_INFLIGHT", 1000)
+        # This is an operator-tunable cap for the load generator itself, not a
+        # way to protect the API. The default is intentionally huge for stress
+        # demos, while still leaving a final backstop against truly unbounded
+        # task creation inside this process.
+        self._max_inflight = positive_int_env("LOADGEN_MAX_INFLIGHT", 1_000_000)
         self._inflight_semaphore = asyncio.Semaphore(self._max_inflight)
         # The lock protects run state shared by FastAPI handlers, the producer
         # loop, and request completion callbacks.
@@ -333,6 +348,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Load Generator", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_loadgen_cors_origins(),
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PATCH"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/healthz")
