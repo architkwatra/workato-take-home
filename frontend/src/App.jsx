@@ -204,8 +204,8 @@ function pipelineVerification({ reachedAt, previousReachedAt, deltaMilliseconds,
       };
 }
 
-function pipelineDeltaTooltip({ delayWindow }) {
-  return delayWindowText(delayWindow);
+function pipelineDeltaTooltip({ delayWindow, verification }) {
+  return `${delayWindowText(delayWindow)} ${verification.label}.`;
 }
 
 function orderIdFromPath(pathname) {
@@ -268,10 +268,22 @@ function shouldUseNativeLinkNavigation(event) {
   );
 }
 
-async function requestDashboard(path, { signal } = {}) {
-  const response = await fetch(`${API_BASE_URL}${path}`, { signal });
+async function requestDashboard(path, { method = "GET", body, signal } = {}) {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+    signal,
+  });
   if (!response.ok) {
-    throw new Error(`API returned ${response.status}`);
+    let message = `API returned ${response.status}`;
+    try {
+      const payload = await response.json();
+      message = payload.detail?.message ?? payload.detail ?? message;
+    } catch {
+      message = `${message}: ${response.statusText}`;
+    }
+    throw new Error(String(message));
   }
   return response.json();
 }
@@ -369,11 +381,13 @@ function App() {
   const [status, setStatus] = useState("loading");
   const [error, setError] = useState("");
   const [lastRefreshAt, setLastRefreshAt] = useState(null);
+  const [overviewRefreshToken, setOverviewRefreshToken] = useState(0);
   const [selectedOrderId, setSelectedOrderId] = useState(selectedOrderIdFromLocation);
   const [orderDetail, setOrderDetail] = useState(null);
   const [orderDetailStatus, setOrderDetailStatus] = useState("idle");
   const [orderDetailError, setOrderDetailError] = useState("");
   const [orderDetailLastRefreshAt, setOrderDetailLastRefreshAt] = useState(null);
+  const [orderDetailRefreshToken, setOrderDetailRefreshToken] = useState(0);
   const [loadgenStatus, setLoadgenStatus] = useState(null);
   const [loadgenConnection, setLoadgenConnection] = useState("loading");
   const [loadgenError, setLoadgenError] = useState("");
@@ -392,6 +406,8 @@ function App() {
   const [downstreamActionError, setDownstreamActionError] = useState("");
   const [downstreamLastRefreshAt, setDownstreamLastRefreshAt] = useState(null);
   const [downstreamActionPending, setDownstreamActionPending] = useState("");
+  const [retryActionPendingOrderId, setRetryActionPendingOrderId] = useState("");
+  const [retryActionError, setRetryActionError] = useState("");
 
   useEffect(() => {
     function handlePopState() {
@@ -450,7 +466,7 @@ function App() {
       window.clearTimeout(timerId);
       controller?.abort();
     };
-  }, []);
+  }, [overviewRefreshToken]);
 
   useEffect(() => {
     let stopped = false;
@@ -556,7 +572,7 @@ function App() {
       window.clearTimeout(timerId);
       controller?.abort();
     };
-  }, [selectedOrderId]);
+  }, [selectedOrderId, orderDetailRefreshToken]);
 
   useEffect(() => {
     let stopped = false;
@@ -757,6 +773,25 @@ function App() {
     );
   }
 
+  async function retryFailedTasks(orderId) {
+    setRetryActionPendingOrderId(orderId);
+    setRetryActionError("");
+
+    try {
+      await requestDashboard(`/orders/${encodeURIComponent(orderId)}/tasks/retry-failed`, {
+        method: "POST",
+      });
+      setOverviewRefreshToken((current) => current + 1);
+      if (selectedOrderId) {
+        setOrderDetailRefreshToken((current) => current + 1);
+      }
+    } catch (caughtError) {
+      setRetryActionError(caughtError.message || "retry failed tasks request failed");
+    } finally {
+      setRetryActionPendingOrderId("");
+    }
+  }
+
   return (
     <main className="dashboard-shell">
       <header className="topbar">
@@ -783,6 +818,9 @@ function App() {
           detail={orderDetail}
           error={orderDetailError}
           onBack={closeOrderDetail}
+          onRetryFailedTasks={retryFailedTasks}
+          retryActionError={retryActionError}
+          retryActionPendingOrderId={retryActionPendingOrderId}
         />
       ) : (
         <>
@@ -858,7 +896,12 @@ function App() {
           />
 
           <div className="content-grid wide">
-            <ProblemTaskPanel overview={overview} />
+            <ProblemTaskPanel
+              overview={overview}
+              onRetryFailedTasks={retryFailedTasks}
+              retryActionError={retryActionError}
+              retryActionPendingOrderId={retryActionPendingOrderId}
+            />
             <RecentEventsPanel overview={overview} />
           </div>
 
@@ -869,10 +912,23 @@ function App() {
   );
 }
 
-function OrderDetailPage({ detail, error, onBack }) {
+function OrderDetailPage({
+  detail,
+  error,
+  onBack,
+  onRetryFailedTasks,
+  retryActionError,
+  retryActionPendingOrderId,
+}) {
   const order = detail?.order;
   const tasks = detail?.tasks ?? [];
   const events = detail?.events ?? [];
+  const failedTaskCount = tasks.filter((task) => task.status === "failed").length;
+  const retryPending = order?.order_id === retryActionPendingOrderId;
+  const retryButtonText =
+    failedTaskCount === 1
+      ? "Retry Failed Task"
+      : `Retry ${numberText(failedTaskCount)} Failed Tasks`;
 
   return (
     <section className="detail-page">
@@ -880,11 +936,26 @@ function OrderDetailPage({ detail, error, onBack }) {
         <a className="button" href="/" onClick={onBack}>
           Back to Dashboard
         </a>
+        {order && failedTaskCount > 0 ? (
+          <button
+            className="button primary"
+            disabled={Boolean(retryActionPendingOrderId)}
+            type="button"
+            onClick={() => onRetryFailedTasks(order.order_id)}
+          >
+            {retryPending ? "Retrying" : retryButtonText}
+          </button>
+        ) : null}
       </div>
 
       {error ? (
         <div className="alert" role="status">
           Order detail issue: {error}
+        </div>
+      ) : null}
+      {retryActionError ? (
+        <div className="alert" role="status">
+          Retry issue: {retryActionError}
         </div>
       ) : null}
 
@@ -975,7 +1046,7 @@ function PipelinePanel({ order, events }) {
             deltaMilliseconds,
             delayWindow,
           });
-          const tooltipText = pipelineDeltaTooltip({ delayWindow });
+          const tooltipText = pipelineDeltaTooltip({ delayWindow, verification });
           const stageStatus =
             currentIndex === -1
               ? reachedAt
@@ -999,9 +1070,6 @@ function PipelinePanel({ order, events }) {
               <div>
                 <strong>{humanize(state)}</strong>
                 <small>{reachedAt ? formatTime(reachedAt) : "Pending"}</small>
-                <span className={`pipeline-verification ${verification.status}`}>
-                  {verification.label}
-                </span>
               </div>
             </div>
           );
@@ -1365,7 +1433,12 @@ function TaskHealthPanel({ overview }) {
   );
 }
 
-function ProblemTaskPanel({ overview }) {
+function ProblemTaskPanel({
+  overview,
+  onRetryFailedTasks,
+  retryActionError,
+  retryActionPendingOrderId,
+}) {
   const rows = overview?.problem_tasks ?? [];
 
   return (
@@ -1374,6 +1447,11 @@ function ProblemTaskPanel({ overview }) {
         <h2>Problem Tasks</h2>
         <span>{numberText(rows.length)} shown</span>
       </div>
+      {retryActionError ? (
+        <p className="inline-error" role="status">
+          {retryActionError}
+        </p>
+      ) : null}
       <div className="table-wrap">
         <table>
           <thead>
@@ -1383,25 +1461,45 @@ function ProblemTaskPanel({ overview }) {
               <th>Order</th>
               <th>Attempts</th>
               <th>Error</th>
+              <th>Action</th>
             </tr>
           </thead>
           <tbody>
             {rows.length ? (
-              rows.map((task) => (
-                <tr key={task.task_id}>
-                  <td>{humanize(task.problem_reason)}</td>
-                  <td>{humanize(task.task_type)}</td>
-                  <td title={task.order_id}>{task.idempotency_key}</td>
-                  <td>
-                    {numberText(task.attempts)}/{numberText(task.max_attempts)}
-                  </td>
-                  <td className="truncate" title={task.last_error ?? ""}>
-                    {task.last_error ?? "None"}
-                  </td>
-                </tr>
-              ))
+              rows.map((task) => {
+                const retryPending = task.order_id === retryActionPendingOrderId;
+                const canRetry = task.status === "failed";
+
+                return (
+                  <tr key={task.task_id}>
+                    <td>{humanize(task.problem_reason)}</td>
+                    <td>{humanize(task.task_type)}</td>
+                    <td title={task.order_id}>{task.idempotency_key}</td>
+                    <td>
+                      {numberText(task.attempts)}/{numberText(task.max_attempts)}
+                    </td>
+                    <td className="truncate" title={task.last_error ?? ""}>
+                      {task.last_error ?? "None"}
+                    </td>
+                    <td>
+                      {canRetry ? (
+                        <button
+                          className="button small"
+                          disabled={Boolean(retryActionPendingOrderId)}
+                          type="button"
+                          onClick={() => onRetryFailedTasks(task.order_id)}
+                        >
+                          {retryPending ? "Retrying" : "Retry"}
+                        </button>
+                      ) : (
+                        <span className="muted-text">None</span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })
             ) : (
-              <EmptyRow colSpan={5}>No failed, expired, or error-bearing due tasks</EmptyRow>
+              <EmptyRow colSpan={6}>No failed, expired, or error-bearing due tasks</EmptyRow>
             )}
           </tbody>
         </table>
