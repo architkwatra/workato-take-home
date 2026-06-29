@@ -7,8 +7,12 @@ from psycopg.rows import dict_row
 from common.db import open_db_connection
 from common.event_types import EVENT_TYPE_ORDER_CREATED, EVENT_TYPE_STATE_TRANSITION
 from common.state_machine import (
+    ORDER_STATE_CONFIRMED,
     ORDER_STATE_DELIVERED,
+    ORDER_STATE_OUT_FOR_DELIVERY,
     ORDER_STATE_PLACED,
+    ORDER_STATE_PREPARING,
+    ORDER_STATE_READY,
     ORDER_STATES,
 )
 from common.task_types import (
@@ -28,12 +32,27 @@ RECENT_ORDER_LIMIT = 12
 RECENT_EVENT_LIMIT = 20
 PROBLEM_TASK_LIMIT = 20
 PLACED_ORDER_LIMIT = 5
+STUCK_ORDER_LIMIT = 12
 ORDER_DETAIL_EVENT_LIMIT = 50
 ORDER_DETAIL_TASK_LIMIT = 50
 # Keep throughput derived from a short rolling window. This is intentionally
 # read-model-only for the local dashboard; durable metrics storage can come
 # later if we need historical charts.
 THROUGHPUT_WINDOW_SECONDS = 30
+DEFAULT_STUCK_ORDER_THRESHOLDS_SECONDS = {
+    ORDER_STATE_PLACED: 18,
+    ORDER_STATE_CONFIRMED: 18,
+    ORDER_STATE_PREPARING: 45,
+    ORDER_STATE_READY: 20,
+    ORDER_STATE_OUT_FOR_DELIVERY: 90,
+}
+STUCK_ORDER_THRESHOLD_ENV_VARS = {
+    ORDER_STATE_PLACED: "DASHBOARD_STUCK_PLACED_SECONDS",
+    ORDER_STATE_CONFIRMED: "DASHBOARD_STUCK_CONFIRMED_SECONDS",
+    ORDER_STATE_PREPARING: "DASHBOARD_STUCK_PREPARING_SECONDS",
+    ORDER_STATE_READY: "DASHBOARD_STUCK_READY_SECONDS",
+    ORDER_STATE_OUT_FOR_DELIVERY: "DASHBOARD_STUCK_OUT_FOR_DELIVERY_SECONDS",
+}
 
 
 def _configured_worker_count() -> int:
@@ -53,6 +72,24 @@ def _configured_worker_count() -> int:
         return DEFAULT_CONFIGURED_WORKER_COUNT
 
     return configured_count if configured_count > 0 else DEFAULT_CONFIGURED_WORKER_COUNT
+
+
+def _positive_int_env(name: str, fallback: int) -> int:
+    raw_value = os.getenv(name, str(fallback))
+    try:
+        parsed_value = int(raw_value)
+    except ValueError:
+        return fallback
+
+    return parsed_value if parsed_value > 0 else fallback
+
+
+def _stuck_order_thresholds() -> dict[str, int]:
+    """Return per-stage stuck-order thresholds in seconds."""
+    return {
+        state: _positive_int_env(STUCK_ORDER_THRESHOLD_ENV_VARS[state], fallback)
+        for state, fallback in DEFAULT_STUCK_ORDER_THRESHOLDS_SECONDS.items()
+    }
 
 
 def _count_map(
@@ -147,6 +184,8 @@ def get_dashboard_overview() -> dict[str, Any]:
 
             order_throughput = _load_order_throughput(cur)
             latency = _load_latency_overview(cur)
+            stuck_thresholds = _stuck_order_thresholds()
+            stuck_orders = _load_stuck_order_overview(cur, stuck_thresholds)
             workers = _load_worker_overview(cur)
             problem_tasks = _load_problem_tasks(cur)
             placed_orders = _load_placed_orders(cur)
@@ -184,11 +223,105 @@ def get_dashboard_overview() -> dict[str, Any]:
             ),
         },
         "latency": latency,
+        "stuck_orders": {
+            "total": stuck_orders["total"],
+            "limit": STUCK_ORDER_LIMIT,
+            "thresholds_seconds": stuck_thresholds,
+            "items": stuck_orders["items"],
+        },
         "workers": workers,
         "problem_tasks": problem_tasks,
         "placed_orders": placed_orders,
         "recent_orders": recent_orders,
         "recent_events": recent_events,
+    }
+
+
+def _load_stuck_order_overview(
+    cur,
+    thresholds: dict[str, int],
+) -> dict[str, Any]:
+    """Return non-terminal orders that have not moved past their stage SLA."""
+    threshold_rows = list(thresholds.items())
+    values_sql = ", ".join(["(%s::order_state, %s::int)"] * len(threshold_rows))
+    params: list[Any] = []
+    for state, threshold_seconds in threshold_rows:
+        params.extend([state, threshold_seconds])
+    params.append(STUCK_ORDER_LIMIT)
+
+    cur.execute(
+        f"""
+        with thresholds(state, threshold_seconds) as (
+            values {values_sql}
+        ),
+        stuck as (
+            select
+                orders.id,
+                orders.id::text as order_id,
+                orders.idempotency_key,
+                orders.state::text,
+                orders.restaurant_ref,
+                orders.courier_ref,
+                orders.created_at,
+                orders.updated_at,
+                extract(epoch from now() - orders.updated_at)::int
+                    as stuck_seconds,
+                thresholds.threshold_seconds
+            from orders
+            join thresholds on thresholds.state = orders.state
+            where
+                orders.updated_at
+                    <= now() - (
+                        thresholds.threshold_seconds * interval '1 second'
+                    )
+        )
+        select
+            count(*) over()::int as total_count,
+            stuck.order_id,
+            stuck.idempotency_key,
+            stuck.state,
+            stuck.restaurant_ref,
+            stuck.courier_ref,
+            stuck.created_at,
+            stuck.updated_at,
+            stuck.stuck_seconds,
+            stuck.threshold_seconds,
+            task.id::text as latest_task_id,
+            task.task_type::text as latest_task_type,
+            task.target_state::text as latest_task_target_state,
+            task.status::text as latest_task_status,
+            task.next_run_at as latest_task_next_run_at,
+            task.locked_until as latest_task_locked_until,
+            task.last_error as latest_task_last_error
+        from stuck
+        left join lateral (
+            select
+                id,
+                task_type,
+                target_state,
+                status,
+                next_run_at,
+                locked_until,
+                last_error
+            from order_tasks
+            where order_id = stuck.id
+            order by updated_at desc, created_at desc, id desc
+            limit 1
+        ) as task on true
+        order by stuck.stuck_seconds desc, stuck.updated_at asc
+        limit %s
+        """,
+        params,
+    )
+    rows = [dict(row) for row in cur.fetchall()]
+    total_count = rows[0]["total_count"] if rows else 0
+
+    for row in rows:
+        del row["total_count"]
+
+    return {
+        "total": total_count,
+        "items": rows,
     }
 
 

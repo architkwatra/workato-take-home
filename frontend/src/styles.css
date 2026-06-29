@@ -1071,6 +1071,36 @@ tbody tr:last-child td {
   white-space: nowrap;
 }
 
+.stuck-orders-table {
+  min-width: 760px;
+}
+
+.stuck-duration {
+  color: #a33b2f;
+  font-weight: 900;
+}
+
+.task-stack {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.task-stack span {
+  color: #263241;
+  font-weight: 800;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.task-stack .task-badge {
+  justify-self: start;
+}
+
+.panel-footnote {
+  margin: 12px 0 0;
+}
+
 .empty-cell {
   color: #66717d;
   font-style: italic;
