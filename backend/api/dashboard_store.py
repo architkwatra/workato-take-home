@@ -107,11 +107,24 @@ def get_dashboard_overview() -> dict[str, Any]:
                     count(*) filter (
                         where
                             status = %s::task_status
+                            and last_error is not null
+                    )::int as retrying_pending,
+                    count(*) filter (
+                        where
+                            status = %s::task_status
+                            and locked_until >= now()
+                            and last_error is not null
+                    )::int as retrying_running,
+                    count(*) filter (
+                        where
+                            status = %s::task_status
                             and updated_at >= now() - (%s * interval '1 second')
                     )::int as completed_recent
                 from order_tasks
                 """,
                 (
+                    TASK_STATUS_PENDING,
+                    TASK_STATUS_RUNNING,
                     TASK_STATUS_PENDING,
                     TASK_STATUS_RUNNING,
                     TASK_STATUS_COMPLETED,
@@ -137,6 +150,8 @@ def get_dashboard_overview() -> dict[str, Any]:
             "by_status": task_counts,
             "due_pending": task_health["due_pending"],
             "expired_running": task_health["expired_running"],
+            "retrying_pending": task_health["retrying_pending"],
+            "retrying_running": task_health["retrying_running"],
         },
         "throughput": {
             "window_seconds": THROUGHPUT_WINDOW_SECONDS,
@@ -269,8 +284,9 @@ def _load_worker_overview(cur) -> dict[str, Any]:
 def _load_problem_tasks(cur) -> list[dict[str, Any]]:
     """Load the tasks an operator should inspect first."""
     # The dashboard only calls out tasks that are already failed, running past
-    # their lease, or due again with an error from a previous attempt. Ordinary
-    # future pending tasks are healthy scheduled work and are counted elsewhere.
+    # their lease, or waiting for retry after a previous failed attempt.
+    # Ordinary future pending tasks with no last_error are healthy scheduled
+    # work and are not useful in this operator-focused list.
     cur.execute(
         """
         select
@@ -293,7 +309,9 @@ def _load_problem_tasks(cur) -> list[dict[str, Any]]:
                     task.status = %s::task_status
                     and task.locked_until < now()
                     then 'expired_running'
-                else 'due_pending_with_error'
+                when task.status = %s::task_status then 'retry_running'
+                when task.next_run_at > now() then 'pending_retry'
+                else 'due_retry'
             end as problem_reason
         from order_tasks as task
         join orders on orders.id = task.order_id
@@ -305,7 +323,10 @@ def _load_problem_tasks(cur) -> list[dict[str, Any]]:
             )
             or (
                 task.status = %s::task_status
-                and task.next_run_at <= now()
+                and task.last_error is not null
+            )
+            or (
+                task.status = %s::task_status
                 and task.last_error is not null
             )
         order by
@@ -315,7 +336,9 @@ def _load_problem_tasks(cur) -> list[dict[str, Any]]:
                     task.status = %s::task_status
                     and task.locked_until < now()
                     then 1
-                else 2
+                when task.status = %s::task_status then 2
+                when task.next_run_at <= now() then 3
+                else 4
             end,
             coalesce(task.locked_until, task.next_run_at, task.updated_at) asc
         limit %s
@@ -323,10 +346,13 @@ def _load_problem_tasks(cur) -> list[dict[str, Any]]:
         (
             TASK_STATUS_FAILED,
             TASK_STATUS_RUNNING,
+            TASK_STATUS_RUNNING,
             TASK_STATUS_FAILED,
             TASK_STATUS_RUNNING,
             TASK_STATUS_PENDING,
+            TASK_STATUS_RUNNING,
             TASK_STATUS_FAILED,
+            TASK_STATUS_RUNNING,
             TASK_STATUS_RUNNING,
             PROBLEM_TASK_LIMIT,
         ),
