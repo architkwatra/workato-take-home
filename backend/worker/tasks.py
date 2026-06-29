@@ -35,7 +35,10 @@ logger = logging.getLogger("worker.tasks")
 LEASE_SECONDS = 30
 DEFAULT_DOWNSTREAM_SIM_BASE_URL = "http://downstream-sim:8000"
 DEFAULT_DOWNSTREAM_REQUEST_TIMEOUT_SECONDS = 2.0
+# Base delay for retryable errors. The first retry waits this long; later
+# retryable failures grow exponentially until TASK_RETRY_MAX_DELAY_SECONDS.
 DEFAULT_TASK_RETRY_DELAY_SECONDS = 5.0
+DEFAULT_TASK_RETRY_MAX_DELAY_SECONDS = 60.0
 DEFAULT_READY_CHECK_INITIAL_DELAY_SECONDS = 2.0
 DEFAULT_READY_CHECK_INTERVAL_SECONDS = 2.0
 DEFAULT_READY_CHECK_DEADLINE_SECONDS = 60.0
@@ -308,12 +311,34 @@ def _downstream_request_timeout_seconds() -> float:
     )
 
 
-def _task_retry_delay_seconds() -> float:
-    """Return how long a failed task waits before becoming claimable again."""
+def _task_retry_base_delay_seconds() -> float:
+    """Return the base wait before the first retryable-error retry."""
     return _read_positive_float_env(
         "TASK_RETRY_DELAY_SECONDS",
         DEFAULT_TASK_RETRY_DELAY_SECONDS,
     )
+
+
+def _task_retry_max_delay_seconds() -> float:
+    """Return the cap for exponential retryable-error backoff."""
+    return _read_positive_float_env(
+        "TASK_RETRY_MAX_DELAY_SECONDS",
+        DEFAULT_TASK_RETRY_MAX_DELAY_SECONDS,
+    )
+
+
+def _task_retry_delay_seconds(*, attempts: int) -> float:
+    """Return exponential backoff for the next retryable-error attempt.
+
+    `attempts` is the number of retryable failures already recorded on the task.
+    The current failure has not been written yet, so attempts=0 is the first
+    failure and receives the base delay. Normal business polling such as
+    not_ready/not_delivered does not use this helper and does not consume
+    attempts.
+    """
+    prior_failures = max(attempts, 0)
+    retry_delay = _task_retry_base_delay_seconds() * (2**prior_failures)
+    return min(retry_delay, _task_retry_max_delay_seconds())
 
 
 def _ready_check_initial_delay_seconds() -> float:
@@ -1236,7 +1261,11 @@ def _prepare_ready_check_call(
                         attempts=row["attempts"],
                         max_attempts=row["max_attempts"],
                         next_run_at=occurred_at
-                        + timedelta(seconds=_task_retry_delay_seconds()),
+                        + timedelta(
+                            seconds=_task_retry_delay_seconds(
+                                attempts=row["attempts"]
+                            )
+                        ),
                         last_error="check_ready task is missing deadline_at",
                         updated_at=occurred_at,
                     )
@@ -1252,7 +1281,11 @@ def _prepare_ready_check_call(
                         attempts=row["attempts"],
                         max_attempts=row["max_attempts"],
                         next_run_at=occurred_at
-                        + timedelta(seconds=_task_retry_delay_seconds()),
+                        + timedelta(
+                            seconds=_task_retry_delay_seconds(
+                                attempts=row["attempts"]
+                            )
+                        ),
                         last_error="missing confirmed -> preparing event for check_ready",
                         updated_at=occurred_at,
                     )
@@ -1332,7 +1365,6 @@ def _reschedule_ready_check_after_error(
 ) -> ProcessingResult:
     """Consume retry budget after a failed readiness check request."""
     updated_at = datetime.now(timezone.utc)
-    next_run_at = updated_at + timedelta(seconds=_task_retry_delay_seconds())
 
     with open_db_connection() as conn:
         with conn.transaction():
@@ -1378,7 +1410,10 @@ def _reschedule_ready_check_after_error(
                     to_state=ORDER_STATE_READY,
                     attempts=row["attempts"],
                     max_attempts=row["max_attempts"],
-                    next_run_at=next_run_at,
+                    next_run_at=updated_at
+                    + timedelta(
+                        seconds=_task_retry_delay_seconds(attempts=row["attempts"])
+                    ),
                     last_error=error,
                     updated_at=updated_at,
                 )
@@ -1440,7 +1475,11 @@ def _reschedule_ready_check_after_not_ready(
                         attempts=row["attempts"],
                         max_attempts=row["max_attempts"],
                         next_run_at=updated_at
-                        + timedelta(seconds=_task_retry_delay_seconds()),
+                        + timedelta(
+                            seconds=_task_retry_delay_seconds(
+                                attempts=row["attempts"]
+                            )
+                        ),
                         last_error="check_ready task is missing deadline_at",
                         updated_at=updated_at,
                     )
@@ -1780,9 +1819,10 @@ def _reschedule_transition_after_pending(
     """Release a transition task after a valid downstream "not yet" response."""
     updated_at = datetime.now(timezone.utc)
     # Pending statuses are normal business progress. Use downstream's retry
-    # hint when present; otherwise fall back to the task retry delay to avoid a
-    # hot loop while still leaving attempts untouched.
-    poll_delay_seconds = retry_after_seconds or _task_retry_delay_seconds()
+    # hint when present; otherwise fall back to the base retry delay to avoid a
+    # hot loop while still leaving attempts untouched. Exponential backoff is
+    # only for real retryable errors that consume attempts.
+    poll_delay_seconds = retry_after_seconds or _task_retry_base_delay_seconds()
     next_run_at = updated_at + timedelta(seconds=poll_delay_seconds)
 
     with open_db_connection() as conn:
@@ -1858,8 +1898,6 @@ def _reschedule_transition_task(
 ) -> ProcessingResult:
     """Release a transition task for a later retry."""
     updated_at = datetime.now(timezone.utc)
-    retry_delay = timedelta(seconds=_task_retry_delay_seconds())
-    next_run_at = updated_at + retry_delay
 
     with open_db_connection() as conn:
         with conn.transaction():
@@ -1921,7 +1959,10 @@ def _reschedule_transition_task(
                     cur,
                     task_id=task.id,
                     worker_id=worker_id,
-                    next_run_at=next_run_at,
+                    next_run_at=updated_at
+                    + timedelta(
+                        seconds=_task_retry_delay_seconds(attempts=row["attempts"])
+                    ),
                     last_error=error,
                     updated_at=updated_at,
                 )
@@ -2099,7 +2140,11 @@ def _prepare_delivery_check_call(
                         attempts=row["attempts"],
                         max_attempts=row["max_attempts"],
                         next_run_at=occurred_at
-                        + timedelta(seconds=_task_retry_delay_seconds()),
+                        + timedelta(
+                            seconds=_task_retry_delay_seconds(
+                                attempts=row["attempts"]
+                            )
+                        ),
                         last_error="check_delivery task is missing deadline_at",
                         updated_at=occurred_at,
                     )
@@ -2115,7 +2160,11 @@ def _prepare_delivery_check_call(
                         attempts=row["attempts"],
                         max_attempts=row["max_attempts"],
                         next_run_at=occurred_at
-                        + timedelta(seconds=_task_retry_delay_seconds()),
+                        + timedelta(
+                            seconds=_task_retry_delay_seconds(
+                                attempts=row["attempts"]
+                            )
+                        ),
                         last_error="missing ready -> out_for_delivery event for check_delivery",
                         updated_at=occurred_at,
                     )
@@ -2131,7 +2180,11 @@ def _prepare_delivery_check_call(
                         attempts=row["attempts"],
                         max_attempts=row["max_attempts"],
                         next_run_at=occurred_at
-                        + timedelta(seconds=_task_retry_delay_seconds()),
+                        + timedelta(
+                            seconds=_task_retry_delay_seconds(
+                                attempts=row["attempts"]
+                            )
+                        ),
                         last_error="missing courier_ref for check_delivery",
                         updated_at=occurred_at,
                     )
@@ -2206,7 +2259,6 @@ def _reschedule_delivery_check_after_error(
 ) -> ProcessingResult:
     """Consume retry budget after a failed delivery check request."""
     updated_at = datetime.now(timezone.utc)
-    next_run_at = updated_at + timedelta(seconds=_task_retry_delay_seconds())
 
     with open_db_connection() as conn:
         with conn.transaction():
@@ -2252,7 +2304,10 @@ def _reschedule_delivery_check_after_error(
                     to_state=ORDER_STATE_DELIVERED,
                     attempts=row["attempts"],
                     max_attempts=row["max_attempts"],
-                    next_run_at=next_run_at,
+                    next_run_at=updated_at
+                    + timedelta(
+                        seconds=_task_retry_delay_seconds(attempts=row["attempts"])
+                    ),
                     last_error=error,
                     updated_at=updated_at,
                 )
@@ -2314,7 +2369,11 @@ def _reschedule_delivery_check_after_in_transit(
                         attempts=row["attempts"],
                         max_attempts=row["max_attempts"],
                         next_run_at=updated_at
-                        + timedelta(seconds=_task_retry_delay_seconds()),
+                        + timedelta(
+                            seconds=_task_retry_delay_seconds(
+                                attempts=row["attempts"]
+                            )
+                        ),
                         last_error="check_delivery task is missing deadline_at",
                         updated_at=updated_at,
                     )

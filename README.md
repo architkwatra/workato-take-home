@@ -117,9 +117,12 @@ Core rules:
   concurrent workers never claim the same task row. Only one worker wins the
   claim; others skip to the next available task.
 - Expired leases are recoverable by another worker.
-- Tasks retry up to 5 times by default, configurable per stage. After that, the
-  task is marked `failed`, while the order remains in its source state until an
-  explicit operator retry or a later order-failure policy handles it.
+- Tasks retry up to 5 times by default. Retryable downstream/local errors use
+  exponential backoff from `TASK_RETRY_DELAY_SECONDS` as the base delay to
+  `TASK_RETRY_MAX_DELAY_SECONDS` as the cap. The compose defaults are 5 seconds
+  and 60 seconds. After the retry budget is exhausted, the task is marked
+  `failed`, while the order remains in its source state until an explicit
+  operator retry or a later order-failure policy handles it.
 - Expected poll results such as `not_ready`, `not_picked_up`, or `not_delivered`
   are not errors and do not increment attempts; they only move `next_run_at`.
 - Rate limit responses (`429`) are handled separately from normal transient
