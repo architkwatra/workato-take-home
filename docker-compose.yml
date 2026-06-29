@@ -101,6 +101,8 @@ services:
     environment:
       SERVICE_NAME: worker
       DATABASE_URL: postgresql://app:app@postgres:5432/orders
+      DATABASE_POOL_MIN_SIZE: "1"
+      DATABASE_POOL_MAX_SIZE: "2"
       DOWNSTREAM_SIM_BASE_URL: http://downstream-sim:8000
       DOWNSTREAM_REQUEST_TIMEOUT_SECONDS: "2"
       TASK_RETRY_DELAY_SECONDS: "5"
@@ -117,7 +119,7 @@ services:
       downstream-sim:
         condition: service_healthy
     deploy:
-      replicas: 3
+      replicas: 20
 
   migrator:
     build:
