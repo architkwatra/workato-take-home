@@ -159,6 +159,8 @@ services:
     environment:
       VITE_API_BASE_URL: http://localhost:8080
       VITE_LOADGEN_BASE_URL: http://localhost:8082
+      VITE_LOADGEN_RESTAURANT_REF: dashboard-manual
+      VITE_LOADGEN_CUSTOMER_REF_PREFIX: dashboard-customer
       VITE_DOWNSTREAM_SIM_BASE_URL: http://localhost:8081
       VITE_RESTAURANT_CONFIRM_AFTER_SECONDS_MIN: "1"
       VITE_RESTAURANT_CONFIRM_AFTER_SECONDS_MAX: "8"
