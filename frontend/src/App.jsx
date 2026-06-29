@@ -36,6 +36,8 @@ const ORDER_STATES = [
   "failed",
 ];
 
+const TERMINAL_ORDER_STATES = new Set(["delivered", "cancelled", "failed"]);
+
 const PIPELINE_STATES = [
   "placed",
   "confirmed",
@@ -408,6 +410,8 @@ function App() {
   const [downstreamActionPending, setDownstreamActionPending] = useState("");
   const [retryActionPendingOrderId, setRetryActionPendingOrderId] = useState("");
   const [retryActionError, setRetryActionError] = useState("");
+  const [cancelActionPendingOrderId, setCancelActionPendingOrderId] = useState("");
+  const [cancelActionError, setCancelActionError] = useState("");
 
   useEffect(() => {
     function handlePopState() {
@@ -792,6 +796,32 @@ function App() {
     }
   }
 
+  async function cancelOrder(orderId) {
+    const confirmed = window.confirm(
+      "Cancel this order? This stops any remaining pipeline work for it.",
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setCancelActionPendingOrderId(orderId);
+    setCancelActionError("");
+
+    try {
+      await requestDashboard(`/orders/${encodeURIComponent(orderId)}/cancel`, {
+        method: "POST",
+      });
+      setOverviewRefreshToken((current) => current + 1);
+      if (selectedOrderId) {
+        setOrderDetailRefreshToken((current) => current + 1);
+      }
+    } catch (caughtError) {
+      setCancelActionError(caughtError.message || "cancel order request failed");
+    } finally {
+      setCancelActionPendingOrderId("");
+    }
+  }
+
   return (
     <main className="dashboard-shell">
       <header className="topbar">
@@ -818,7 +848,10 @@ function App() {
           detail={orderDetail}
           error={orderDetailError}
           onBack={closeOrderDetail}
+          onCancelOrder={cancelOrder}
           onRetryFailedTasks={retryFailedTasks}
+          cancelActionError={cancelActionError}
+          cancelActionPendingOrderId={cancelActionPendingOrderId}
           retryActionError={retryActionError}
           retryActionPendingOrderId={retryActionPendingOrderId}
         />
@@ -916,7 +949,10 @@ function OrderDetailPage({
   detail,
   error,
   onBack,
+  onCancelOrder,
   onRetryFailedTasks,
+  cancelActionError,
+  cancelActionPendingOrderId,
   retryActionError,
   retryActionPendingOrderId,
 }) {
@@ -925,6 +961,11 @@ function OrderDetailPage({
   const events = detail?.events ?? [];
   const failedTaskCount = tasks.filter((task) => task.status === "failed").length;
   const retryPending = order?.order_id === retryActionPendingOrderId;
+  const cancelPending = order?.order_id === cancelActionPendingOrderId;
+  const orderActionPending = Boolean(
+    retryActionPendingOrderId || cancelActionPendingOrderId,
+  );
+  const canCancelOrder = order && !TERMINAL_ORDER_STATES.has(order.state);
   const retryButtonText =
     failedTaskCount === 1
       ? "Retry Failed Task"
@@ -936,16 +977,28 @@ function OrderDetailPage({
         <a className="button" href="/" onClick={onBack}>
           Back to Dashboard
         </a>
-        {order && failedTaskCount > 0 ? (
-          <button
-            className="button primary"
-            disabled={Boolean(retryActionPendingOrderId)}
-            type="button"
-            onClick={() => onRetryFailedTasks(order.order_id)}
-          >
-            {retryPending ? "Retrying" : retryButtonText}
-          </button>
-        ) : null}
+        <div className="button-row">
+          {order && failedTaskCount > 0 ? (
+            <button
+              className="button primary"
+              disabled={orderActionPending}
+              type="button"
+              onClick={() => onRetryFailedTasks(order.order_id)}
+            >
+              {retryPending ? "Retrying" : retryButtonText}
+            </button>
+          ) : null}
+          {canCancelOrder ? (
+            <button
+              className="button danger"
+              disabled={orderActionPending}
+              type="button"
+              onClick={() => onCancelOrder(order.order_id)}
+            >
+              {cancelPending ? "Cancelling" : "Cancel Order"}
+            </button>
+          ) : null}
+        </div>
       </div>
 
       {error ? (
@@ -956,6 +1009,11 @@ function OrderDetailPage({
       {retryActionError ? (
         <div className="alert" role="status">
           Retry issue: {retryActionError}
+        </div>
+      ) : null}
+      {cancelActionError ? (
+        <div className="alert" role="status">
+          Cancel issue: {cancelActionError}
         </div>
       ) : null}
 

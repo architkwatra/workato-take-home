@@ -3,11 +3,26 @@ from typing import Any
 from uuid import uuid4
 
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 from common.db import open_db_connection
-from common.event_types import EVENT_TYPE_ORDER_CREATED
-from common.state_machine import ORDER_STATE_CONFIRMED, ORDER_STATE_PLACED
-from common.task_types import TASK_STATUS_PENDING, TASK_TYPE_ADVANCE_STATE
+from common.event_types import EVENT_TYPE_ORDER_CANCELLED, EVENT_TYPE_ORDER_CREATED
+from common.state_machine import (
+    ORDER_STATE_CANCELLED,
+    ORDER_STATE_CONFIRMED,
+    ORDER_STATE_PLACED,
+    is_terminal_order_state,
+)
+from common.task_types import (
+    TASK_STATUS_CANCELLED,
+    TASK_STATUS_PENDING,
+    TASK_STATUS_RUNNING,
+    TASK_TYPE_ADVANCE_STATE,
+)
+
+
+ORDER_CANCELLED_REASON = "operator_cancelled"
+ORDER_CANCELLED_TASK_ERROR = "order cancelled by operator"
 
 
 class IdempotencyConflictError(RuntimeError):
@@ -183,3 +198,140 @@ def create_or_get_order(
                     )
 
                 return dict(existing_order), False
+
+
+def cancel_order(*, order_id: str) -> dict[str, Any] | None:
+    """Move a non-terminal order to cancelled and invalidate open work."""
+    cancelled_at = datetime.now(timezone.utc)
+
+    with open_db_connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                # Cancellation is an operator override, so lock the order row
+                # before deciding whether it is still cancellable. This
+                # serializes the decision with worker finalization updates that
+                # may be moving the same order through the lifecycle.
+                cur.execute(
+                    """
+                    select
+                        id::text,
+                        idempotency_key,
+                        state::text,
+                        customer_ref,
+                        restaurant_ref,
+                        created_at,
+                        updated_at
+                    from orders
+                    where id = %s::uuid
+                    for update
+                    """,
+                    (order_id,),
+                )
+                order = cur.fetchone()
+                if order is None:
+                    return None
+
+                # Treat terminal orders as an idempotent no-op. A delivered,
+                # failed, or already-cancelled order should not be rewritten by
+                # a late dashboard click.
+                from_state = order["state"]
+                if is_terminal_order_state(from_state):
+                    return dict(order)
+
+                cur.execute(
+                    """
+                    update orders
+                    set
+                        state = %s::order_state,
+                        version = version + 1,
+                        terminal_reason = %s,
+                        cancelled_at = coalesce(cancelled_at, %s),
+                        updated_at = %s
+                    where id = %s::uuid
+                    returning
+                        id::text,
+                        idempotency_key,
+                        state::text,
+                        customer_ref,
+                        restaurant_ref,
+                        created_at,
+                        updated_at
+                    """,
+                    (
+                        ORDER_STATE_CANCELLED,
+                        ORDER_CANCELLED_REASON,
+                        cancelled_at,
+                        cancelled_at,
+                        order_id,
+                    ),
+                )
+                cancelled_order = dict(cur.fetchone())
+
+                # The order is now terminal, so pending/running queue rows are
+                # no longer valid work. A worker that is already outside the DB
+                # doing a downstream call will re-check task ownership/order
+                # state before finalizing; clearing the lease here prevents
+                # future workers from continuing that order.
+                cur.execute(
+                    """
+                    update order_tasks
+                    set
+                        status = %s::task_status,
+                        locked_by = null,
+                        locked_until = null,
+                        last_error = %s,
+                        updated_at = %s
+                    where
+                        order_id = %s::uuid
+                        and status = any(%s::task_status[])
+                    returning id::text
+                    """,
+                    (
+                        TASK_STATUS_CANCELLED,
+                        ORDER_CANCELLED_TASK_ERROR,
+                        cancelled_at,
+                        order_id,
+                        [TASK_STATUS_PENDING, TASK_STATUS_RUNNING],
+                    ),
+                )
+                cancelled_task_ids = [row["id"] for row in cur.fetchall()]
+
+                cur.execute(
+                    """
+                    insert into order_events (
+                        id,
+                        order_id,
+                        event_type,
+                        from_state,
+                        to_state,
+                        occurred_at,
+                        metadata
+                    )
+                    values (
+                        %s::uuid,
+                        %s::uuid,
+                        %s::event_type,
+                        %s::order_state,
+                        %s::order_state,
+                        %s,
+                        %s
+                    )
+                    """,
+                    (
+                        uuid4(),
+                        order_id,
+                        EVENT_TYPE_ORDER_CANCELLED,
+                        from_state,
+                        ORDER_STATE_CANCELLED,
+                        cancelled_at,
+                        Jsonb(
+                            {
+                                "source": "dashboard_cancel_order",
+                                "cancelled_task_count": len(cancelled_task_ids),
+                                "cancelled_task_ids": cancelled_task_ids,
+                            }
+                        ),
+                    ),
+                )
+
+                return cancelled_order
