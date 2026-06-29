@@ -24,6 +24,7 @@ services:
     environment:
       SERVICE_NAME: api
       DATABASE_URL: postgresql://app:app@postgres:5432/orders
+      DASHBOARD_CORS_ORIGINS: http://localhost:3000
     ports:
       - "8080:8000"
     depends_on:

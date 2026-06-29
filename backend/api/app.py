@@ -7,8 +7,10 @@ from uuid import UUID
 
 import psycopg
 from fastapi import FastAPI, Header, HTTPException, Response, status
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from api.dashboard_store import get_dashboard_overview
 from api.order_store import IdempotencyConflictError, create_or_get_order
 from api.task_store import retry_failed_tasks_for_order
 from common.db import (
@@ -35,6 +37,28 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Order Pipeline API", lifespan=lifespan)
+
+
+def _dashboard_cors_origins() -> list[str]:
+    """Return browser origins allowed to read dashboard API data."""
+    raw_origins = os.getenv("DASHBOARD_CORS_ORIGINS")
+    if raw_origins is None:
+        # Keep the no-config local demo working without using wildcard CORS.
+        # The dashboard reads operational data, so a specific default origin is
+        # safer than allowing every browser origin by accident.
+        return ["http://localhost:3000"]
+
+    origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+    return origins or ["http://localhost:3000"]
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_dashboard_cors_origins(),
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 
 class CreateOrderRequest(BaseModel):
@@ -104,6 +128,17 @@ def readyz() -> dict[str, object]:
 def root() -> dict[str, str]:
     """Return a simple scaffold response for humans hitting the API root."""
     return {"message": "Order Pipeline API scaffold"}
+
+
+@app.get("/dashboard/overview")
+def dashboard_overview() -> dict[str, Any]:
+    """Return a read-only operations snapshot for the local dashboard."""
+    try:
+        return get_dashboard_overview()
+    except DatabaseConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except psycopg.Error as exc:
+        raise HTTPException(status_code=503, detail="postgres is not reachable") from exc
 
 
 @app.post("/orders", response_model=OrderResponse)
