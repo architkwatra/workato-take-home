@@ -12,6 +12,10 @@ const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "http://localhost:808
 const LOADGEN_BASE_URL = (
   import.meta.env.VITE_LOADGEN_BASE_URL ?? "http://localhost:8082"
 ).replace(/\/$/, "");
+const LOADGEN_RESTAURANT_REF =
+  import.meta.env.VITE_LOADGEN_RESTAURANT_REF ?? "dashboard-manual";
+const LOADGEN_CUSTOMER_REF_PREFIX =
+  import.meta.env.VITE_LOADGEN_CUSTOMER_REF_PREFIX ?? "dashboard-customer";
 const DOWNSTREAM_SIM_BASE_URL = (
   import.meta.env.VITE_DOWNSTREAM_SIM_BASE_URL ?? "http://localhost:8081"
 ).replace(/\/$/, "");
@@ -431,8 +435,6 @@ function App() {
   const [loadgenForm, setLoadgenForm] = useState({
     ratePerSecond: "20",
     maxOrders: "100",
-    restaurantRef: "dashboard-manual",
-    customerRefPrefix: "dashboard-customer",
   });
   const [downstreamServices, setDownstreamServices] = useState([]);
   const [downstreamConnection, setDownstreamConnection] = useState("loading");
@@ -774,15 +776,6 @@ function App() {
 
   async function startLoadgen() {
     await runLoadgenAction("start", async () => {
-      const restaurantRef = loadgenForm.restaurantRef.trim();
-      const customerRefPrefix = loadgenForm.customerRefPrefix.trim();
-      if (!restaurantRef) {
-        throw new Error("Restaurant ref is required");
-      }
-      if (!customerRefPrefix) {
-        throw new Error("Customer prefix is required");
-      }
-
       return requestLoadgen("/load/start", {
         method: "POST",
         body: {
@@ -791,8 +784,8 @@ function App() {
             "Rate",
           ),
           max_orders: readMaxOrders(loadgenForm.maxOrders),
-          restaurant_ref: restaurantRef,
-          customer_ref_prefix: customerRefPrefix,
+          restaurant_ref: LOADGEN_RESTAURANT_REF,
+          customer_ref_prefix: LOADGEN_CUSTOMER_REF_PREFIX,
         },
       });
     });
@@ -1343,22 +1336,6 @@ function LoadgenControlPanel({
               type="number"
               value={form.maxOrders}
               onChange={(event) => onChange("maxOrders", event.target.value)}
-            />
-          </label>
-          <label className="field">
-            <span>Restaurant ref</span>
-            <input
-              type="text"
-              value={form.restaurantRef}
-              onChange={(event) => onChange("restaurantRef", event.target.value)}
-            />
-          </label>
-          <label className="field">
-            <span>Customer prefix</span>
-            <input
-              type="text"
-              value={form.customerRefPrefix}
-              onChange={(event) => onChange("customerRefPrefix", event.target.value)}
             />
           </label>
         </div>
