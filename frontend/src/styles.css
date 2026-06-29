@@ -145,11 +145,68 @@ h2 {
   border-left-color: #b13f35;
 }
 
-.metric p {
+.metric-label {
+  align-items: center;
   color: #5c6875;
+  display: flex;
   font-size: 13px;
   font-weight: 700;
+  gap: 6px;
   margin-bottom: 12px;
+}
+
+.metric-help {
+  align-items: center;
+  background: #edf3f5;
+  border: 1px solid #b7c8cf;
+  border-radius: 999px;
+  color: #25636f;
+  display: inline-flex;
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 900;
+  height: 18px;
+  justify-content: center;
+  line-height: 1;
+  position: relative;
+  width: 18px;
+}
+
+.metric-help:focus {
+  outline: 2px solid #25636f;
+  outline-offset: 2px;
+}
+
+.metric-help::after {
+  background: #17202a;
+  border-radius: 6px;
+  bottom: calc(100% + 8px);
+  color: #ffffff;
+  content: attr(data-tooltip);
+  font-size: 12px;
+  font-weight: 700;
+  left: 50%;
+  line-height: 1.35;
+  max-width: min(260px, 70vw);
+  opacity: 0;
+  padding: 8px 10px;
+  pointer-events: none;
+  position: absolute;
+  text-align: left;
+  text-transform: none;
+  transform: translateX(-50%) translateY(4px);
+  transition: opacity 120ms ease, transform 120ms ease;
+  visibility: hidden;
+  white-space: normal;
+  width: max-content;
+  z-index: 10;
+}
+
+.metric-help:hover::after,
+.metric-help:focus::after {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+  visibility: visible;
 }
 
 .metric strong {
@@ -159,7 +216,7 @@ h2 {
   margin-bottom: 8px;
 }
 
-.metric span {
+.metric-detail {
   color: #66717d;
   font-size: 13px;
 }
@@ -340,6 +397,75 @@ h2 {
 
 .text-button:hover {
   text-decoration: underline;
+}
+
+.placed-watch {
+  background: #f7fafb;
+  border: 1px solid #dce4e8;
+  border-radius: 8px;
+  margin-bottom: 14px;
+  padding: 12px;
+}
+
+.placed-watch-heading {
+  align-items: center;
+  color: #263241;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.placed-watch-heading span {
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.placed-watch-heading small,
+.placed-watch-empty {
+  color: #66717d;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.placed-watch-list {
+  display: grid;
+  gap: 8px;
+}
+
+.placed-watch-item {
+  align-items: center;
+  background: #ffffff;
+  border: 1px solid #d7dde2;
+  border-radius: 7px;
+  color: #263241;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-height: 38px;
+  padding: 8px 10px;
+  text-align: left;
+}
+
+.placed-watch-item:hover {
+  border-color: #94b2bd;
+}
+
+.placed-watch-item span {
+  color: #25636f;
+  font-size: 13px;
+  font-weight: 900;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.placed-watch-item small {
+  color: #66717d;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
 }
 
 .detail-toolbar {
