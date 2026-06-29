@@ -24,10 +24,15 @@ services:
     environment:
       SERVICE_NAME: api
       DATABASE_URL: postgresql://app:app@postgres:5432/orders
+      # `/orders` is write-heavy during dinner-rush demos. This lets the API
+      # run more concurrent order-create transactions while still leaving room
+      # for workers and admin connections on Postgres' default connection budget.
+      DATABASE_POOL_MIN_SIZE: "1"
+      DATABASE_POOL_MAX_SIZE: "20"
       DASHBOARD_CORS_ORIGINS: http://localhost:3000
       # The API cannot inspect Compose's worker replica count at runtime.
       # Keep this value in sync with worker.deploy.replicas below.
-      DASHBOARD_CONFIGURED_WORKER_COUNT: "3"
+      DASHBOARD_CONFIGURED_WORKER_COUNT: "5"
     ports:
       - "8080:8000"
     depends_on:
@@ -135,7 +140,7 @@ services:
       downstream-sim:
         condition: service_healthy
     deploy:
-      replicas: 3
+      replicas: 5
 
   migrator:
     build:
