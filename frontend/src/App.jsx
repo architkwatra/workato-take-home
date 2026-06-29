@@ -95,8 +95,8 @@ const LABELS = {
 const METRIC_HELP = {
   orders: "Total order rows in the database, across every order state.",
   delivered: "Orders whose current state is delivered.",
-  taskRate:
-    "Completed tasks in the last dashboard throughput window divided by that window size.",
+  taskCompletionRate:
+    "Completed task rows per second over the rolling dashboard window. This is worker throughput, not delivered-order rate.",
   taskIssues:
     "Failed tasks plus running tasks whose worker lease has expired.",
   workers:
@@ -872,12 +872,12 @@ function App() {
               tone="good"
             />
             <Metric
-              label="Task Rate"
+              label="Task Completion Rate"
               value={`${rateText(totals.tasksCompletedPerSecond)}/s`}
-              detail={`${numberText(totals.tasksCompletedRecent)} in last ${
+              detail={`${numberText(totals.tasksCompletedRecent)} completed in last ${
                 totals.throughputWindowSeconds
               }s`}
-              helpText={METRIC_HELP.taskRate}
+              helpText={METRIC_HELP.taskCompletionRate}
               tone={totals.tasksCompletedPerSecond > 0 ? "good" : "neutral"}
             />
             <Metric
@@ -900,6 +900,16 @@ function App() {
             />
           </section>
 
+          <DownstreamControlPanel
+            actionError={downstreamActionError}
+            actionPending={downstreamActionPending}
+            connection={downstreamConnection}
+            error={downstreamError}
+            lastRefreshAt={downstreamLastRefreshAt}
+            onToggle={setDownstreamKilled}
+            services={downstreamServices}
+          />
+
           <LoadgenControlPanel
             actionError={loadgenActionError}
             actionPending={loadgenActionPending}
@@ -917,16 +927,6 @@ function App() {
             <LifecyclePanel overview={overview} />
             <RecentOrdersPanel overview={overview} onSelectOrder={openOrderDetail} />
           </div>
-
-          <DownstreamControlPanel
-            actionError={downstreamActionError}
-            actionPending={downstreamActionPending}
-            connection={downstreamConnection}
-            error={downstreamError}
-            lastRefreshAt={downstreamLastRefreshAt}
-            onToggle={setDownstreamKilled}
-            services={downstreamServices}
-          />
 
           <div className="content-grid wide">
             <ProblemTaskPanel
@@ -1369,63 +1369,80 @@ function DownstreamControlPanel({
   const serviceByName = new Map(
     services.map((serviceState) => [serviceState.service, serviceState]),
   );
+  const killedCount = DOWNSTREAM_SERVICES.filter((serviceName) =>
+    Boolean(serviceByName.get(serviceName)?.killed),
+  ).length;
   const connectionLabel =
     connection === "online" || connection === "refreshing"
       ? "Connected"
       : connection === "offline"
         ? "Offline"
         : "Loading";
+  const statusText = lastRefreshAt
+    ? `Updated ${formatTime(lastRefreshAt)}`
+    : connectionLabel;
+  const killSummary =
+    services.length === 0
+      ? "Pending"
+      : killedCount > 0
+        ? `${numberText(killedCount)} killed`
+        : "All enabled";
 
   return (
-    <section className="section downstream-panel">
-      <div className="section-heading">
-        <h2>Downstream Kill Switches</h2>
-        <span>{lastRefreshAt ? `Updated ${formatTime(lastRefreshAt)}` : connectionLabel}</span>
-      </div>
+    <details className="section downstream-panel dropdown-panel">
+      <summary className="dropdown-summary">
+        <div>
+          <h2>Downstream Kill Switches</h2>
+          <span>{statusText}</span>
+        </div>
+        <strong>{killSummary}</strong>
+      </summary>
 
-      <div className="service-list">
-        {DOWNSTREAM_SERVICES.map((serviceName) => {
-          const serviceState = serviceByName.get(serviceName);
-          const killed = Boolean(serviceState?.killed);
-          const pendingKill = actionPending === `${serviceName}:kill`;
-          const pendingRestore = actionPending === `${serviceName}:restore`;
-          const pending = pendingKill || pendingRestore;
-          const disabled = Boolean(actionPending) || connection === "offline";
+      <div className="dropdown-content">
+        <div className="service-list">
+          {DOWNSTREAM_SERVICES.map((serviceName) => {
+            const serviceState = serviceByName.get(serviceName);
+            const killed = Boolean(serviceState?.killed);
+            const pendingKill = actionPending === `${serviceName}:kill`;
+            const pendingRestore = actionPending === `${serviceName}:restore`;
+            const pending = pendingKill || pendingRestore;
+            const disabled = Boolean(actionPending) || connection === "offline";
 
-          return (
-            <div className="service-row" key={serviceName}>
-              <div>
-                <strong>{humanize(serviceName)}</strong>
-                <span
-                  className={`service-state ${
-                    killed ? "killed" : serviceState ? "online" : "unknown"
-                  }`}
+            return (
+              <div className="service-row" key={serviceName}>
+                <div>
+                  <strong>{humanize(serviceName)}</strong>
+                  <span
+                    className={`service-state ${
+                      killed ? "killed" : serviceState ? "online" : "unknown"
+                    }`}
+                  >
+                    {killed ? "Killed" : serviceState ? "Online" : "Unknown"}
+                  </span>
+                </div>
+                <button
+                  className={`button ${killed ? "primary" : "danger"}`}
+                  disabled={disabled}
+                  type="button"
+                  onClick={() => onToggle(serviceName, !killed)}
                 >
-                  {killed ? "Killed" : serviceState ? "Online" : "Unknown"}
-                </span>
+                  {pending
+                    ? pendingKill
+                      ? "Killing"
+                      : "Restoring"
+                    : killed
+                      ? "Restore"
+                      : "Kill"}
+                </button>
               </div>
-              <button
-                className={`button ${killed ? "primary" : "danger"}`}
-                disabled={disabled}
-                type="button"
-                onClick={() => onToggle(serviceName, !killed)}
-              >
-                {pending
-                  ? pendingKill
-                    ? "Killing"
-                    : "Restoring"
-                  : killed
-                    ? "Restore"
-                    : "Kill"}
-              </button>
-            </div>
-          );
-        })}
-      </div>
+            );
+          })}
+        </div>
 
-      {error ? <p className="inline-error">downstream-sim: {error}</p> : null}
-      {actionError ? <p className="inline-error">{actionError}</p> : null}
-    </section>
+        {error ? <p className="inline-error">downstream-sim: {error}</p> : null}
+        {actionError ? <p className="inline-error">{actionError}</p> : null}
+      </div>
+    </details>
   );
 }
 
