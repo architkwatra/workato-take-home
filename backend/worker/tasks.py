@@ -12,6 +12,8 @@ from common.db import open_db_connection
 from common.event_types import EVENT_TYPE_STATE_TRANSITION
 from common.state_machine import (
     ORDER_STATE_CONFIRMED,
+    ORDER_STATE_DELIVERED,
+    ORDER_STATE_OUT_FOR_DELIVERY,
     ORDER_STATE_PLACED,
     ORDER_STATE_PREPARING,
     ORDER_STATE_READY,
@@ -23,6 +25,7 @@ from common.task_types import (
     TASK_STATUS_PENDING,
     TASK_STATUS_RUNNING,
     TASK_TYPE_ADVANCE_STATE,
+    TASK_TYPE_CHECK_DELIVERY,
     TASK_TYPE_CHECK_READY,
 )
 
@@ -36,6 +39,9 @@ DEFAULT_TASK_RETRY_DELAY_SECONDS = 5.0
 DEFAULT_READY_CHECK_INITIAL_DELAY_SECONDS = 2.0
 DEFAULT_READY_CHECK_INTERVAL_SECONDS = 2.0
 DEFAULT_READY_CHECK_DEADLINE_SECONDS = 60.0
+DEFAULT_DELIVERY_CHECK_INITIAL_DELAY_SECONDS = 3.0
+DEFAULT_DELIVERY_CHECK_INTERVAL_SECONDS = 3.0
+DEFAULT_DELIVERY_CHECK_DEADLINE_SECONDS = 120.0
 # Future-slice tasks should stay visible but not spin the worker loop before
 # their handler exists. This delay is only for unsupported task release.
 DEFAULT_UNSUPPORTED_TASK_RELEASE_DELAY_SECONDS = 30.0
@@ -43,6 +49,9 @@ MAX_LAST_ERROR_LENGTH = 300
 MAX_CLAIM_LOG_CACHE_SIZE = 1000
 _logged_claimed_task_ids: set[str] = set()
 _logged_claimed_task_order: deque[str] = deque()
+
+DELIVERY_CHECK_STATUS_DELIVERED = "delivered"
+DELIVERY_CHECK_STATUS_IN_TRANSIT = "in_transit"
 
 PROCESSING_ACTION_TRANSITIONED = "transitioned"
 PROCESSING_ACTION_RETRY_SCHEDULED = "retry_scheduled"
@@ -134,6 +143,23 @@ class RestaurantReadyCheckOutcome:
     retry_after_seconds: float | None = None
 
 
+@dataclass(frozen=True)
+class CourierDeliveryCheckCall:
+    """Details needed for one courier delivery status poll."""
+
+    order_id: str
+    courier_ref: str
+    dispatched_at: datetime
+
+
+@dataclass(frozen=True)
+class CourierDeliveryCheckOutcome:
+    """Validated response from the courier delivery simulator endpoint."""
+
+    status: str
+    retry_after_seconds: float | None = None
+
+
 READY_CHECK_STATUS_READY = "ready"
 READY_CHECK_STATUS_NOT_READY = "not_ready"
 
@@ -167,6 +193,27 @@ READY_FINALIZATION_SPEC = RestaurantTransitionSpec(
     endpoint_path="/restaurant/check-ready",
     expected_status=READY_CHECK_STATUS_READY,
     action_name="restaurant check-ready",
+)
+
+# Courier assign is a command task like restaurant confirm/start-prep, but it
+# also writes courier_ref to the order row. It is dispatched separately from
+# process_transition_task so the HTTP response can be passed into finalization.
+COURIER_ASSIGN_SPEC = RestaurantTransitionSpec(
+    source_state=ORDER_STATE_READY,
+    target_state=ORDER_STATE_OUT_FOR_DELIVERY,
+    endpoint_path="/courier/assign",
+    expected_status="assigned",
+    action_name="courier assign",
+    next_task_type=TASK_TYPE_CHECK_DELIVERY,
+    next_target_state=ORDER_STATE_DELIVERED,
+)
+
+DELIVERY_FINALIZATION_SPEC = RestaurantTransitionSpec(
+    source_state=ORDER_STATE_OUT_FOR_DELIVERY,
+    target_state=ORDER_STATE_DELIVERED,
+    endpoint_path="/courier/check-delivery",
+    expected_status=DELIVERY_CHECK_STATUS_DELIVERED,
+    action_name="courier check-delivery",
 )
 
 
@@ -235,6 +282,30 @@ def _ready_check_deadline_seconds() -> float:
     )
 
 
+def _delivery_check_initial_delay_seconds() -> float:
+    """Return how long to wait before the first courier delivery check."""
+    return _read_positive_float_env(
+        "DELIVERY_CHECK_INITIAL_DELAY_SECONDS",
+        DEFAULT_DELIVERY_CHECK_INITIAL_DELAY_SECONDS,
+    )
+
+
+def _delivery_check_interval_seconds() -> float:
+    """Return the fallback wait between normal in-transit delivery polls."""
+    return _read_positive_float_env(
+        "DELIVERY_CHECK_INTERVAL_SECONDS",
+        DEFAULT_DELIVERY_CHECK_INTERVAL_SECONDS,
+    )
+
+
+def _delivery_check_deadline_seconds() -> float:
+    """Return the max wall-clock wait for courier delivery polling."""
+    return _read_positive_float_env(
+        "DELIVERY_CHECK_DEADLINE_SECONDS",
+        DEFAULT_DELIVERY_CHECK_DEADLINE_SECONDS,
+    )
+
+
 def _unsupported_task_release_delay_seconds() -> float:
     """Return how long unsupported tasks wait before workers inspect them again."""
     return _read_positive_float_env(
@@ -281,6 +352,18 @@ def _bounded_ready_check_next_run_at(
 ) -> datetime:
     """Return the next poll time, capped so the deadline gets a final check."""
     poll_delay_seconds = retry_after_seconds or _ready_check_interval_seconds()
+    proposed_next_run_at = now + timedelta(seconds=poll_delay_seconds)
+    return min(proposed_next_run_at, deadline_at)
+
+
+def _bounded_delivery_check_next_run_at(
+    *,
+    now: datetime,
+    retry_after_seconds: float | None,
+    deadline_at: datetime,
+) -> datetime:
+    """Return the next delivery poll time, capped so the deadline gets a final check."""
+    poll_delay_seconds = retry_after_seconds or _delivery_check_interval_seconds()
     proposed_next_run_at = now + timedelta(seconds=poll_delay_seconds)
     return min(proposed_next_run_at, deadline_at)
 
@@ -495,6 +578,52 @@ def _load_ready_check_task_row(cur, *, task_id: str) -> dict | None:
             EVENT_TYPE_STATE_TRANSITION,
             ORDER_STATE_CONFIRMED,
             ORDER_STATE_PREPARING,
+            task_id,
+        ),
+    )
+    return cur.fetchone()
+
+
+def _load_delivery_check_task_row(cur, *, task_id: str) -> dict | None:
+    """Lock the check_delivery task row and return current order/dispatch details."""
+    cur.execute(
+        """
+        select
+            task.id::text as task_id,
+            task.order_id::text,
+            task.status::text as task_status,
+            task.locked_by,
+            task.attempts,
+            task.max_attempts,
+            task.deadline_at,
+            orders.state::text as order_state,
+            orders.version,
+            orders.courier_ref,
+            dispatch_event.occurred_at as dispatched_at
+        from order_tasks as task
+        join orders on orders.id = task.order_id
+        -- The ready -> out_for_delivery transition event is the durable clock
+        -- source for the delivery simulator. It was committed with the state
+        -- change, so workers do not need simulator-side state to know when
+        -- dispatch happened.
+        left join lateral (
+            select occurred_at
+            from order_events
+            where
+                order_id = orders.id
+                and event_type = %s::event_type
+                and from_state = %s::order_state
+                and to_state = %s::order_state
+            order by occurred_at desc
+            limit 1
+        ) as dispatch_event on true
+        where task.id = %s::uuid
+        for update of task
+        """,
+        (
+            EVENT_TYPE_STATE_TRANSITION,
+            ORDER_STATE_READY,
+            ORDER_STATE_OUT_FOR_DELIVERY,
             task_id,
         ),
     )
@@ -844,6 +973,54 @@ def _call_restaurant_transition(call: RestaurantTransitionCall) -> str | None:
         )
 
     return None
+
+
+def _call_courier_assign(
+    call: RestaurantTransitionCall,
+) -> tuple[str | None, str | None]:
+    """Call the courier assign endpoint; return (error, courier_ref)."""
+    url = f"{_downstream_sim_base_url()}/courier/assign"
+    payload = {"order_id": call.order_id, "restaurant_ref": call.restaurant_ref}
+
+    try:
+        response = httpx.post(
+            url,
+            json=payload,
+            timeout=_downstream_request_timeout_seconds(),
+        )
+    except httpx.TimeoutException as exc:
+        return _short_error(f"downstream timeout calling courier assign: {exc}"), None
+    except httpx.RequestError as exc:
+        return _short_error(
+            f"downstream request failed calling courier assign: {exc}"
+        ), None
+
+    if response.status_code >= 500:
+        return _short_error(
+            f"downstream returned {response.status_code} from courier assign"
+        ), None
+    if response.status_code != 200:
+        return _short_error(
+            f"downstream returned unexpected {response.status_code} from courier assign"
+        ), None
+
+    try:
+        body = response.json()
+    except ValueError as exc:
+        return _short_error(f"downstream returned invalid JSON: {exc}"), None
+
+    if not isinstance(body, dict) or body.get("status") != "assigned":
+        return _short_error(
+            f"downstream returned invalid courier assign body: {body!r}"
+        ), None
+
+    courier_ref = body.get("courier_ref")
+    if not courier_ref or not isinstance(courier_ref, str):
+        return _short_error(
+            f"downstream returned missing courier_ref in assign response: {body!r}"
+        ), None
+
+    return None, courier_ref
 
 
 def _prepare_ready_check_call(
@@ -1244,6 +1421,14 @@ def _followup_schedule_for_spec(
             occurred_at + timedelta(seconds=_ready_check_deadline_seconds()),
         )
 
+    if spec.next_task_type == TASK_TYPE_CHECK_DELIVERY:
+        # Same rationale as check_ready: a courier that always says "in_transit"
+        # would never exhaust max_attempts without a hard deadline.
+        return (
+            occurred_at + timedelta(seconds=_delivery_check_initial_delay_seconds()),
+            occurred_at + timedelta(seconds=_delivery_check_deadline_seconds()),
+        )
+
     return occurred_at, None
 
 
@@ -1252,8 +1437,14 @@ def _finalize_transition_task(
     task: ClaimedTask,
     worker_id: str,
     spec: RestaurantTransitionSpec,
+    extra_order_fields: dict[str, object] | None = None,
 ) -> ProcessingResult:
-    """Persist a restaurant transition after downstream success."""
+    """Persist a restaurant or courier transition after downstream success.
+
+    extra_order_fields is for caller-supplied columns that must be written
+    alongside the state change (e.g. {"courier_ref": "..."} for courier assign).
+    Column names come from internal callsites only — never from user input.
+    """
     occurred_at = datetime.now(timezone.utc)
     with open_db_connection() as conn:
         with conn.transaction():
@@ -1297,25 +1488,27 @@ def _finalize_transition_task(
                 # Optimistic locking on orders.version prevents a stale worker,
                 # cancellation race, or expired-lease claimant from committing a
                 # state transition after another actor already changed the row.
+                extra_set_sql = (
+                    "".join(f",\n                        {col} = %s" for col in extra_order_fields)
+                    if extra_order_fields
+                    else ""
+                )
+                extra_set_params = tuple(extra_order_fields.values()) if extra_order_fields else ()
                 cur.execute(
-                    """
+                    f"""
                     update orders
                     set
                         state = %s::order_state,
                         version = version + 1,
-                        updated_at = %s
+                        updated_at = %s{extra_set_sql}
                     where
                         id = %s::uuid
                         and version = %s
                         and state = %s::order_state
                     """,
-                    (
-                        spec.target_state,
-                        occurred_at,
-                        order_id,
-                        row["version"],
-                        spec.source_state,
-                    ),
+                    (spec.target_state, occurred_at)
+                    + extra_set_params
+                    + (order_id, row["version"], spec.source_state),
                 )
                 if cur.rowcount == 0:
                     _complete_claimed_task(
@@ -1524,6 +1717,36 @@ def process_transition_task(
     return _finalize_transition_task(task=task, worker_id=worker_id, spec=spec)
 
 
+def process_courier_assign_task(*, task: ClaimedTask, worker_id: str) -> ProcessingResult:
+    """Assign a courier and advance ready orders to out_for_delivery.
+
+    Separated from process_transition_task so the courier_ref from the HTTP
+    response can flow into the finalization transaction via extra_order_fields.
+    """
+    prepared = _prepare_transition_call(
+        task=task, worker_id=worker_id, spec=COURIER_ASSIGN_SPEC
+    )
+    if isinstance(prepared, ProcessingResult):
+        return prepared
+
+    error, courier_ref = _call_courier_assign(prepared)
+    if error is not None:
+        return _reschedule_transition_task(
+            task=task,
+            worker_id=worker_id,
+            order_id=prepared.order_id,
+            error=error,
+            spec=COURIER_ASSIGN_SPEC,
+        )
+
+    return _finalize_transition_task(
+        task=task,
+        worker_id=worker_id,
+        spec=COURIER_ASSIGN_SPEC,
+        extra_order_fields={"courier_ref": courier_ref},
+    )
+
+
 def process_ready_check_task(*, task: ClaimedTask, worker_id: str) -> ProcessingResult:
     """Poll restaurant readiness and advance preparing orders to ready."""
     prepared = _prepare_ready_check_call(task=task, worker_id=worker_id)
@@ -1555,6 +1778,366 @@ def process_ready_check_task(*, task: ClaimedTask, worker_id: str) -> Processing
     )
 
 
+def _prepare_delivery_check_call(
+    *,
+    task: ClaimedTask,
+    worker_id: str,
+) -> CourierDeliveryCheckCall | ProcessingResult:
+    """Validate the claimed check_delivery task and return simulator call details."""
+    occurred_at = datetime.now(timezone.utc)
+    with open_db_connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                row = _load_delivery_check_task_row(cur, task_id=task.id)
+                skip_result = _owned_task_check_result(row, worker_id=worker_id)
+                if skip_result is not None:
+                    return skip_result
+
+                order_state = row["order_state"]
+                order_id = row["order_id"]
+                if is_terminal_order_state(order_state):
+                    _complete_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        completed_at=occurred_at,
+                    )
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_COMPLETED_TERMINAL_NOOP,
+                        order_id=order_id,
+                        from_state=order_state,
+                    )
+
+                if order_state != ORDER_STATE_OUT_FOR_DELIVERY:
+                    _complete_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        completed_at=occurred_at,
+                    )
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_COMPLETED_STALE_NOOP,
+                        order_id=order_id,
+                        from_state=order_state,
+                    )
+
+                if row["deadline_at"] is None:
+                    return _retry_or_fail_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        order_id=order_id,
+                        from_state=ORDER_STATE_OUT_FOR_DELIVERY,
+                        to_state=ORDER_STATE_DELIVERED,
+                        attempts=row["attempts"],
+                        max_attempts=row["max_attempts"],
+                        next_run_at=occurred_at
+                        + timedelta(seconds=_task_retry_delay_seconds()),
+                        last_error="check_delivery task is missing deadline_at",
+                        updated_at=occurred_at,
+                    )
+
+                if row["dispatched_at"] is None:
+                    return _retry_or_fail_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        order_id=order_id,
+                        from_state=ORDER_STATE_OUT_FOR_DELIVERY,
+                        to_state=ORDER_STATE_DELIVERED,
+                        attempts=row["attempts"],
+                        max_attempts=row["max_attempts"],
+                        next_run_at=occurred_at
+                        + timedelta(seconds=_task_retry_delay_seconds()),
+                        last_error="missing ready -> out_for_delivery event for check_delivery",
+                        updated_at=occurred_at,
+                    )
+
+                if row["courier_ref"] is None:
+                    return _retry_or_fail_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        order_id=order_id,
+                        from_state=ORDER_STATE_OUT_FOR_DELIVERY,
+                        to_state=ORDER_STATE_DELIVERED,
+                        attempts=row["attempts"],
+                        max_attempts=row["max_attempts"],
+                        next_run_at=occurred_at
+                        + timedelta(seconds=_task_retry_delay_seconds()),
+                        last_error="missing courier_ref for check_delivery",
+                        updated_at=occurred_at,
+                    )
+
+                return CourierDeliveryCheckCall(
+                    order_id=order_id,
+                    courier_ref=row["courier_ref"],
+                    dispatched_at=row["dispatched_at"],
+                )
+
+
+def _call_courier_delivery_check(
+    call: CourierDeliveryCheckCall,
+) -> CourierDeliveryCheckOutcome | str:
+    """Call the delivery simulator and return an outcome or retryable error."""
+    url = f"{_downstream_sim_base_url()}/courier/check-delivery"
+    payload = {
+        "order_id": call.order_id,
+        "courier_ref": call.courier_ref,
+        "dispatched_at": call.dispatched_at.isoformat(),
+    }
+
+    try:
+        response = httpx.post(
+            url,
+            json=payload,
+            timeout=_downstream_request_timeout_seconds(),
+        )
+    except httpx.TimeoutException as exc:
+        return _short_error(f"downstream timeout calling courier check-delivery: {exc}")
+    except httpx.RequestError as exc:
+        return _short_error(
+            f"downstream request failed calling courier check-delivery: {exc}"
+        )
+
+    if response.status_code >= 500:
+        return _short_error(
+            f"downstream returned {response.status_code} from courier check-delivery"
+        )
+    if response.status_code != 200:
+        return _short_error(
+            f"downstream returned unexpected {response.status_code} "
+            "from courier check-delivery"
+        )
+
+    try:
+        body = response.json()
+    except ValueError as exc:
+        return _short_error(f"downstream returned invalid JSON: {exc}")
+
+    if not isinstance(body, dict):
+        return _short_error(f"downstream returned invalid check-delivery body: {body!r}")
+
+    status = body.get("status")
+    if status == DELIVERY_CHECK_STATUS_DELIVERED:
+        return CourierDeliveryCheckOutcome(status=DELIVERY_CHECK_STATUS_DELIVERED)
+    if status == DELIVERY_CHECK_STATUS_IN_TRANSIT:
+        return CourierDeliveryCheckOutcome(
+            status=DELIVERY_CHECK_STATUS_IN_TRANSIT,
+            retry_after_seconds=_valid_positive_number(body.get("retry_after_seconds")),
+        )
+
+    return _short_error(f"downstream returned invalid check-delivery body: {body!r}")
+
+
+def _reschedule_delivery_check_after_error(
+    *,
+    task: ClaimedTask,
+    worker_id: str,
+    order_id: str,
+    error: str,
+) -> ProcessingResult:
+    """Consume retry budget after a failed delivery check request."""
+    updated_at = datetime.now(timezone.utc)
+    next_run_at = updated_at + timedelta(seconds=_task_retry_delay_seconds())
+
+    with open_db_connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                row = _load_delivery_check_task_row(cur, task_id=task.id)
+                skip_result = _owned_task_check_result(row, worker_id=worker_id)
+                if skip_result is not None:
+                    return skip_result
+
+                order_state = row["order_state"]
+                if is_terminal_order_state(order_state):
+                    _complete_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        completed_at=updated_at,
+                    )
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_COMPLETED_TERMINAL_NOOP,
+                        order_id=row["order_id"],
+                        from_state=order_state,
+                    )
+
+                if order_state != ORDER_STATE_OUT_FOR_DELIVERY:
+                    _complete_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        completed_at=updated_at,
+                    )
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_COMPLETED_STALE_NOOP,
+                        order_id=row["order_id"],
+                        from_state=order_state,
+                    )
+
+                return _retry_or_fail_claimed_task(
+                    cur,
+                    task_id=task.id,
+                    worker_id=worker_id,
+                    order_id=order_id,
+                    from_state=ORDER_STATE_OUT_FOR_DELIVERY,
+                    to_state=ORDER_STATE_DELIVERED,
+                    attempts=row["attempts"],
+                    max_attempts=row["max_attempts"],
+                    next_run_at=next_run_at,
+                    last_error=error,
+                    updated_at=updated_at,
+                )
+
+
+def _reschedule_delivery_check_after_in_transit(
+    *,
+    task: ClaimedTask,
+    worker_id: str,
+    outcome: CourierDeliveryCheckOutcome,
+) -> ProcessingResult:
+    """Release check_delivery after a normal in-transit response."""
+    updated_at = datetime.now(timezone.utc)
+
+    with open_db_connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                row = _load_delivery_check_task_row(cur, task_id=task.id)
+                skip_result = _owned_task_check_result(row, worker_id=worker_id)
+                if skip_result is not None:
+                    return skip_result
+
+                order_state = row["order_state"]
+                order_id = row["order_id"]
+                if is_terminal_order_state(order_state):
+                    _complete_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        completed_at=updated_at,
+                    )
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_COMPLETED_TERMINAL_NOOP,
+                        order_id=order_id,
+                        from_state=order_state,
+                    )
+
+                if order_state != ORDER_STATE_OUT_FOR_DELIVERY:
+                    _complete_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        completed_at=updated_at,
+                    )
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_COMPLETED_STALE_NOOP,
+                        order_id=order_id,
+                        from_state=order_state,
+                    )
+
+                if row["deadline_at"] is None:
+                    return _retry_or_fail_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        order_id=order_id,
+                        from_state=ORDER_STATE_OUT_FOR_DELIVERY,
+                        to_state=ORDER_STATE_DELIVERED,
+                        attempts=row["attempts"],
+                        max_attempts=row["max_attempts"],
+                        next_run_at=updated_at
+                        + timedelta(seconds=_task_retry_delay_seconds()),
+                        last_error="check_delivery task is missing deadline_at",
+                        updated_at=updated_at,
+                    )
+
+                if updated_at >= row["deadline_at"]:
+                    # Deadline failure is a business timeout; the courier kept
+                    # reporting in_transit past the window. Does not count as a
+                    # transient error, so attempts is left unchanged.
+                    error = "courier delivery deadline exceeded"
+                    failed = _fail_claimed_task_without_attempt_increment(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        last_error=error,
+                        updated_at=updated_at,
+                    )
+                    if failed:
+                        return ProcessingResult(
+                            action=PROCESSING_ACTION_FAILED,
+                            order_id=order_id,
+                            from_state=ORDER_STATE_OUT_FOR_DELIVERY,
+                            to_state=ORDER_STATE_DELIVERED,
+                            error=error,
+                        )
+
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_LOST_OWNERSHIP,
+                        order_id=order_id,
+                        from_state=ORDER_STATE_OUT_FOR_DELIVERY,
+                        to_state=ORDER_STATE_DELIVERED,
+                        error=error,
+                    )
+
+                next_run_at = _bounded_delivery_check_next_run_at(
+                    now=updated_at,
+                    retry_after_seconds=outcome.retry_after_seconds,
+                    deadline_at=row["deadline_at"],
+                )
+                scheduled = _reschedule_poll_task(
+                    cur,
+                    task_id=task.id,
+                    worker_id=worker_id,
+                    next_run_at=next_run_at,
+                    updated_at=updated_at,
+                )
+                if scheduled:
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_POLL_SCHEDULED,
+                        order_id=order_id,
+                        from_state=ORDER_STATE_OUT_FOR_DELIVERY,
+                        to_state=ORDER_STATE_DELIVERED,
+                    )
+
+    return ProcessingResult(
+        action=PROCESSING_ACTION_LOST_OWNERSHIP,
+        order_id=task.order_id,
+        from_state=ORDER_STATE_OUT_FOR_DELIVERY,
+        to_state=ORDER_STATE_DELIVERED,
+    )
+
+
+def process_delivery_check_task(*, task: ClaimedTask, worker_id: str) -> ProcessingResult:
+    """Poll courier delivery status and advance out_for_delivery orders to delivered."""
+    prepared = _prepare_delivery_check_call(task=task, worker_id=worker_id)
+    if isinstance(prepared, ProcessingResult):
+        return prepared
+
+    outcome = _call_courier_delivery_check(prepared)
+    if isinstance(outcome, str):
+        return _reschedule_delivery_check_after_error(
+            task=task,
+            worker_id=worker_id,
+            order_id=prepared.order_id,
+            error=outcome,
+        )
+
+    if outcome.status == DELIVERY_CHECK_STATUS_DELIVERED:
+        return _finalize_transition_task(
+            task=task,
+            worker_id=worker_id,
+            spec=DELIVERY_FINALIZATION_SPEC,
+        )
+
+    return _reschedule_delivery_check_after_in_transit(
+        task=task,
+        worker_id=worker_id,
+        outcome=outcome,
+    )
+
+
 def claim_and_process_one_task(*, worker_id: str) -> bool:
     """Claim one task and process the first supported lifecycle transition."""
     task = claim_one_task(worker_id=worker_id)
@@ -1565,20 +2148,30 @@ def claim_and_process_one_task(*, worker_id: str) -> bool:
     log("claimed task %s for order %s by %s", task.id, task.order_id, worker_id)
 
     if task.task_type == TASK_TYPE_ADVANCE_STATE:
-        spec = RESTAURANT_TRANSITION_SPECS.get(task.target_state)
-        if spec is not None:
-            result = process_transition_task(
-                task=task,
-                worker_id=worker_id,
-                spec=spec,
-            )
+        if task.target_state == ORDER_STATE_OUT_FOR_DELIVERY:
+            # Courier assign is handled separately to pass courier_ref from the
+            # HTTP response into the finalization transaction.
+            result = process_courier_assign_task(task=task, worker_id=worker_id)
         else:
-            result = None
+            spec = RESTAURANT_TRANSITION_SPECS.get(task.target_state)
+            if spec is not None:
+                result = process_transition_task(
+                    task=task,
+                    worker_id=worker_id,
+                    spec=spec,
+                )
+            else:
+                result = None
     elif (
         task.task_type == TASK_TYPE_CHECK_READY
         and task.target_state == ORDER_STATE_READY
     ):
         result = process_ready_check_task(task=task, worker_id=worker_id)
+    elif (
+        task.task_type == TASK_TYPE_CHECK_DELIVERY
+        and task.target_state == ORDER_STATE_DELIVERED
+    ):
+        result = process_delivery_check_task(task=task, worker_id=worker_id)
     else:
         result = None
 
