@@ -20,6 +20,8 @@ ACTIVE_WORKER_THRESHOLD_SECONDS = 30
 RECENT_ORDER_LIMIT = 12
 RECENT_EVENT_LIMIT = 20
 PROBLEM_TASK_LIMIT = 20
+ORDER_DETAIL_EVENT_LIMIT = 50
+ORDER_DETAIL_TASK_LIMIT = 50
 # Keep throughput derived from a short rolling window. This is intentionally
 # read-model-only for the local dashboard; durable metrics storage can come
 # later if we need historical charts.
@@ -125,6 +127,92 @@ def get_dashboard_overview() -> dict[str, Any]:
         "problem_tasks": problem_tasks,
         "recent_orders": recent_orders,
         "recent_events": recent_events,
+    }
+
+
+def get_dashboard_order_detail(*, order_id: str) -> dict[str, Any] | None:
+    """Return one order's current state and audit trail for the detail view."""
+    with open_db_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                select
+                    id::text as order_id,
+                    idempotency_key,
+                    state::text,
+                    customer_ref,
+                    restaurant_ref,
+                    courier_ref,
+                    version,
+                    created_at,
+                    updated_at
+                from orders
+                where id = %s::uuid
+                """,
+                (order_id,),
+            )
+            order = cur.fetchone()
+            if order is None:
+                return None
+
+            # Keep task history bounded but ordered newest-first. The detail
+            # view is for operational inspection, not a full audit export.
+            cur.execute(
+                """
+                select
+                    id::text as task_id,
+                    task_type::text,
+                    target_state::text,
+                    status::text,
+                    attempts,
+                    max_attempts,
+                    next_run_at,
+                    deadline_at,
+                    locked_by,
+                    locked_until,
+                    last_error,
+                    created_at,
+                    updated_at,
+                    completed_at
+                from order_tasks
+                where order_id = %s::uuid
+                order by created_at desc, updated_at desc, id desc
+                limit %s
+                """,
+                (order_id, ORDER_DETAIL_TASK_LIMIT),
+            )
+            tasks = [dict(row) for row in cur.fetchall()]
+
+            # Events are returned chronological so the UI can render the
+            # pipeline history in the same direction an order moves.
+            cur.execute(
+                """
+                select
+                    id::text as event_id,
+                    event_type::text,
+                    from_state::text,
+                    to_state::text,
+                    task_id::text,
+                    worker_id,
+                    occurred_at,
+                    metadata
+                from order_events
+                where order_id = %s::uuid
+                order by occurred_at asc, id asc
+                limit %s
+                """,
+                (order_id, ORDER_DETAIL_EVENT_LIMIT),
+            )
+            events = [dict(row) for row in cur.fetchall()]
+
+    return {
+        "order": dict(order),
+        "tasks": tasks,
+        "events": events,
+        "limits": {
+            "tasks": ORDER_DETAIL_TASK_LIMIT,
+            "events": ORDER_DETAIL_EVENT_LIMIT,
+        },
     }
 
 
