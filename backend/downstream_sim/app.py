@@ -1,10 +1,18 @@
 import os
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
 
 app = FastAPI(title="Downstream Simulator")
+
+# Demo prep duration used when RESTAURANT_READY_AFTER_SECONDS is not set. The
+# simulator returns "ready" once now >= prep_started_at + this many seconds.
+DEFAULT_RESTAURANT_READY_AFTER_SECONDS = 6.0
+# Poll hint used when RESTAURANT_READY_RETRY_AFTER_SECONDS is not set. Workers
+# cap this by the task deadline before scheduling the next check_ready attempt.
+DEFAULT_RESTAURANT_READY_RETRY_AFTER_SECONDS = 2.0
 
 
 class RestaurantConfirmRequest(BaseModel):
@@ -31,6 +39,42 @@ class RestaurantStartPrepResponse(BaseModel):
     """Deterministic restaurant start-prep response."""
 
     status: str
+
+
+class RestaurantCheckReadyRequest(BaseModel):
+    """Restaurant readiness check request sent by the worker."""
+
+    order_id: str = Field(min_length=1)
+    restaurant_ref: str = Field(min_length=1)
+    prep_started_at: datetime
+
+
+class RestaurantCheckReadyResponse(BaseModel):
+    """Deterministic restaurant readiness check response."""
+
+    status: str
+    retry_after_seconds: float | None = None
+
+
+def _read_positive_float_env(env_name: str, default: float) -> float:
+    """Read a positive float env var while keeping deterministic defaults."""
+    raw_value = os.getenv(env_name)
+    if raw_value is None:
+        return default
+
+    try:
+        value = float(raw_value)
+    except ValueError:
+        return default
+
+    return value if value > 0 else default
+
+
+def _utc_datetime(value: datetime) -> datetime:
+    """Normalize incoming timestamps so readiness math is timezone-safe."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 @app.get("/healthz")
@@ -79,3 +123,28 @@ async def start_restaurant_prep(
     durable idempotency records remain a later step.
     """
     return {"status": "preparing"}
+
+
+@app.post("/restaurant/check-ready", response_model=RestaurantCheckReadyResponse)
+async def check_restaurant_ready(
+    request: RestaurantCheckReadyRequest,
+) -> dict[str, float | str]:
+    """Return whether enough deterministic prep time has elapsed for an order."""
+    ready_after_seconds = _read_positive_float_env(
+        "RESTAURANT_READY_AFTER_SECONDS",
+        DEFAULT_RESTAURANT_READY_AFTER_SECONDS,
+    )
+    retry_after_seconds = _read_positive_float_env(
+        "RESTAURANT_READY_RETRY_AFTER_SECONDS",
+        DEFAULT_RESTAURANT_READY_RETRY_AFTER_SECONDS,
+    )
+
+    prep_started_at = _utc_datetime(request.prep_started_at)
+    ready_at = prep_started_at + timedelta(seconds=ready_after_seconds)
+    if datetime.now(timezone.utc) >= ready_at:
+        return {"status": "ready"}
+
+    return {
+        "status": "not_ready",
+        "retry_after_seconds": retry_after_seconds,
+    }
