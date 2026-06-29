@@ -33,6 +33,7 @@ services:
       # The API cannot inspect Compose's worker replica count at runtime.
       # Keep this value in sync with worker.deploy.replicas below.
       DASHBOARD_CONFIGURED_WORKER_COUNT: "5"
+      DASHBOARD_LATENCY_WINDOW_SECONDS: "300"
     ports:
       - "8080:8000"
     depends_on:
