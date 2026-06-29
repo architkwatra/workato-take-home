@@ -71,16 +71,65 @@ joining logic:
       "cancelled": 0
     },
     "due_pending": 1,
-    "expired_running": 0,
-    "problem_tasks": []
+    "expired_running": 0
   },
   "workers": {
     "active_count": 3,
+    "active_threshold_seconds": 30,
     "total_seen": 3,
-    "rows": []
+    "rows": [
+      {
+        "worker_id": "worker-...",
+        "hostname": "container-hostname",
+        "started_at": "...",
+        "last_seen_at": "...",
+        "last_seen_seconds_ago": 4,
+        "active": true
+      }
+    ]
   },
-  "recent_orders": [],
-  "recent_events": []
+  "problem_tasks": [
+    {
+      "task_id": "...",
+      "order_id": "...",
+      "idempotency_key": "loadgen-...",
+      "task_type": "check_delivery",
+      "target_state": "delivered",
+      "status": "failed",
+      "attempts": 5,
+      "max_attempts": 5,
+      "next_run_at": "...",
+      "deadline_at": "...",
+      "locked_by": null,
+      "locked_until": null,
+      "last_error": "downstream request failed ...",
+      "problem_reason": "failed"
+    }
+  ],
+  "recent_orders": [
+    {
+      "order_id": "...",
+      "idempotency_key": "loadgen-...",
+      "state": "delivered",
+      "restaurant_ref": "restaurant-1",
+      "courier_ref": "courier-...",
+      "created_at": "...",
+      "updated_at": "..."
+    }
+  ],
+  "recent_events": [
+    {
+      "event_id": "...",
+      "order_id": "...",
+      "idempotency_key": "loadgen-...",
+      "event_type": "state_transition",
+      "from_state": "out_for_delivery",
+      "to_state": "delivered",
+      "task_id": "...",
+      "worker_id": "worker-...",
+      "occurred_at": "..."
+    }
+  ]
 }
 ```
 
@@ -91,7 +140,15 @@ Implementation notes:
 - Return all known order states and task statuses even when the count is zero.
 - Limit recent rows to a small number, such as 12 orders and 20 events.
 - Include failed tasks, expired running tasks, and error-bearing due pending
-  tasks in `problem_tasks`.
+  tasks in the top-level `problem_tasks` list. Keeping full row lists
+  top-level avoids making the frontend special-case one table under the task
+  aggregate bucket while `recent_orders` and `recent_events` are top-level.
+- Define active workers as `workers.last_seen_at >= now() - interval '30
+  seconds'`. The heartbeat interval is 10 seconds, so 30 seconds allows a small
+  amount of scheduling jitter without hiding truly stale workers.
+- Join `recent_events` and `problem_tasks` to `orders` so the response includes
+  `idempotency_key`; `order_events` and `order_tasks` store `order_id` but not
+  the human-friendly idempotency key.
 - Add comments around dashboard query choices, especially why we denormalize the
   response for the frontend and how worker activity is calculated.
 
@@ -118,7 +175,10 @@ DASHBOARD_CORS_ORIGINS=http://localhost:3000
 ```
 
 and configure FastAPI `CORSMiddleware` from that env var. Do not use wildcard
-CORS by default.
+CORS by default. The implementation should also add this env var to the API
+service in `docker-compose.yml`. If the env var is missing, the code can default
+to the same non-wildcard local origin (`http://localhost:3000`) so a fresh
+`docker compose up` works without extra shell configuration.
 
 ### Frontend
 
