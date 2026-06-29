@@ -34,6 +34,11 @@ services:
       # Keep this value in sync with worker.deploy.replicas below.
       DASHBOARD_CONFIGURED_WORKER_COUNT: "5"
       DASHBOARD_LATENCY_WINDOW_SECONDS: "300"
+      DASHBOARD_STUCK_PLACED_SECONDS: "18"
+      DASHBOARD_STUCK_CONFIRMED_SECONDS: "18"
+      DASHBOARD_STUCK_PREPARING_SECONDS: "45"
+      DASHBOARD_STUCK_READY_SECONDS: "20"
+      DASHBOARD_STUCK_OUT_FOR_DELIVERY_SECONDS: "90"
     ports:
       - "8080:8000"
     depends_on:

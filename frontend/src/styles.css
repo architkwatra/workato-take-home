@@ -301,6 +301,21 @@ h2 {
   margin-top: 8px;
 }
 
+.stage-latency-list-header {
+  align-items: center;
+  border-bottom: 1px solid #e4e8ed;
+  color: #66717d;
+  display: grid;
+  font-size: 11px;
+  font-weight: 800;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  letter-spacing: 0.03em;
+  margin-top: 10px;
+  padding-bottom: 6px;
+  text-transform: uppercase;
+}
+
 .stage-latency-list {
   display: grid;
   gap: 0;
@@ -1069,6 +1084,36 @@ tbody tr:last-child td {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.stuck-orders-table {
+  min-width: 760px;
+}
+
+.stuck-duration {
+  color: #a33b2f;
+  font-weight: 900;
+}
+
+.task-stack {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.task-stack span {
+  color: #263241;
+  font-weight: 800;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.task-stack .task-badge {
+  justify-self: start;
+}
+
+.panel-footnote {
+  margin: 12px 0 0;
 }
 
 .empty-cell {
