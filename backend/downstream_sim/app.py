@@ -1,3 +1,4 @@
+import hashlib
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -13,6 +14,10 @@ DEFAULT_RESTAURANT_READY_AFTER_SECONDS = 6.0
 # Poll hint used when RESTAURANT_READY_RETRY_AFTER_SECONDS is not set. Workers
 # cap this by the task deadline before scheduling the next check_ready attempt.
 DEFAULT_RESTAURANT_READY_RETRY_AFTER_SECONDS = 2.0
+# Courier delivery gate: "delivered" once now >= dispatched_at + this many seconds.
+DEFAULT_COURIER_DELIVERED_AFTER_SECONDS = 8.0
+# Poll hint returned with "in_transit". Workers cap this by the task deadline.
+DEFAULT_COURIER_DELIVERED_RETRY_AFTER_SECONDS = 3.0
 
 
 class RestaurantConfirmRequest(BaseModel):
@@ -51,6 +56,35 @@ class RestaurantCheckReadyRequest(BaseModel):
 
 class RestaurantCheckReadyResponse(BaseModel):
     """Deterministic restaurant readiness check response."""
+
+    status: str
+    retry_after_seconds: float | None = None
+
+
+class CourierAssignRequest(BaseModel):
+    """Courier assignment request sent by the worker."""
+
+    order_id: str = Field(min_length=1)
+    restaurant_ref: str = Field(min_length=1)
+
+
+class CourierAssignResponse(BaseModel):
+    """Deterministic courier assignment response."""
+
+    status: str
+    courier_ref: str
+
+
+class CourierCheckDeliveryRequest(BaseModel):
+    """Courier delivery status poll request sent by the worker."""
+
+    order_id: str = Field(min_length=1)
+    courier_ref: str = Field(min_length=1)
+    dispatched_at: datetime
+
+
+class CourierCheckDeliveryResponse(BaseModel):
+    """Deterministic courier delivery status response."""
 
     status: str
     retry_after_seconds: float | None = None
@@ -146,5 +180,46 @@ async def check_restaurant_ready(
 
     return {
         "status": "not_ready",
+        "retry_after_seconds": retry_after_seconds,
+    }
+
+
+@app.post("/courier/assign", response_model=CourierAssignResponse)
+async def assign_courier(request: CourierAssignRequest) -> dict[str, str]:
+    """Assign a deterministic courier ref to an order.
+
+    The ref is derived from order_id so repeated calls for the same order always
+    return the same courier. No persistence is needed; the worker writes the ref
+    to orders.courier_ref in the finalization transaction.
+    """
+    digest = hashlib.md5(
+        request.order_id.encode(),
+        usedforsecurity=False,
+    ).hexdigest()
+    courier_ref = f"courier-{digest[:12]}"
+    return {"status": "assigned", "courier_ref": courier_ref}
+
+
+@app.post("/courier/check-delivery", response_model=CourierCheckDeliveryResponse)
+async def check_courier_delivery(
+    request: CourierCheckDeliveryRequest,
+) -> dict[str, float | str]:
+    """Return whether enough deterministic delivery time has elapsed for an order."""
+    delivered_after_seconds = _read_positive_float_env(
+        "COURIER_DELIVERED_AFTER_SECONDS",
+        DEFAULT_COURIER_DELIVERED_AFTER_SECONDS,
+    )
+    retry_after_seconds = _read_positive_float_env(
+        "COURIER_DELIVERED_RETRY_AFTER_SECONDS",
+        DEFAULT_COURIER_DELIVERED_RETRY_AFTER_SECONDS,
+    )
+
+    dispatched_at = _utc_datetime(request.dispatched_at)
+    delivered_at = dispatched_at + timedelta(seconds=delivered_after_seconds)
+    if datetime.now(timezone.utc) >= delivered_at:
+        return {"status": "delivered"}
+
+    return {
+        "status": "in_transit",
         "retry_after_seconds": retry_after_seconds,
     }

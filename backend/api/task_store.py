@@ -10,6 +10,7 @@ from common.event_types import EVENT_TYPE_RETRY_SCHEDULED
 from common.task_types import (
     TASK_STATUS_FAILED,
     TASK_STATUS_PENDING,
+    TASK_TYPE_CHECK_DELIVERY,
     TASK_TYPE_CHECK_READY,
 )
 
@@ -44,9 +45,10 @@ def retry_failed_tasks_for_order(*, order_id: str) -> dict[str, Any] | None:
                     return None
 
                 # Failed tasks are terminal until an operator explicitly resets
-                # them. For poll tasks, start a fresh deadline window based on
-                # the original window length; otherwise an expired check_ready
-                # task would fail immediately after manual recovery.
+                # them. For poll tasks (check_ready, check_delivery), start a
+                # fresh deadline window based on the original window length;
+                # otherwise a timed-out poll task would fail immediately after
+                # manual recovery.
                 cur.execute(
                     """
                     with failed_task as (
@@ -71,7 +73,7 @@ def retry_failed_tasks_for_order(*, order_id: str) -> dict[str, Any] | None:
                         attempts = 0,
                         next_run_at = %s,
                         deadline_at = case
-                            when failed_task.task_type = %s::task_type then
+                            when failed_task.task_type = any(%s::task_type[]) then
                                 %s + greatest(
                                     coalesce(
                                         failed_task.deadline_at
@@ -104,7 +106,7 @@ def retry_failed_tasks_for_order(*, order_id: str) -> dict[str, Any] | None:
                         TASK_STATUS_FAILED,
                         TASK_STATUS_PENDING,
                         recovered_at,
-                        TASK_TYPE_CHECK_READY,
+                        [TASK_TYPE_CHECK_READY, TASK_TYPE_CHECK_DELIVERY],
                         recovered_at,
                         recovered_at,
                     ),
