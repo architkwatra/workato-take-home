@@ -190,6 +190,19 @@ function formatDurationSeconds(seconds) {
   return formatDuration(Number(seconds) * 1000) ?? "—";
 }
 
+function formatLatencySeconds(seconds) {
+  if (seconds == null || !Number.isFinite(Number(seconds))) {
+    return "—";
+  }
+
+  const parsed = Number(seconds);
+  if (parsed < 60) {
+    return `${parsed.toFixed(1)}s`;
+  }
+
+  return formatDurationSeconds(parsed);
+}
+
 function formatWindowLabel(seconds) {
   const duration = formatDurationSeconds(seconds);
   return duration === "—" ? "current window" : `last ${duration}`;
@@ -1133,14 +1146,14 @@ function PipelineLatencyPanel({ overview }) {
             Avg
             <HelpIcon text={DETAIL_HELP.pipelineAvg} />
           </span>
-          <strong>{hasSamples ? formatDurationSeconds(pipeline.avg_seconds) : "—"}</strong>
+          <strong>{hasSamples ? formatLatencySeconds(pipeline.avg_seconds) : "—"}</strong>
         </div>
         <div>
           <span className="label-with-help">
             P95
             <HelpIcon text={DETAIL_HELP.pipelineP95} />
           </span>
-          <strong>{hasSamples ? formatDurationSeconds(pipeline.p95_seconds) : "—"}</strong>
+          <strong>{hasSamples ? formatLatencySeconds(pipeline.p95_seconds) : "—"}</strong>
         </div>
       </div>
       <div className="stage-latency-list">
@@ -1163,9 +1176,9 @@ function PipelineLatencyPanel({ overview }) {
                   )} reached_at to ${humanize(state)} reached_at.`}
                 />
               </span>
-              <strong>P95 {formatDurationSeconds(stage?.p95_seconds)}</strong>
+              <strong>P95 {formatLatencySeconds(stage?.p95_seconds)}</strong>
               <small>
-                avg {formatDurationSeconds(stage?.avg_seconds)}
+                avg {formatLatencySeconds(stage?.avg_seconds)}
                 {" · "}n={numberText(stage?.sample_count ?? 0)}
               </small>
             </div>
