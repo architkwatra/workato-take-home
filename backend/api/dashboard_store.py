@@ -5,7 +5,12 @@ from typing import Any
 from psycopg.rows import dict_row
 
 from common.db import open_db_connection
-from common.state_machine import ORDER_STATE_PLACED, ORDER_STATES
+from common.event_types import EVENT_TYPE_ORDER_CREATED, EVENT_TYPE_STATE_TRANSITION
+from common.state_machine import (
+    ORDER_STATE_DELIVERED,
+    ORDER_STATE_PLACED,
+    ORDER_STATES,
+)
 from common.task_types import (
     ORDER_TASK_STATUSES,
     TASK_STATUS_COMPLETED,
@@ -59,6 +64,13 @@ def _count_map(
     for row in rows:
         counts[row["key"]] = row["count"]
     return counts
+
+
+def _rounded_float(value: Any) -> float | None:
+    """Return a rounded JSON-friendly float for aggregate numeric values."""
+    if value is None:
+        return None
+    return round(float(value), 2)
 
 
 def get_dashboard_overview() -> dict[str, Any]:
@@ -133,6 +145,8 @@ def get_dashboard_overview() -> dict[str, Any]:
             )
             task_health = dict(cur.fetchone())
 
+            order_throughput = _load_order_throughput(cur)
+            latency = _load_latency_overview(cur)
             workers = _load_worker_overview(cur)
             problem_tasks = _load_problem_tasks(cur)
             placed_orders = _load_placed_orders(cur)
@@ -155,17 +169,191 @@ def get_dashboard_overview() -> dict[str, Any]:
         },
         "throughput": {
             "window_seconds": THROUGHPUT_WINDOW_SECONDS,
+            "orders_created": order_throughput["orders_created"],
+            "orders_created_per_minute": order_throughput[
+                "orders_created_per_minute"
+            ],
+            "orders_delivered": order_throughput["orders_delivered"],
+            "orders_delivered_per_minute": order_throughput[
+                "orders_delivered_per_minute"
+            ],
             "tasks_completed": task_health["completed_recent"],
             "tasks_completed_per_second": round(
                 task_health["completed_recent"] / THROUGHPUT_WINDOW_SECONDS,
                 2,
             ),
         },
+        "latency": latency,
         "workers": workers,
         "problem_tasks": problem_tasks,
         "placed_orders": placed_orders,
         "recent_orders": recent_orders,
         "recent_events": recent_events,
+    }
+
+
+def _load_order_throughput(cur) -> dict[str, Any]:
+    """Return order-level throughput over the dashboard rolling window."""
+    # Business throughput is based on customer-visible events, not task rows.
+    # A single order completes several tasks, so task completion rate is useful
+    # system telemetry but not a substitute for order creation/delivery rate.
+    cur.execute(
+        """
+        select
+            count(*) filter (
+                where
+                    event_type = %s::event_type
+                    and occurred_at >= now() - (%s * interval '1 second')
+            )::int as orders_created,
+            count(*) filter (
+                where
+                    event_type = %s::event_type
+                    and to_state = %s::order_state
+                    and occurred_at >= now() - (%s * interval '1 second')
+            )::int as orders_delivered
+        from order_events
+        """,
+        (
+            EVENT_TYPE_ORDER_CREATED,
+            THROUGHPUT_WINDOW_SECONDS,
+            EVENT_TYPE_STATE_TRANSITION,
+            ORDER_STATE_DELIVERED,
+            THROUGHPUT_WINDOW_SECONDS,
+        ),
+    )
+    row = dict(cur.fetchone())
+    orders_created = row["orders_created"]
+    orders_delivered = row["orders_delivered"]
+    return {
+        "orders_created": orders_created,
+        "orders_created_per_minute": round(
+            orders_created * 60 / THROUGHPUT_WINDOW_SECONDS,
+            2,
+        ),
+        "orders_delivered": orders_delivered,
+        "orders_delivered_per_minute": round(
+            orders_delivered * 60 / THROUGHPUT_WINDOW_SECONDS,
+            2,
+        ),
+    }
+
+
+def _load_latency_overview(cur) -> dict[str, Any]:
+    """Return end-to-end and per-stage latency from order event timestamps."""
+    cur.execute(
+        """
+        with created as (
+            select order_id, min(occurred_at) as created_at
+            from order_events
+            where event_type = %s::event_type
+            group by order_id
+        ),
+        delivered as (
+            select order_id, min(occurred_at) as delivered_at
+            from order_events
+            where
+                event_type = %s::event_type
+                and to_state = %s::order_state
+            group by order_id
+        ),
+        durations as (
+            select
+                extract(epoch from delivered.delivered_at - created.created_at)
+                    ::double precision as duration_seconds
+            from created
+            join delivered on delivered.order_id = created.order_id
+            where delivered.delivered_at >= created.created_at
+        )
+        select
+            count(*)::int as sample_count,
+            avg(duration_seconds)::double precision as avg_seconds,
+            percentile_cont(0.95) within group (order by duration_seconds)
+                ::double precision as p95_seconds
+        from durations
+        """,
+        (
+            EVENT_TYPE_ORDER_CREATED,
+            EVENT_TYPE_STATE_TRANSITION,
+            ORDER_STATE_DELIVERED,
+        ),
+    )
+    pipeline = dict(cur.fetchone())
+
+    cur.execute(
+        """
+        with timeline as (
+            select
+                order_id,
+                %s::text as reached_state,
+                occurred_at,
+                0 as event_order
+            from order_events
+            where event_type = %s::event_type
+
+            union all
+
+            select
+                order_id,
+                to_state::text as reached_state,
+                occurred_at,
+                1 as event_order
+            from order_events
+            where
+                event_type = %s::event_type
+                and to_state is not null
+        ),
+        sequenced as (
+            select
+                order_id,
+                lag(reached_state) over event_sequence as from_state,
+                reached_state as to_state,
+                extract(
+                    epoch from occurred_at - lag(occurred_at) over event_sequence
+                )::double precision as duration_seconds
+            from timeline
+            window event_sequence as (
+                partition by order_id
+                order by occurred_at, event_order, reached_state
+            )
+        )
+        select
+            from_state,
+            to_state,
+            count(*)::int as sample_count,
+            avg(duration_seconds)::double precision as avg_seconds,
+            percentile_cont(0.95) within group (order by duration_seconds)
+                ::double precision as p95_seconds
+        from sequenced
+        where
+            from_state is not null
+            and duration_seconds is not null
+            and duration_seconds >= 0
+        group by from_state, to_state
+        """,
+        (
+            ORDER_STATE_PLACED,
+            EVENT_TYPE_ORDER_CREATED,
+            EVENT_TYPE_STATE_TRANSITION,
+        ),
+    )
+    stages = [
+        {
+            "from_state": row["from_state"],
+            "to_state": row["to_state"],
+            "sample_count": row["sample_count"],
+            "avg_seconds": _rounded_float(row["avg_seconds"]),
+            "p95_seconds": _rounded_float(row["p95_seconds"]),
+        }
+        for row in cur.fetchall()
+    ]
+
+    return {
+        "pipeline": {
+            "sample_count": pipeline["sample_count"],
+            "avg_seconds": _rounded_float(pipeline["avg_seconds"]),
+            "p95_seconds": _rounded_float(pipeline["p95_seconds"]),
+        },
+        "stages": stages,
     }
 
 

@@ -100,7 +100,12 @@ const LABELS = {
 
 const METRIC_HELP = {
   orders: "Total order rows in the database, across every order state.",
-  delivered: "Orders whose current state is delivered.",
+  ordersCreatedRate:
+    "Orders accepted per minute over the rolling dashboard window.",
+  ordersDeliveredRate:
+    "Orders delivered per minute over the rolling dashboard window.",
+  pipelineLatency:
+    "End-to-end p95 time from order creation to delivery, across delivered orders.",
   taskCompletionRate:
     "Completed task rows per second over the rolling dashboard window. This is worker throughput, not delivered-order rate.",
   taskIssues:
@@ -109,9 +114,28 @@ const METRIC_HELP = {
     "Workers with a heartbeat in the active window divided by the configured worker replica count.",
 };
 
+const DETAIL_HELP = {
+  pipelineSamples:
+    "Delivered orders with both an order_created event and a delivered state_transition event.",
+  pipelineAvg:
+    "Average elapsed time from order_created to delivered across delivered orders.",
+  pipelineP95:
+    "95th percentile elapsed time from order_created to delivered. 95% of delivered orders completed at or below this value.",
+  stageLatency:
+    "95th percentile elapsed time between consecutive lifecycle events for this transition, calculated from order_events.",
+  taskCompletionRate:
+    "Completed order_tasks rows per second over the rolling dashboard window. This is worker throughput, not delivered-order rate.",
+  duePending:
+    "Pending order_tasks rows where next_run_at is now or earlier, so a worker can claim them.",
+  retrying:
+    "Pending or running tasks with last_error set. Pending retry tasks wait until next_run_at; running retry tasks are currently leased.",
+  expiredLeases:
+    "Running tasks where locked_until is in the past. These are reclaimable by another worker.",
+};
+
 function humanize(value) {
   if (!value) {
-    return "None";
+    return "—";
   }
   return LABELS[value] ?? value.replaceAll("_", " ");
 }
@@ -134,14 +158,41 @@ function rateText(value) {
 
 function shortId(value) {
   if (!value) {
-    return "None";
+    return "—";
   }
-  return value.length > 12 ? `${value.slice(0, 8)}...` : value;
+  return value.length > 12 ? `${value.slice(0, 8)}…` : value;
+}
+
+function shortKey(value) {
+  if (!value) return "—";
+  if (value.length <= 20) return value;
+  // For keys like "loadgen-<uuid>-97", keep the meaningful prefix and serial suffix
+  const lastDash = value.lastIndexOf("-");
+  if (lastDash > 8) {
+    return `${value.slice(0, 8)}…${value.slice(lastDash)}`;
+  }
+  return `${value.slice(0, 12)}…`;
+}
+
+function formatDuration(ms) {
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return null;
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return rem > 0 ? `${m}m ${rem}s` : `${m}m`;
+}
+
+function formatDurationSeconds(seconds) {
+  if (seconds == null || !Number.isFinite(Number(seconds))) {
+    return "—";
+  }
+  return formatDuration(Number(seconds) * 1000) ?? "—";
 }
 
 function formatTime(value) {
   if (!value) {
-    return "None";
+    return "—";
   }
 
   return new Intl.DateTimeFormat(undefined, {
@@ -387,20 +438,24 @@ function Metric({ label, value, detail, helpText, tone = "neutral" }) {
     <section className={`metric ${tone}`}>
       <p className="metric-label">
         <span>{label}</span>
-        {helpText ? (
-          <span
-            aria-label={helpText}
-            className="metric-help"
-            data-tooltip={helpText}
-            tabIndex="0"
-          >
-            i
-          </span>
-        ) : null}
+        {helpText ? <HelpIcon text={helpText} /> : null}
       </p>
       <strong>{value}</strong>
       {detail ? <span className="metric-detail">{detail}</span> : null}
     </section>
+  );
+}
+
+function HelpIcon({ text }) {
+  return (
+    <span
+      aria-label={text}
+      className="metric-help"
+      data-tooltip={text}
+      tabIndex="0"
+    >
+      i
+    </span>
   );
 }
 
@@ -411,6 +466,19 @@ function EmptyRow({ colSpan, children }) {
         {children}
       </td>
     </tr>
+  );
+}
+
+function StateBadge({ state }) {
+  const cls = `state-badge state-badge--${(state ?? "unknown").replace(/_/g, "-")}`;
+  return <span className={cls}>{humanize(state ?? "unknown")}</span>;
+}
+
+function TaskStatusBadge({ status }) {
+  return (
+    <span className={`task-badge task-badge--${status ?? "unknown"}`}>
+      {humanize(status ?? "unknown")}
+    </span>
   );
 }
 
@@ -676,10 +744,20 @@ function App() {
       expiredRunning: overview?.tasks?.expired_running ?? 0,
       retryingPending: overview?.tasks?.retrying_pending ?? 0,
       retryingRunning: overview?.tasks?.retrying_running ?? 0,
+      duePending: overview?.tasks?.due_pending ?? 0,
+      ordersCreatedPerMinute:
+        overview?.throughput?.orders_created_per_minute ?? 0,
+      ordersDeliveredPerMinute:
+        overview?.throughput?.orders_delivered_per_minute ?? 0,
+      ordersCreatedRecent: overview?.throughput?.orders_created ?? 0,
+      ordersDeliveredRecent: overview?.throughput?.orders_delivered ?? 0,
       tasksCompletedPerSecond:
         overview?.throughput?.tasks_completed_per_second ?? 0,
       tasksCompletedRecent: overview?.throughput?.tasks_completed ?? 0,
       throughputWindowSeconds: overview?.throughput?.window_seconds ?? 30,
+      pipelineAvgSeconds: overview?.latency?.pipeline?.avg_seconds ?? null,
+      pipelineP95Seconds: overview?.latency?.pipeline?.p95_seconds ?? null,
+      pipelineSampleCount: overview?.latency?.pipeline?.sample_count ?? 0,
       activeWorkers: overview?.workers?.active_count ?? 0,
       configuredWorkers: overview?.workers?.configured_count ?? 0,
       workerActiveThresholdSeconds: overview?.workers?.active_threshold_seconds ?? 30,
@@ -939,20 +1017,29 @@ function App() {
               helpText={METRIC_HELP.orders}
             />
             <Metric
-              label="Delivered"
-              value={numberText(totals.deliveredOrders)}
-              detail="terminal success"
-              helpText={METRIC_HELP.delivered}
-              tone="good"
-            />
-            <Metric
-              label="Task Completion Rate"
-              value={`${rateText(totals.tasksCompletedPerSecond)}/s`}
-              detail={`${numberText(totals.tasksCompletedRecent)} completed in last ${
+              label="Created / Min"
+              value={`${rateText(totals.ordersCreatedPerMinute)}/min`}
+              detail={`${numberText(totals.ordersCreatedRecent)} in last ${
                 totals.throughputWindowSeconds
               }s`}
-              helpText={METRIC_HELP.taskCompletionRate}
-              tone={totals.tasksCompletedPerSecond > 0 ? "good" : "neutral"}
+              helpText={METRIC_HELP.ordersCreatedRate}
+              tone={totals.ordersCreatedPerMinute > 0 ? "good" : "neutral"}
+            />
+            <Metric
+              label="Delivered / Min"
+              value={`${rateText(totals.ordersDeliveredPerMinute)}/min`}
+              detail={`${numberText(totals.deliveredOrders)} total delivered`}
+              helpText={METRIC_HELP.ordersDeliveredRate}
+              tone={totals.ordersDeliveredPerMinute > 0 ? "good" : "neutral"}
+            />
+            <Metric
+              label="Pipeline P95"
+              value={formatDurationSeconds(totals.pipelineP95Seconds)}
+              detail={`Avg ${formatDurationSeconds(totals.pipelineAvgSeconds)} · ${
+                numberText(totals.pipelineSampleCount)
+              } delivered`}
+              helpText={METRIC_HELP.pipelineLatency}
+              tone={totals.pipelineP95Seconds == null ? "neutral" : "good"}
             />
             <Metric
               label="Task Issues"
@@ -993,6 +1080,11 @@ function App() {
           </div>
 
           <div className="content-grid wide">
+            <PipelineLatencyPanel overview={overview} />
+            <QueueHealthPanel totals={totals} />
+          </div>
+
+          <div className="content-grid wide">
             <ProblemTaskPanel
               overview={overview}
               onRetryFailedTasks={retryFailedTasks}
@@ -1004,6 +1096,134 @@ function App() {
         </>
       )}
     </main>
+  );
+}
+
+function PipelineLatencyPanel({ overview }) {
+  const pipeline = overview?.latency?.pipeline ?? {};
+  const stages = overview?.latency?.stages ?? [];
+  const stagesByTarget = new Map(stages.map((stage) => [stage.to_state, stage]));
+  const hasSamples = (pipeline.sample_count ?? 0) > 0;
+
+  // Compute relative bar widths from the slowest stage p95
+  const maxP95 = Math.max(
+    ...PIPELINE_STATES.slice(1).map((state) => stagesByTarget.get(state)?.p95_seconds ?? 0),
+    0.001,
+  );
+
+  return (
+    <section className="section latency-panel">
+      <div className="section-heading">
+        <h2>Pipeline Latency</h2>
+        <span className="label-with-help">
+          {numberText(pipeline.sample_count ?? 0)} delivered samples
+          <HelpIcon text={DETAIL_HELP.pipelineSamples} />
+        </span>
+      </div>
+      <div className="latency-summary">
+        <div>
+          <span className="label-with-help">
+            Avg
+            <HelpIcon text={DETAIL_HELP.pipelineAvg} />
+          </span>
+          <strong>{hasSamples ? formatDurationSeconds(pipeline.avg_seconds) : "—"}</strong>
+        </div>
+        <div>
+          <span className="label-with-help">
+            P95
+            <HelpIcon text={DETAIL_HELP.pipelineP95} />
+          </span>
+          <strong>{hasSamples ? formatDurationSeconds(pipeline.p95_seconds) : "—"}</strong>
+        </div>
+      </div>
+      <div className="stage-latency-list">
+        {PIPELINE_STATES.slice(1).map((state, index) => {
+          const fromState = PIPELINE_STATES[index];
+          const stage = stagesByTarget.get(state);
+          const pct = stage?.p95_seconds
+            ? Math.min(Math.round((stage.p95_seconds / maxP95) * 88), 88)
+            : 0;
+          const rowStyle = pct > 0
+            ? { background: `linear-gradient(to right, rgba(37,99,111,0.08) ${pct}%, transparent ${pct}%)` }
+            : {};
+          return (
+            <div className="stage-latency-row" key={state} style={rowStyle}>
+              <span className="stage-label">
+                {humanize(fromState)} → {humanize(state)}
+                <HelpIcon
+                  text={`${DETAIL_HELP.stageLatency} Source: ${humanize(
+                    fromState,
+                  )} reached_at to ${humanize(state)} reached_at.`}
+                />
+              </span>
+              <strong>{formatDurationSeconds(stage?.p95_seconds)}</strong>
+              <small>
+                avg {formatDurationSeconds(stage?.avg_seconds)}
+                {" · "}n={numberText(stage?.sample_count ?? 0)}
+              </small>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function QueueHealthPanel({ totals }) {
+  return (
+    <section className="section system-metrics-panel">
+      <div className="section-heading">
+        <h2>Queue Health</h2>
+        <span>Worker and task queue status</span>
+      </div>
+      <dl className="secondary-metrics">
+        <div>
+          <dt>
+            <span className="label-with-help">
+              Task completion rate
+              <HelpIcon text={DETAIL_HELP.taskCompletionRate} />
+            </span>
+          </dt>
+          <dd>{rateText(totals.tasksCompletedPerSecond)}/s</dd>
+          <small>
+            {numberText(totals.tasksCompletedRecent)} in last{" "}
+            {totals.throughputWindowSeconds}s
+          </small>
+        </div>
+        <div>
+          <dt>
+            <span className="label-with-help">
+              Due pending
+              <HelpIcon text={DETAIL_HELP.duePending} />
+            </span>
+          </dt>
+          <dd>{numberText(totals.duePending)}</dd>
+          <small>claimable now</small>
+        </div>
+        <div>
+          <dt>
+            <span className="label-with-help">
+              Retrying
+              <HelpIcon text={DETAIL_HELP.retrying} />
+            </span>
+          </dt>
+          <dd>
+            {numberText(totals.retryingPending + totals.retryingRunning)}
+          </dd>
+          <small>pending or running</small>
+        </div>
+        <div>
+          <dt>
+            <span className="label-with-help">
+              Expired leases
+              <HelpIcon text={DETAIL_HELP.expiredLeases} />
+            </span>
+          </dt>
+          <dd>{numberText(totals.expiredRunning)}</dd>
+          <small>running past lease</small>
+        </div>
+      </dl>
+    </section>
   );
 }
 
@@ -1089,7 +1309,7 @@ function OrderDetailPage({
             <dl className="order-meta">
               <div>
                 <dt>State</dt>
-                <dd>{humanize(order.state)}</dd>
+                <dd><StateBadge state={order.state} /></dd>
               </div>
               <div>
                 <dt>Restaurant</dt>
@@ -1097,11 +1317,11 @@ function OrderDetailPage({
               </div>
               <div>
                 <dt>Courier</dt>
-                <dd>{order.courier_ref ?? "None"}</dd>
+                <dd>{order.courier_ref ?? "—"}</dd>
               </div>
               <div>
                 <dt>Customer</dt>
-                <dd>{order.customer_ref ?? "None"}</dd>
+                <dd>{order.customer_ref ?? "—"}</dd>
               </div>
               <div>
                 <dt>Created</dt>
@@ -1146,7 +1366,7 @@ function PipelinePanel({ order, events }) {
     <section className="section">
       <div className="section-heading">
         <h2>Order Pipeline</h2>
-        <span>{humanize(order.state)}</span>
+        <StateBadge state={order.state} />
       </div>
       <div className="pipeline">
         {PIPELINE_STATES.map((state, index) => {
@@ -1190,6 +1410,11 @@ function PipelinePanel({ order, events }) {
               <div>
                 <strong>{humanize(state)}</strong>
                 <small>{reachedAt ? formatTime(reachedAt) : "Pending"}</small>
+                {deltaMilliseconds != null ? (
+                  <small className="pipeline-duration">
+                    +{formatDuration(deltaMilliseconds)}
+                  </small>
+                ) : null}
               </div>
             </div>
           );
@@ -1227,13 +1452,13 @@ function OrderTasksPanel({ tasks }) {
                 <tr key={task.task_id}>
                   <td title={task.task_id}>{humanize(task.task_type)}</td>
                   <td>{humanize(task.target_state)}</td>
-                  <td>{humanize(task.status)}</td>
+                  <td><TaskStatusBadge status={task.status} /></td>
                   <td>
                     {numberText(task.attempts)}/{numberText(task.max_attempts)}
                   </td>
                   <td>{formatTime(task.next_run_at)}</td>
                   <td className="truncate" title={task.last_error ?? ""}>
-                    {task.last_error ?? "None"}
+                    {task.last_error ?? "—"}
                   </td>
                 </tr>
               ))
@@ -1272,8 +1497,8 @@ function OrderEventsPanel({ events }) {
                   <td>{humanize(event.event_type)}</td>
                   <td>
                     {event.from_state || event.to_state
-                      ? `${humanize(event.from_state)} -> ${humanize(event.to_state)}`
-                      : "None"}
+                      ? `${humanize(event.from_state)} → ${humanize(event.to_state)}`
+                      : "—"}
                   </td>
                   <td title={event.worker_id ?? ""}>{shortId(event.worker_id)}</td>
                 </tr>
@@ -1317,30 +1542,30 @@ function LoadgenControlPanel({
       </div>
 
       <div className="loadgen-layout">
-        <div className="loadgen-controls">
-          <label className="field">
-            <span>Rate / second</span>
-            <input
-              min="0.1"
-              step="0.1"
-              type="number"
-              value={form.ratePerSecond}
-              onChange={(event) => onChange("ratePerSecond", event.target.value)}
-            />
-          </label>
-          <label className="field">
-            <span>Max orders</span>
-            <input
-              min="1"
-              step="1"
-              type="number"
-              value={form.maxOrders}
-              onChange={(event) => onChange("maxOrders", event.target.value)}
-            />
-          </label>
-        </div>
+        <div className="loadgen-top">
+          <div className="loadgen-controls">
+            <label className="field">
+              <span>Rate / second</span>
+              <input
+                min="0.1"
+                step="0.1"
+                type="number"
+                value={form.ratePerSecond}
+                onChange={(event) => onChange("ratePerSecond", event.target.value)}
+              />
+            </label>
+            <label className="field">
+              <span>Max orders</span>
+              <input
+                min="1"
+                step="1"
+                type="number"
+                value={form.maxOrders}
+                onChange={(event) => onChange("maxOrders", event.target.value)}
+              />
+            </label>
+          </div>
 
-        <div className="loadgen-actions">
           <div className="button-row">
             <button
               className="button primary"
@@ -1359,45 +1584,38 @@ function LoadgenControlPanel({
               {actionPending === "stop" ? "Stopping" : "Stop"}
             </button>
           </div>
-
-          <dl className="loadgen-stats">
-            <div>
-              <dt>Status</dt>
-              <dd>
-                <span className={`run-status ${running ? "running" : "stopped"}`}>
-                  {running ? "Running" : "Stopped"}
-                </span>
-              </dd>
-            </div>
-            <div>
-              <dt>Connection</dt>
-              <dd>{connectionLabel}</dd>
-            </div>
-            <div>
-              <dt>Attempted</dt>
-              <dd>{numberText(status?.attempted_count ?? 0)}</dd>
-            </div>
-            <div>
-              <dt>Created</dt>
-              <dd>{numberText(status?.created_count ?? 0)}</dd>
-            </div>
-            <div>
-              <dt>Failed</dt>
-              <dd>{numberText(status?.failed_count ?? 0)}</dd>
-            </div>
-            <div>
-              <dt>Inflight</dt>
-              <dd>
-                {numberText(status?.inflight_count ?? 0)}/
-                {numberText(status?.max_inflight ?? 0)}
-              </dd>
-            </div>
-          </dl>
-
-          {status?.last_error ? <p className="inline-error">{status.last_error}</p> : null}
-          {error ? <p className="inline-error">{error}</p> : null}
-          {actionError ? <p className="inline-error">{actionError}</p> : null}
         </div>
+
+        <dl className="loadgen-stats">
+          <div>
+            <dt>Status</dt>
+            <dd>
+              <span className={`run-status ${running ? "running" : "stopped"}`}>
+                {running ? "Running" : "Stopped"}
+              </span>
+            </dd>
+          </div>
+          <div>
+            <dt>Attempted</dt>
+            <dd>{numberText(status?.attempted_count ?? 0)}</dd>
+          </div>
+          <div>
+            <dt>Created</dt>
+            <dd>{numberText(status?.created_count ?? 0)}</dd>
+          </div>
+          <div>
+            <dt>Failed</dt>
+            <dd>{numberText(status?.failed_count ?? 0)}</dd>
+          </div>
+          <div>
+            <dt>Inflight</dt>
+            <dd>{numberText(status?.inflight_count ?? 0)}</dd>
+          </div>
+        </dl>
+
+        {status?.last_error ? <p className="inline-error">{status.last_error}</p> : null}
+        {error ? <p className="inline-error">{error}</p> : null}
+        {actionError ? <p className="inline-error">{actionError}</p> : null}
       </div>
     </section>
   );
@@ -1562,15 +1780,27 @@ function ProblemTaskPanel({
 
                 return (
                   <tr key={task.task_id}>
-                    <td>{humanize(task.problem_reason)}</td>
+                    <td>
+                      <span className={`reason-badge reason-badge--${task.problem_reason ?? "unknown"}`}>
+                        {humanize(task.problem_reason)}
+                      </span>
+                    </td>
                     <td>{humanize(task.task_type)}</td>
-                    <td title={task.order_id}>{task.idempotency_key}</td>
+                    <td>
+                      <a
+                        className="text-button"
+                        href={orderDetailPath(task.order_id)}
+                        title={task.idempotency_key}
+                      >
+                        {shortKey(task.idempotency_key)}
+                      </a>
+                    </td>
                     <td>
                       {numberText(task.attempts)}/{numberText(task.max_attempts)}
                     </td>
                     <td>{formatTime(task.next_run_at)}</td>
                     <td className="truncate" title={task.last_error ?? ""}>
-                      {task.last_error ?? "None"}
+                      {task.last_error ?? "—"}
                     </td>
                     <td>
                       {canRetry ? (
@@ -1582,9 +1812,7 @@ function ProblemTaskPanel({
                         >
                           {retryPending ? "Retrying" : "Retry"}
                         </button>
-                      ) : (
-                        <span className="muted-text">None</span>
-                      )}
+                      ) : null}
                     </td>
                   </tr>
                 );
@@ -1609,12 +1837,12 @@ function RecentOrdersPanel({ overview, onSelectOrder }) {
         <h2>Recent Orders</h2>
         <span>{numberText(rows.length)} shown</span>
       </div>
-      <div className="placed-watch">
-        <div className="placed-watch-heading">
-          <span>Placed Orders</span>
-          <small>{numberText(placedRows.length)} of 5 shown</small>
-        </div>
-        {placedRows.length ? (
+      {placedRows.length > 0 ? (
+        <div className="placed-watch">
+          <div className="placed-watch-heading">
+            <span>Placed — waiting for pickup</span>
+            <small>{numberText(placedRows.length)} shown</small>
+          </div>
           <div className="placed-watch-list">
             {placedRows.map((order) => (
               <a
@@ -1623,23 +1851,20 @@ function RecentOrdersPanel({ overview, onSelectOrder }) {
                 key={order.order_id}
                 onClick={(event) => onSelectOrder(order.order_id, event)}
               >
-                <span title={order.order_id}>{order.idempotency_key}</span>
+                <span title={order.idempotency_key}>{shortKey(order.idempotency_key)}</span>
                 <small>{formatTime(order.created_at)}</small>
               </a>
             ))}
           </div>
-        ) : (
-          <div className="placed-watch-empty">No placed orders waiting</div>
-        )}
-      </div>
+        </div>
+      ) : null}
       <div className="table-wrap">
         <table>
           <thead>
             <tr>
-              <th>Key</th>
+              <th>Order</th>
               <th>State</th>
               <th>Restaurant</th>
-              <th>Courier</th>
               <th>Updated</th>
             </tr>
           </thead>
@@ -1647,23 +1872,23 @@ function RecentOrdersPanel({ overview, onSelectOrder }) {
             {rows.length ? (
               rows.map((order) => (
                 <tr key={order.order_id}>
-                  <td title={order.order_id}>
+                  <td>
                     <a
                       className="text-button"
                       href={orderDetailPath(order.order_id)}
+                      title={order.idempotency_key}
                       onClick={(event) => onSelectOrder(order.order_id, event)}
                     >
-                      {order.idempotency_key}
+                      {shortKey(order.idempotency_key)}
                     </a>
                   </td>
-                  <td>{humanize(order.state)}</td>
+                  <td><StateBadge state={order.state} /></td>
                   <td>{order.restaurant_ref}</td>
-                  <td>{order.courier_ref ?? "None"}</td>
                   <td>{formatTime(order.updated_at)}</td>
                 </tr>
               ))
             ) : (
-              <EmptyRow colSpan={5}>No orders yet</EmptyRow>
+              <EmptyRow colSpan={4}>No orders yet</EmptyRow>
             )}
           </tbody>
         </table>
@@ -1699,10 +1924,10 @@ function RecentEventsPanel({ overview }) {
                   <td>{humanize(event.event_type)}</td>
                   <td>
                     {event.from_state || event.to_state
-                      ? `${humanize(event.from_state)} -> ${humanize(event.to_state)}`
-                      : "None"}
+                      ? `${humanize(event.from_state)} → ${humanize(event.to_state)}`
+                      : "—"}
                   </td>
-                  <td title={event.order_id}>{event.idempotency_key}</td>
+                  <td title={event.idempotency_key}>{shortKey(event.idempotency_key)}</td>
                   <td title={event.worker_id ?? ""}>{shortId(event.worker_id)}</td>
                   <td>{formatTime(event.occurred_at)}</td>
                 </tr>
