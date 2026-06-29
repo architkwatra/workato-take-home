@@ -25,6 +25,9 @@ services:
       SERVICE_NAME: api
       DATABASE_URL: postgresql://app:app@postgres:5432/orders
       DASHBOARD_CORS_ORIGINS: http://localhost:3000
+      # The API cannot inspect Compose's worker replica count at runtime.
+      # Keep this value in sync with worker.deploy.replicas below.
+      DASHBOARD_CONFIGURED_WORKER_COUNT: "3"
     ports:
       - "8080:8000"
     depends_on:
@@ -48,9 +51,18 @@ services:
     command: uvicorn downstream_sim.app:app --host 0.0.0.0 --port 8000
     environment:
       SERVICE_NAME: downstream-sim
+      RESTAURANT_CONFIRM_AFTER_SECONDS_MIN: "1"
+      RESTAURANT_CONFIRM_AFTER_SECONDS_MAX: "8"
+      RESTAURANT_CONFIRM_RETRY_AFTER_SECONDS: "1"
+      RESTAURANT_START_PREP_AFTER_SECONDS_MIN: "1"
+      RESTAURANT_START_PREP_AFTER_SECONDS_MAX: "8"
+      RESTAURANT_START_PREP_RETRY_AFTER_SECONDS: "1"
       RESTAURANT_READY_AFTER_SECONDS_MIN: "5"
       RESTAURANT_READY_AFTER_SECONDS_MAX: "30"
       RESTAURANT_READY_RETRY_AFTER_SECONDS: "2"
+      COURIER_ASSIGN_AFTER_SECONDS_MIN: "1"
+      COURIER_ASSIGN_AFTER_SECONDS_MAX: "10"
+      COURIER_ASSIGN_RETRY_AFTER_SECONDS: "1"
       COURIER_DELIVERED_AFTER_SECONDS_MIN: "10"
       COURIER_DELIVERED_AFTER_SECONDS_MAX: "60"
       COURIER_DELIVERED_RETRY_AFTER_SECONDS: "3"
@@ -119,7 +131,7 @@ services:
       downstream-sim:
         condition: service_healthy
     deploy:
-      replicas: 20
+      replicas: 3
 
   migrator:
     build:
@@ -138,6 +150,16 @@ services:
     environment:
       VITE_API_BASE_URL: http://localhost:8080
       VITE_LOADGEN_BASE_URL: http://localhost:8082
+      VITE_RESTAURANT_CONFIRM_AFTER_SECONDS_MIN: "1"
+      VITE_RESTAURANT_CONFIRM_AFTER_SECONDS_MAX: "8"
+      VITE_RESTAURANT_START_PREP_AFTER_SECONDS_MIN: "1"
+      VITE_RESTAURANT_START_PREP_AFTER_SECONDS_MAX: "8"
+      VITE_RESTAURANT_READY_AFTER_SECONDS_MIN: "5"
+      VITE_RESTAURANT_READY_AFTER_SECONDS_MAX: "30"
+      VITE_COURIER_ASSIGN_AFTER_SECONDS_MIN: "1"
+      VITE_COURIER_ASSIGN_AFTER_SECONDS_MAX: "10"
+      VITE_COURIER_DELIVERED_AFTER_SECONDS_MIN: "10"
+      VITE_COURIER_DELIVERED_AFTER_SECONDS_MAX: "60"
     ports:
       - "3000:3000"
     depends_on:

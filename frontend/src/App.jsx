@@ -15,6 +15,7 @@ const LOADGEN_BASE_URL = (
 // Polling keeps the dashboard operationally useful without adding websocket
 // infrastructure to this small local demo slice.
 const POLL_INTERVAL_MS = 3000;
+const ORDER_DETAIL_ROUTE_PREFIX = "/orders/";
 
 const ORDER_STATES = [
   "placed",
@@ -36,6 +37,34 @@ const PIPELINE_STATES = [
   "delivered",
 ];
 
+const PIPELINE_DELAY_WINDOWS = {
+  confirmed: {
+    label: "restaurant confirmation",
+    min: numberEnv("VITE_RESTAURANT_CONFIRM_AFTER_SECONDS_MIN", 1),
+    max: numberEnv("VITE_RESTAURANT_CONFIRM_AFTER_SECONDS_MAX", 8),
+  },
+  preparing: {
+    label: "restaurant start-prep",
+    min: numberEnv("VITE_RESTAURANT_START_PREP_AFTER_SECONDS_MIN", 1),
+    max: numberEnv("VITE_RESTAURANT_START_PREP_AFTER_SECONDS_MAX", 8),
+  },
+  ready: {
+    label: "restaurant ready",
+    min: numberEnv("VITE_RESTAURANT_READY_AFTER_SECONDS_MIN", 5),
+    max: numberEnv("VITE_RESTAURANT_READY_AFTER_SECONDS_MAX", 30),
+  },
+  out_for_delivery: {
+    label: "courier assignment",
+    min: numberEnv("VITE_COURIER_ASSIGN_AFTER_SECONDS_MIN", 1),
+    max: numberEnv("VITE_COURIER_ASSIGN_AFTER_SECONDS_MAX", 10),
+  },
+  delivered: {
+    label: "courier delivery",
+    min: numberEnv("VITE_COURIER_DELIVERED_AFTER_SECONDS_MIN", 10),
+    max: numberEnv("VITE_COURIER_DELIVERED_AFTER_SECONDS_MAX", 60),
+  },
+};
+
 const TASK_STATUSES = ["pending", "running", "completed", "failed", "cancelled"];
 
 const LABELS = {
@@ -46,11 +75,27 @@ const LABELS = {
   advance_state: "advance state",
 };
 
+const METRIC_HELP = {
+  orders: "Total order rows in the database, across every order state.",
+  delivered: "Orders whose current state is delivered.",
+  taskRate:
+    "Completed tasks in the last dashboard throughput window divided by that window size.",
+  taskIssues:
+    "Failed tasks plus running tasks whose worker lease has expired.",
+  workers:
+    "Workers with a heartbeat in the active window divided by the configured worker replica count.",
+};
+
 function humanize(value) {
   if (!value) {
     return "None";
   }
   return LABELS[value] ?? value.replaceAll("_", " ");
+}
+
+function numberEnv(name, fallback) {
+  const parsed = Number(import.meta.env[name]);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function numberText(value) {
@@ -83,19 +128,163 @@ function formatTime(value) {
   }).format(new Date(value));
 }
 
-function formatAge(seconds) {
-  if (seconds === null || seconds === undefined) {
-    return "Unknown";
+function formatTooltipTime(value) {
+  if (!value) {
+    return "None";
   }
 
-  const safeSeconds = Math.max(0, Number(seconds));
-  if (safeSeconds < 60) {
-    return `${safeSeconds}s`;
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    fractionalSecondDigits: 3,
+  }).format(new Date(value));
+}
+
+function millisecondsBetween(firstValue, secondValue) {
+  const firstTime = new Date(firstValue).getTime();
+  const secondTime = new Date(secondValue).getTime();
+  if (!Number.isFinite(firstTime) || !Number.isFinite(secondTime)) {
+    return null;
   }
-  if (safeSeconds < 3600) {
-    return `${Math.floor(safeSeconds / 60)}m ${safeSeconds % 60}s`;
+
+  return Math.abs(secondTime - firstTime);
+}
+
+function formatElapsedMilliseconds(milliseconds) {
+  if (milliseconds == null) {
+    return "Pending";
   }
-  return `${Math.floor(safeSeconds / 3600)}h ${Math.floor((safeSeconds % 3600) / 60)}m`;
+
+  if (milliseconds < 1000) {
+    return `${milliseconds}ms`;
+  }
+
+  return `${(milliseconds / 1000).toFixed(3).replace(/\.?0+$/, "")}s`;
+}
+
+function formatDuration(seconds) {
+  if (seconds == null) {
+    return "Pending";
+  }
+
+  if (seconds < 60) {
+    return `${seconds}s`;
+  }
+
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  if (minutes < 60) {
+    return remainingSeconds ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
+  }
+
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
+}
+
+function delayWindowText(delayWindow) {
+  if (!delayWindow) {
+    return "No downstream simulator delay window for this initial state.";
+  }
+
+  if (delayWindow.min === delayWindow.max) {
+    return `${delayWindow.label} simulator delay: ${formatDuration(
+      delayWindow.min,
+    )}.`;
+  }
+
+  return `${delayWindow.label} simulator delay window: ${formatDuration(
+    delayWindow.min,
+  )}-${formatDuration(delayWindow.max)}.`;
+}
+
+function pipelineDeltaTooltip({
+  state,
+  reachedAt,
+  previousState,
+  previousReachedAt,
+  deltaMilliseconds,
+  delayWindow,
+}) {
+  const windowText = delayWindowText(delayWindow);
+  if (!reachedAt) {
+    return `${humanize(state)} is pending. ${windowText} The exact per-order delay is deterministic and this order has not reached the stage yet.`;
+  }
+
+  if (!previousState || !previousReachedAt) {
+    return `${humanize(state)} was created at ${formatTooltipTime(reachedAt)}. This is the initial local state, not a downstream transition.`;
+  }
+
+  return [
+    `${humanize(state)} uses this order's events.`,
+    windowText,
+    `Started from ${humanize(previousState)} at ${formatTooltipTime(previousReachedAt)}.`,
+    `Reached ${humanize(state)} at ${formatTooltipTime(reachedAt)}.`,
+    `Observed elapsed: ${formatElapsedMilliseconds(deltaMilliseconds)}.`,
+  ].join(" ");
+}
+
+function orderIdFromPath(pathname) {
+  if (!pathname.startsWith(ORDER_DETAIL_ROUTE_PREFIX)) {
+    return null;
+  }
+
+  const encodedOrderId = pathname.slice(ORDER_DETAIL_ROUTE_PREFIX.length);
+  if (!encodedOrderId || encodedOrderId.includes("/")) {
+    return null;
+  }
+
+  return decodeURIComponent(encodedOrderId);
+}
+
+function selectedOrderIdFromLocation() {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  return orderIdFromPath(window.location.pathname);
+}
+
+function orderDetailPath(orderId) {
+  return `${ORDER_DETAIL_ROUTE_PREFIX}${encodeURIComponent(orderId)}`;
+}
+
+function pushRoute(path) {
+  // This dashboard has one lightweight detail route, so native history keeps the
+  // URL shareable without adding a routing dependency for this small page split.
+  if (typeof window === "undefined" || window.location.pathname === path) {
+    return;
+  }
+
+  window.history.pushState({}, "", path);
+}
+
+function connectionLabelFor(status, hasPayload) {
+  if (status === "online" || status === "refreshing") {
+    return "Live";
+  }
+
+  if (status === "offline") {
+    return hasPayload ? "Stale" : "Offline";
+  }
+
+  return "Loading";
+}
+
+function shouldUseNativeLinkNavigation(event) {
+  // Real links preserve expected browser behavior: Command-click, Ctrl-click,
+  // Shift-click, and middle-click can open the order page in a new tab/window.
+  return (
+    event.defaultPrevented ||
+    event.button !== 0 ||
+    event.metaKey ||
+    event.ctrlKey ||
+    event.shiftKey ||
+    event.altKey
+  );
 }
 
 async function requestDashboard(path, { signal } = {}) {
@@ -126,16 +315,24 @@ async function requestLoadgen(path, { method = "GET", body, signal } = {}) {
   return response.json();
 }
 
-function StatusBadge({ active, children }) {
-  return <span className={`status-badge ${active ? "active" : "stale"}`}>{children}</span>;
-}
-
-function Metric({ label, value, detail, tone = "neutral" }) {
+function Metric({ label, value, detail, helpText, tone = "neutral" }) {
   return (
     <section className={`metric ${tone}`}>
-      <p>{label}</p>
+      <p className="metric-label">
+        <span>{label}</span>
+        {helpText ? (
+          <span
+            aria-label={helpText}
+            className="metric-help"
+            data-tooltip={helpText}
+            tabIndex="0"
+          >
+            i
+          </span>
+        ) : null}
+      </p>
       <strong>{value}</strong>
-      {detail ? <span>{detail}</span> : null}
+      {detail ? <span className="metric-detail">{detail}</span> : null}
     </section>
   );
 }
@@ -155,7 +352,7 @@ function App() {
   const [status, setStatus] = useState("loading");
   const [error, setError] = useState("");
   const [lastRefreshAt, setLastRefreshAt] = useState(null);
-  const [selectedOrderId, setSelectedOrderId] = useState(null);
+  const [selectedOrderId, setSelectedOrderId] = useState(selectedOrderIdFromLocation);
   const [orderDetail, setOrderDetail] = useState(null);
   const [orderDetailStatus, setOrderDetailStatus] = useState("idle");
   const [orderDetailError, setOrderDetailError] = useState("");
@@ -172,6 +369,18 @@ function App() {
     restaurantRef: "dashboard-manual",
     customerRefPrefix: "dashboard-customer",
   });
+
+  useEffect(() => {
+    function handlePopState() {
+      setSelectedOrderId(selectedOrderIdFromLocation());
+    }
+
+    window.addEventListener("popstate", handlePopState);
+
+    return () => {
+      window.removeEventListener("popstate", handlePopState);
+    };
+  }, []);
 
   useEffect(() => {
     let stopped = false;
@@ -240,9 +449,12 @@ function App() {
       );
 
       try {
-        const payload = await requestDashboard(`/dashboard/orders/${selectedOrderId}`, {
-          signal: controller.signal,
-        });
+        const payload = await requestDashboard(
+          `/dashboard/orders/${encodeURIComponent(selectedOrderId)}`,
+          {
+            signal: controller.signal,
+          },
+        );
         if (stopped) {
           return;
         }
@@ -331,35 +543,47 @@ function App() {
       totalOrders: overview?.orders?.total ?? 0,
       deliveredOrders: orderCounts.delivered ?? 0,
       failedTasks: taskCounts.failed ?? 0,
-      duePending: overview?.tasks?.due_pending ?? 0,
       expiredRunning: overview?.tasks?.expired_running ?? 0,
       tasksCompletedPerSecond:
         overview?.throughput?.tasks_completed_per_second ?? 0,
       tasksCompletedRecent: overview?.throughput?.tasks_completed ?? 0,
       throughputWindowSeconds: overview?.throughput?.window_seconds ?? 30,
       activeWorkers: overview?.workers?.active_count ?? 0,
-      seenWorkers: overview?.workers?.total_seen ?? 0,
+      configuredWorkers: overview?.workers?.configured_count ?? 0,
+      workerActiveThresholdSeconds: overview?.workers?.active_threshold_seconds ?? 30,
     };
   }, [overview]);
 
-  const connectionLabel =
-    status === "online" || status === "refreshing"
-      ? "Live"
-      : status === "offline"
-        ? overview
-          ? "Stale"
-          : "Offline"
-        : "Loading";
+  const pageStatus = selectedOrderId ? orderDetailStatus : status;
+  const pageLastRefreshAt = selectedOrderId
+    ? orderDetailLastRefreshAt
+    : lastRefreshAt;
+  const connectionLabel = connectionLabelFor(
+    pageStatus,
+    Boolean(selectedOrderId ? orderDetail : overview),
+  );
 
   function updateLoadgenForm(field, value) {
     setLoadgenForm((current) => ({ ...current, [field]: value }));
   }
 
-  function openOrderDetail(orderId) {
+  function openOrderDetail(orderId, event) {
+    if (event && shouldUseNativeLinkNavigation(event)) {
+      return;
+    }
+
+    event?.preventDefault();
+    pushRoute(orderDetailPath(orderId));
     setSelectedOrderId(orderId);
   }
 
-  function closeOrderDetail() {
+  function closeOrderDetail(event) {
+    if (event && shouldUseNativeLinkNavigation(event)) {
+      return;
+    }
+
+    event?.preventDefault();
+    pushRoute("/");
     setSelectedOrderId(null);
   }
 
@@ -435,17 +659,6 @@ function App() {
     );
   }
 
-  async function updateLoadgenRate() {
-    await runLoadgenAction("rate", () =>
-      requestLoadgen("/load/rate", {
-        method: "PATCH",
-        body: {
-          rate_per_second: readPositiveNumber(loadgenForm.ratePerSecond, "Rate"),
-        },
-      }),
-    );
-  }
-
   return (
     <main className="dashboard-shell">
       <header className="topbar">
@@ -454,10 +667,9 @@ function App() {
           <h1>Order Pipeline Dashboard</h1>
         </div>
         <div className="topbar-meta" aria-live="polite">
-          <span className={`connection ${status}`}>{connectionLabel}</span>
-          <span>Last refresh {lastRefreshAt ? formatTime(lastRefreshAt) : "pending"}</span>
+          <span className={`connection ${pageStatus}`}>{connectionLabel}</span>
           <span>
-            Workers {numberText(totals.activeWorkers)}/{numberText(totals.seenWorkers)}
+            Last refresh {pageLastRefreshAt ? formatTime(pageLastRefreshAt) : "pending"}
           </span>
         </div>
       </header>
@@ -472,25 +684,23 @@ function App() {
         <OrderDetailPage
           detail={orderDetail}
           error={orderDetailError}
-          lastRefreshAt={orderDetailLastRefreshAt}
           onBack={closeOrderDetail}
-          status={orderDetailStatus}
         />
       ) : (
         <>
           <section className="summary-grid" aria-label="Pipeline summary">
-            <Metric label="Orders" value={numberText(totals.totalOrders)} detail="total created" />
+            <Metric
+              label="Orders"
+              value={numberText(totals.totalOrders)}
+              detail="total created"
+              helpText={METRIC_HELP.orders}
+            />
             <Metric
               label="Delivered"
               value={numberText(totals.deliveredOrders)}
               detail="terminal success"
+              helpText={METRIC_HELP.delivered}
               tone="good"
-            />
-            <Metric
-              label="Due Work"
-              value={numberText(totals.duePending)}
-              detail="pending now"
-              tone={totals.duePending > 0 ? "watch" : "neutral"}
             />
             <Metric
               label="Task Rate"
@@ -498,13 +708,26 @@ function App() {
               detail={`${numberText(totals.tasksCompletedRecent)} in last ${
                 totals.throughputWindowSeconds
               }s`}
+              helpText={METRIC_HELP.taskRate}
               tone={totals.tasksCompletedPerSecond > 0 ? "good" : "neutral"}
             />
             <Metric
               label="Task Issues"
               value={numberText(totals.failedTasks + totals.expiredRunning)}
               detail="failed or expired"
+              helpText={METRIC_HELP.taskIssues}
               tone={totals.failedTasks + totals.expiredRunning > 0 ? "bad" : "neutral"}
+            />
+            <Metric
+              label="Workers"
+              value={`${numberText(totals.activeWorkers)}/${numberText(
+                totals.configuredWorkers,
+              )}`}
+              detail={`${numberText(totals.workerActiveThresholdSeconds)}s active window`}
+              helpText={METRIC_HELP.workers}
+              tone={
+                totals.activeWorkers >= totals.configuredWorkers ? "good" : "watch"
+              }
             />
           </section>
 
@@ -518,7 +741,6 @@ function App() {
             onChange={updateLoadgenForm}
             onStart={startLoadgen}
             onStop={stopLoadgen}
-            onUpdateRate={updateLoadgenRate}
             status={loadgenStatus}
           />
 
@@ -526,8 +748,6 @@ function App() {
             <LifecyclePanel overview={overview} />
             <RecentOrdersPanel overview={overview} onSelectOrder={openOrderDetail} />
           </div>
-
-          <WorkerPanel overview={overview} />
 
           <div className="content-grid wide">
             <ProblemTaskPanel overview={overview} />
@@ -541,27 +761,17 @@ function App() {
   );
 }
 
-function OrderDetailPage({ detail, error, lastRefreshAt, onBack, status }) {
+function OrderDetailPage({ detail, error, onBack }) {
   const order = detail?.order;
   const tasks = detail?.tasks ?? [];
   const events = detail?.events ?? [];
-  const statusLabel =
-    status === "online" || status === "refreshing"
-      ? "Live"
-      : status === "offline"
-        ? "Stale"
-        : "Loading";
 
   return (
     <section className="detail-page">
       <div className="detail-toolbar">
-        <button className="button" type="button" onClick={onBack}>
+        <a className="button" href="/" onClick={onBack}>
           Back to Dashboard
-        </button>
-        <div className="detail-toolbar-meta">
-          <span className={`connection ${status}`}>{statusLabel}</span>
-          <span>Updated {lastRefreshAt ? formatTime(lastRefreshAt) : "pending"}</span>
-        </div>
+        </a>
       </div>
 
       {error ? (
@@ -642,6 +852,31 @@ function PipelinePanel({ order, events }) {
       <div className="pipeline">
         {PIPELINE_STATES.map((state, index) => {
           const reachedAt = reachedAtByState.get(state);
+          const previousState = PIPELINE_STATES[index - 1];
+          const previousReachedAt = previousState
+            ? reachedAtByState.get(previousState)
+            : null;
+          const deltaMilliseconds =
+            reachedAt && previousReachedAt
+              ? millisecondsBetween(previousReachedAt, reachedAt)
+              : null;
+          const delayWindow = PIPELINE_DELAY_WINDOWS[state] ?? null;
+          const deltaText =
+            index === 0
+              ? reachedAt
+                ? "Created"
+                : "Pending"
+              : deltaMilliseconds == null
+                ? "Pending"
+                : `Elapsed ${formatElapsedMilliseconds(deltaMilliseconds)}`;
+          const tooltipText = pipelineDeltaTooltip({
+            state,
+            reachedAt,
+            previousState,
+            previousReachedAt,
+            deltaMilliseconds,
+            delayWindow,
+          });
           const stageStatus =
             currentIndex === -1
               ? reachedAt
@@ -653,11 +888,19 @@ function PipelinePanel({ order, events }) {
                   ? "current"
                   : "waiting";
           return (
-            <div className={`pipeline-step ${stageStatus}`} key={state}>
+            <div
+              aria-label={tooltipText}
+              className={`pipeline-step ${stageStatus}`}
+              data-tooltip={tooltipText}
+              key={state}
+              tabIndex="0"
+              title={tooltipText}
+            >
               <span className="pipeline-dot" />
               <div>
                 <strong>{humanize(state)}</strong>
                 <small>{reachedAt ? formatTime(reachedAt) : "Pending"}</small>
+                <span className="pipeline-delta">{deltaText}</span>
               </div>
             </div>
           );
@@ -766,7 +1009,6 @@ function LoadgenControlPanel({
   onChange,
   onStart,
   onStop,
-  onUpdateRate,
   status,
 }) {
   const running = Boolean(status?.running);
@@ -842,14 +1084,6 @@ function LoadgenControlPanel({
               onClick={onStop}
             >
               {actionPending === "stop" ? "Stopping" : "Stop"}
-            </button>
-            <button
-              className="button"
-              disabled={disabled || !running}
-              type="button"
-              onClick={onUpdateRate}
-            >
-              {actionPending === "rate" ? "Updating" : "Update Rate"}
             </button>
           </div>
 
@@ -958,51 +1192,6 @@ function TaskHealthPanel({ overview }) {
   );
 }
 
-function WorkerPanel({ overview }) {
-  const rows = overview?.workers?.rows ?? [];
-
-  return (
-    <section className="section">
-      <div className="section-heading">
-        <h2>Worker Heartbeats</h2>
-        <span>{numberText(overview?.workers?.active_threshold_seconds ?? 30)}s active window</span>
-      </div>
-      <div className="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Worker</th>
-              <th>Host</th>
-              <th>Last Seen</th>
-              <th>Started</th>
-              <th>Status</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.length ? (
-              rows.map((worker) => (
-                <tr key={worker.worker_id}>
-                  <td title={worker.worker_id}>{shortId(worker.worker_id)}</td>
-                  <td>{worker.hostname ?? "Unknown"}</td>
-                  <td>{formatAge(worker.last_seen_seconds_ago)}</td>
-                  <td>{formatTime(worker.started_at)}</td>
-                  <td>
-                    <StatusBadge active={worker.active}>
-                      {worker.active ? "Active" : "Stale"}
-                    </StatusBadge>
-                  </td>
-                </tr>
-              ))
-            ) : (
-              <EmptyRow colSpan={5}>No worker heartbeats yet</EmptyRow>
-            )}
-          </tbody>
-        </table>
-      </div>
-    </section>
-  );
-}
-
 function ProblemTaskPanel({ overview }) {
   const rows = overview?.problem_tasks ?? [];
 
@@ -1049,6 +1238,7 @@ function ProblemTaskPanel({ overview }) {
 }
 
 function RecentOrdersPanel({ overview, onSelectOrder }) {
+  const placedRows = overview?.placed_orders ?? [];
   const rows = overview?.recent_orders ?? [];
 
   return (
@@ -1056,6 +1246,29 @@ function RecentOrdersPanel({ overview, onSelectOrder }) {
       <div className="section-heading">
         <h2>Recent Orders</h2>
         <span>{numberText(rows.length)} shown</span>
+      </div>
+      <div className="placed-watch">
+        <div className="placed-watch-heading">
+          <span>Placed Orders</span>
+          <small>{numberText(placedRows.length)} of 5 shown</small>
+        </div>
+        {placedRows.length ? (
+          <div className="placed-watch-list">
+            {placedRows.map((order) => (
+              <a
+                className="placed-watch-item"
+                href={orderDetailPath(order.order_id)}
+                key={order.order_id}
+                onClick={(event) => onSelectOrder(order.order_id, event)}
+              >
+                <span title={order.order_id}>{order.idempotency_key}</span>
+                <small>{formatTime(order.created_at)}</small>
+              </a>
+            ))}
+          </div>
+        ) : (
+          <div className="placed-watch-empty">No placed orders waiting</div>
+        )}
       </div>
       <div className="table-wrap">
         <table>
@@ -1073,13 +1286,13 @@ function RecentOrdersPanel({ overview, onSelectOrder }) {
               rows.map((order) => (
                 <tr key={order.order_id}>
                   <td title={order.order_id}>
-                    <button
+                    <a
                       className="text-button"
-                      type="button"
-                      onClick={() => onSelectOrder(order.order_id)}
+                      href={orderDetailPath(order.order_id)}
+                      onClick={(event) => onSelectOrder(order.order_id, event)}
                     >
                       {order.idempotency_key}
-                    </button>
+                    </a>
                   </td>
                   <td>{humanize(order.state)}</td>
                   <td>{order.restaurant_ref}</td>

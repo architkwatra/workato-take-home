@@ -1,10 +1,11 @@
+import os
 from datetime import datetime, timezone
 from typing import Any
 
 from psycopg.rows import dict_row
 
 from common.db import open_db_connection
-from common.state_machine import ORDER_STATES
+from common.state_machine import ORDER_STATE_PLACED, ORDER_STATES
 from common.task_types import (
     ORDER_TASK_STATUSES,
     TASK_STATUS_COMPLETED,
@@ -15,17 +16,38 @@ from common.task_types import (
 
 
 ACTIVE_WORKER_THRESHOLD_SECONDS = 30
+DEFAULT_CONFIGURED_WORKER_COUNT = 3
 # The dashboard polls frequently, so row lists stay intentionally bounded while
 # aggregate counts continue to reflect the whole database.
 RECENT_ORDER_LIMIT = 12
 RECENT_EVENT_LIMIT = 20
 PROBLEM_TASK_LIMIT = 20
+PLACED_ORDER_LIMIT = 5
 ORDER_DETAIL_EVENT_LIMIT = 50
 ORDER_DETAIL_TASK_LIMIT = 50
 # Keep throughput derived from a short rolling window. This is intentionally
 # read-model-only for the local dashboard; durable metrics storage can come
 # later if we need historical charts.
 THROUGHPUT_WINDOW_SECONDS = 30
+
+
+def _configured_worker_count() -> int:
+    """Return the configured worker count displayed by the dashboard.
+
+    The API container cannot discover Docker Compose's worker replica count at
+    runtime, so local compose sets this explicitly next to the worker replica
+    setting. Invalid values fall back to the local-demo default.
+    """
+    raw_value = os.getenv(
+        "DASHBOARD_CONFIGURED_WORKER_COUNT",
+        str(DEFAULT_CONFIGURED_WORKER_COUNT),
+    )
+    try:
+        configured_count = int(raw_value)
+    except ValueError:
+        return DEFAULT_CONFIGURED_WORKER_COUNT
+
+    return configured_count if configured_count > 0 else DEFAULT_CONFIGURED_WORKER_COUNT
 
 
 def _count_map(
@@ -100,6 +122,7 @@ def get_dashboard_overview() -> dict[str, Any]:
 
             workers = _load_worker_overview(cur)
             problem_tasks = _load_problem_tasks(cur)
+            placed_orders = _load_placed_orders(cur)
             recent_orders = _load_recent_orders(cur)
             recent_events = _load_recent_events(cur)
 
@@ -125,6 +148,7 @@ def get_dashboard_overview() -> dict[str, Any]:
         },
         "workers": workers,
         "problem_tasks": problem_tasks,
+        "placed_orders": placed_orders,
         "recent_orders": recent_orders,
         "recent_events": recent_events,
     }
@@ -217,7 +241,7 @@ def get_dashboard_order_detail(*, order_id: str) -> dict[str, Any] | None:
 
 
 def _load_worker_overview(cur) -> dict[str, Any]:
-    """Load worker heartbeat status for the dashboard summary."""
+    """Load aggregate worker heartbeat status for the dashboard summary."""
     # Worker heartbeats run every 10 seconds. A 30 second active window allows a
     # small amount of scheduling jitter while still making stopped workers
     # visible quickly during local demos.
@@ -234,30 +258,11 @@ def _load_worker_overview(cur) -> dict[str, Any]:
     )
     counts = dict(cur.fetchone())
 
-    cur.execute(
-        """
-        select
-            worker_id,
-            hostname,
-            started_at,
-            last_seen_at,
-            greatest(
-                0,
-                floor(extract(epoch from (now() - last_seen_at)))::int
-            ) as last_seen_seconds_ago,
-            last_seen_at >= now() - (%s * interval '1 second') as active
-        from workers
-        order by last_seen_at desc
-        limit %s
-        """,
-        (ACTIVE_WORKER_THRESHOLD_SECONDS, 10),
-    )
-
     return {
         "active_count": counts["active_count"],
         "active_threshold_seconds": ACTIVE_WORKER_THRESHOLD_SECONDS,
+        "configured_count": _configured_worker_count(),
         "total_seen": counts["total_seen"],
-        "rows": [dict(row) for row in cur.fetchall()],
     }
 
 
@@ -346,6 +351,31 @@ def _load_recent_orders(cur) -> list[dict[str, Any]]:
         limit %s
         """,
         (RECENT_ORDER_LIMIT,),
+    )
+    return [dict(row) for row in cur.fetchall()]
+
+
+def _load_placed_orders(cur) -> list[dict[str, Any]]:
+    """Load the newest placed orders so operators can click one early."""
+    # This query intentionally orders by updated_at to use the existing
+    # ix_orders_state_updated_at index. Placed orders have not advanced yet, so
+    # updated_at is the timestamp that matters for this dashboard watch list.
+    cur.execute(
+        """
+        select
+            id::text as order_id,
+            idempotency_key,
+            state::text,
+            restaurant_ref,
+            courier_ref,
+            created_at,
+            updated_at
+        from orders
+        where state = %s::order_state
+        order by updated_at desc
+        limit %s
+        """,
+        (ORDER_STATE_PLACED, PLACED_ORDER_LIMIT),
     )
     return [dict(row) for row in cur.fetchall()]
 

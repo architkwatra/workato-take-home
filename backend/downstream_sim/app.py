@@ -8,17 +8,18 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(title="Downstream Simulator")
 
-# Demo prep duration used when neither a fixed restaurant delay nor a restaurant
-# delay range is configured. The simulator returns "ready" once now is past the
-# per-order ready_at timestamp.
+# Demo delays are deterministic per order and stage. The simulator responds
+# immediately with a "not yet" status until now is past source_started_at +
+# delay; it never sleeps inside an HTTP request.
+DEFAULT_RESTAURANT_CONFIRM_AFTER_SECONDS = 3.0
+DEFAULT_RESTAURANT_CONFIRM_RETRY_AFTER_SECONDS = 1.0
+DEFAULT_RESTAURANT_START_PREP_AFTER_SECONDS = 3.0
+DEFAULT_RESTAURANT_START_PREP_RETRY_AFTER_SECONDS = 1.0
 DEFAULT_RESTAURANT_READY_AFTER_SECONDS = 6.0
-# Poll hint used when RESTAURANT_READY_RETRY_AFTER_SECONDS is not set. Workers
-# cap this by the task deadline before scheduling the next check_ready attempt.
 DEFAULT_RESTAURANT_READY_RETRY_AFTER_SECONDS = 2.0
-# Courier delivery duration used when neither a fixed courier delay nor a
-# courier delay range is configured.
+DEFAULT_COURIER_ASSIGN_AFTER_SECONDS = 3.0
+DEFAULT_COURIER_ASSIGN_RETRY_AFTER_SECONDS = 1.0
 DEFAULT_COURIER_DELIVERED_AFTER_SECONDS = 8.0
-# Poll hint returned with "in_transit". Workers cap this by the task deadline.
 DEFAULT_COURIER_DELIVERED_RETRY_AFTER_SECONDS = 3.0
 
 
@@ -27,12 +28,14 @@ class RestaurantConfirmRequest(BaseModel):
 
     order_id: str = Field(min_length=1)
     restaurant_ref: str = Field(min_length=1)
+    placed_at: datetime
 
 
 class RestaurantConfirmResponse(BaseModel):
     """Deterministic restaurant confirmation response."""
 
     status: str
+    retry_after_seconds: float | None = None
 
 
 class RestaurantStartPrepRequest(BaseModel):
@@ -40,12 +43,14 @@ class RestaurantStartPrepRequest(BaseModel):
 
     order_id: str = Field(min_length=1)
     restaurant_ref: str = Field(min_length=1)
+    confirmed_at: datetime
 
 
 class RestaurantStartPrepResponse(BaseModel):
     """Deterministic restaurant start-prep response."""
 
     status: str
+    retry_after_seconds: float | None = None
 
 
 class RestaurantCheckReadyRequest(BaseModel):
@@ -68,13 +73,15 @@ class CourierAssignRequest(BaseModel):
 
     order_id: str = Field(min_length=1)
     restaurant_ref: str = Field(min_length=1)
+    ready_at: datetime
 
 
 class CourierAssignResponse(BaseModel):
     """Deterministic courier assignment response."""
 
     status: str
-    courier_ref: str
+    courier_ref: str | None = None
+    retry_after_seconds: float | None = None
 
 
 class CourierCheckDeliveryRequest(BaseModel):
@@ -172,6 +179,44 @@ def _deterministic_delay_seconds(
     )
 
 
+def _delayed_status_response(
+    *,
+    order_id: str,
+    source_started_at: datetime,
+    salt: str,
+    min_env_name: str,
+    max_env_name: str,
+    fixed_env_name: str,
+    default_delay_seconds: float,
+    retry_after_env_name: str,
+    default_retry_after_seconds: float,
+    ready_status: str,
+    pending_status: str,
+) -> dict[str, float | str]:
+    """Return success after the deterministic per-order delay has elapsed."""
+    delay_seconds = _deterministic_delay_seconds(
+        order_id=order_id,
+        salt=salt,
+        min_env_name=min_env_name,
+        max_env_name=max_env_name,
+        fixed_env_name=fixed_env_name,
+        default=default_delay_seconds,
+    )
+    retry_after_seconds = _read_positive_float_env(
+        retry_after_env_name,
+        default_retry_after_seconds,
+    )
+
+    ready_at = _utc_datetime(source_started_at) + timedelta(seconds=delay_seconds)
+    if datetime.now(timezone.utc) >= ready_at:
+        return {"status": ready_status}
+
+    return {
+        "status": pending_status,
+        "retry_after_seconds": retry_after_seconds,
+    }
+
+
 def _utc_datetime(value: datetime) -> datetime:
     """Normalize incoming timestamps so readiness math is timezone-safe."""
     if value.tzinfo is None:
@@ -204,27 +249,50 @@ async def root() -> dict[str, str]:
 @app.post("/restaurant/confirm", response_model=RestaurantConfirmResponse)
 async def confirm_restaurant_order(
     request: RestaurantConfirmRequest,
-) -> dict[str, str]:
+) -> dict[str, float | str]:
     """Confirm that a restaurant accepted an order.
 
-    This first simulator slice is deterministic and side-effect-free. Repeated
-    requests for the same order return the same response until durable
-    downstream idempotency is added in a later slice.
+    Real restaurants may not acknowledge immediately. The simulator models that
+    as quick "not_confirmed" responses until this order's deterministic delay
+    from placed_at has elapsed.
     """
-    return {"status": "confirmed"}
+    return _delayed_status_response(
+        order_id=request.order_id,
+        source_started_at=request.placed_at,
+        salt="restaurant-confirm",
+        min_env_name="RESTAURANT_CONFIRM_AFTER_SECONDS_MIN",
+        max_env_name="RESTAURANT_CONFIRM_AFTER_SECONDS_MAX",
+        fixed_env_name="RESTAURANT_CONFIRM_AFTER_SECONDS",
+        default_delay_seconds=DEFAULT_RESTAURANT_CONFIRM_AFTER_SECONDS,
+        retry_after_env_name="RESTAURANT_CONFIRM_RETRY_AFTER_SECONDS",
+        default_retry_after_seconds=DEFAULT_RESTAURANT_CONFIRM_RETRY_AFTER_SECONDS,
+        ready_status="confirmed",
+        pending_status="not_confirmed",
+    )
 
 
 @app.post("/restaurant/start-prep", response_model=RestaurantStartPrepResponse)
 async def start_restaurant_prep(
     request: RestaurantStartPrepRequest,
-) -> dict[str, str]:
+) -> dict[str, float | str]:
     """Start restaurant preparation for an order.
 
-    Like confirmation, this is a deterministic command endpoint for the current
-    demo slice. Repeated requests for the same order return the same response;
-    durable idempotency records remain a later step.
+    Starting prep is also delayed to make every lifecycle hop visible in the
+    dashboard without blocking a worker thread or DB transaction.
     """
-    return {"status": "preparing"}
+    return _delayed_status_response(
+        order_id=request.order_id,
+        source_started_at=request.confirmed_at,
+        salt="restaurant-start-prep",
+        min_env_name="RESTAURANT_START_PREP_AFTER_SECONDS_MIN",
+        max_env_name="RESTAURANT_START_PREP_AFTER_SECONDS_MAX",
+        fixed_env_name="RESTAURANT_START_PREP_AFTER_SECONDS",
+        default_delay_seconds=DEFAULT_RESTAURANT_START_PREP_AFTER_SECONDS,
+        retry_after_env_name="RESTAURANT_START_PREP_RETRY_AFTER_SECONDS",
+        default_retry_after_seconds=DEFAULT_RESTAURANT_START_PREP_RETRY_AFTER_SECONDS,
+        ready_status="preparing",
+        pending_status="not_preparing",
+    )
 
 
 @app.post("/restaurant/check-ready", response_model=RestaurantCheckReadyResponse)
@@ -232,38 +300,45 @@ async def check_restaurant_ready(
     request: RestaurantCheckReadyRequest,
 ) -> dict[str, float | str]:
     """Return whether enough deterministic prep time has elapsed for an order."""
-    ready_after_seconds = _deterministic_delay_seconds(
+    return _delayed_status_response(
         order_id=request.order_id,
+        source_started_at=request.prep_started_at,
         salt="restaurant-ready",
         min_env_name="RESTAURANT_READY_AFTER_SECONDS_MIN",
         max_env_name="RESTAURANT_READY_AFTER_SECONDS_MAX",
         fixed_env_name="RESTAURANT_READY_AFTER_SECONDS",
-        default=DEFAULT_RESTAURANT_READY_AFTER_SECONDS,
+        default_delay_seconds=DEFAULT_RESTAURANT_READY_AFTER_SECONDS,
+        retry_after_env_name="RESTAURANT_READY_RETRY_AFTER_SECONDS",
+        default_retry_after_seconds=DEFAULT_RESTAURANT_READY_RETRY_AFTER_SECONDS,
+        ready_status="ready",
+        pending_status="not_ready",
     )
-    retry_after_seconds = _read_positive_float_env(
-        "RESTAURANT_READY_RETRY_AFTER_SECONDS",
-        DEFAULT_RESTAURANT_READY_RETRY_AFTER_SECONDS,
-    )
-
-    prep_started_at = _utc_datetime(request.prep_started_at)
-    ready_at = prep_started_at + timedelta(seconds=ready_after_seconds)
-    if datetime.now(timezone.utc) >= ready_at:
-        return {"status": "ready"}
-
-    return {
-        "status": "not_ready",
-        "retry_after_seconds": retry_after_seconds,
-    }
 
 
 @app.post("/courier/assign", response_model=CourierAssignResponse)
-async def assign_courier(request: CourierAssignRequest) -> dict[str, str]:
+async def assign_courier(request: CourierAssignRequest) -> dict[str, float | str]:
     """Assign a deterministic courier ref to an order.
 
     The ref is derived from order_id so repeated calls for the same order always
     return the same courier. No persistence is needed; the worker writes the ref
     to orders.courier_ref in the finalization transaction.
     """
+    delay_response = _delayed_status_response(
+        order_id=request.order_id,
+        source_started_at=request.ready_at,
+        salt="courier-assign",
+        min_env_name="COURIER_ASSIGN_AFTER_SECONDS_MIN",
+        max_env_name="COURIER_ASSIGN_AFTER_SECONDS_MAX",
+        fixed_env_name="COURIER_ASSIGN_AFTER_SECONDS",
+        default_delay_seconds=DEFAULT_COURIER_ASSIGN_AFTER_SECONDS,
+        retry_after_env_name="COURIER_ASSIGN_RETRY_AFTER_SECONDS",
+        default_retry_after_seconds=DEFAULT_COURIER_ASSIGN_RETRY_AFTER_SECONDS,
+        ready_status="assigned",
+        pending_status="not_assigned",
+    )
+    if delay_response["status"] != "assigned":
+        return delay_response
+
     digest = hashlib.md5(
         request.order_id.encode(),
         usedforsecurity=False,
@@ -277,25 +352,16 @@ async def check_courier_delivery(
     request: CourierCheckDeliveryRequest,
 ) -> dict[str, float | str]:
     """Return whether enough deterministic delivery time has elapsed for an order."""
-    delivered_after_seconds = _deterministic_delay_seconds(
+    return _delayed_status_response(
         order_id=request.order_id,
+        source_started_at=request.dispatched_at,
         salt="courier-delivery",
         min_env_name="COURIER_DELIVERED_AFTER_SECONDS_MIN",
         max_env_name="COURIER_DELIVERED_AFTER_SECONDS_MAX",
         fixed_env_name="COURIER_DELIVERED_AFTER_SECONDS",
-        default=DEFAULT_COURIER_DELIVERED_AFTER_SECONDS,
+        default_delay_seconds=DEFAULT_COURIER_DELIVERED_AFTER_SECONDS,
+        retry_after_env_name="COURIER_DELIVERED_RETRY_AFTER_SECONDS",
+        default_retry_after_seconds=DEFAULT_COURIER_DELIVERED_RETRY_AFTER_SECONDS,
+        ready_status="delivered",
+        pending_status="in_transit",
     )
-    retry_after_seconds = _read_positive_float_env(
-        "COURIER_DELIVERED_RETRY_AFTER_SECONDS",
-        DEFAULT_COURIER_DELIVERED_RETRY_AFTER_SECONDS,
-    )
-
-    dispatched_at = _utc_datetime(request.dispatched_at)
-    delivered_at = dispatched_at + timedelta(seconds=delivered_after_seconds)
-    if datetime.now(timezone.utc) >= delivered_at:
-        return {"status": "delivered"}
-
-    return {
-        "status": "in_transit",
-        "retry_after_seconds": retry_after_seconds,
-    }
