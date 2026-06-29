@@ -15,6 +15,11 @@ const LOADGEN_BASE_URL = (
 // Polling keeps the dashboard operationally useful without adding websocket
 // infrastructure to this small local demo slice.
 const POLL_INTERVAL_MS = 3000;
+// The simulator controls the minimum/maximum stage delay, but workers only
+// observe readiness by polling and then committing an event. Allow a small
+// scheduling buffer before marking a reached stage as outside the expected
+// window, otherwise normal poll timing can look like a failed delay check.
+const PIPELINE_VERIFICATION_TOLERANCE_SECONDS = 3;
 const ORDER_DETAIL_ROUTE_PREFIX = "/orders/";
 
 const ORDER_STATES = [
@@ -36,6 +41,34 @@ const PIPELINE_STATES = [
   "out_for_delivery",
   "delivered",
 ];
+
+const PIPELINE_DELAY_WINDOWS = {
+  confirmed: {
+    label: "restaurant confirmation",
+    min: numberEnv("VITE_RESTAURANT_CONFIRM_AFTER_SECONDS_MIN", 1),
+    max: numberEnv("VITE_RESTAURANT_CONFIRM_AFTER_SECONDS_MAX", 8),
+  },
+  preparing: {
+    label: "restaurant start-prep",
+    min: numberEnv("VITE_RESTAURANT_START_PREP_AFTER_SECONDS_MIN", 1),
+    max: numberEnv("VITE_RESTAURANT_START_PREP_AFTER_SECONDS_MAX", 8),
+  },
+  ready: {
+    label: "restaurant ready",
+    min: numberEnv("VITE_RESTAURANT_READY_AFTER_SECONDS_MIN", 5),
+    max: numberEnv("VITE_RESTAURANT_READY_AFTER_SECONDS_MAX", 30),
+  },
+  out_for_delivery: {
+    label: "courier assignment",
+    min: numberEnv("VITE_COURIER_ASSIGN_AFTER_SECONDS_MIN", 1),
+    max: numberEnv("VITE_COURIER_ASSIGN_AFTER_SECONDS_MAX", 10),
+  },
+  delivered: {
+    label: "courier delivery",
+    min: numberEnv("VITE_COURIER_DELIVERED_AFTER_SECONDS_MIN", 10),
+    max: numberEnv("VITE_COURIER_DELIVERED_AFTER_SECONDS_MAX", 60),
+  },
+};
 
 const TASK_STATUSES = ["pending", "running", "completed", "failed", "cancelled"];
 
@@ -63,6 +96,11 @@ function humanize(value) {
     return "None";
   }
   return LABELS[value] ?? value.replaceAll("_", " ");
+}
+
+function numberEnv(name, fallback) {
+  const parsed = Number(import.meta.env[name]);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function numberText(value) {
@@ -95,6 +133,71 @@ function formatTime(value) {
   }).format(new Date(value));
 }
 
+function millisecondsBetween(firstValue, secondValue) {
+  const firstTime = new Date(firstValue).getTime();
+  const secondTime = new Date(secondValue).getTime();
+  if (!Number.isFinite(firstTime) || !Number.isFinite(secondTime)) {
+    return null;
+  }
+
+  return Math.abs(secondTime - firstTime);
+}
+
+function formatDelaySeconds(seconds) {
+  if (seconds == null) {
+    return "Pending";
+  }
+
+  return `${seconds}s`;
+}
+
+function delayWindowText(delayWindow) {
+  if (!delayWindow) {
+    return "No downstream delay.";
+  }
+
+  // These are the simulator's configured per-stage delay bounds, not the
+  // observed timestamps from this order's event history.
+  return `Min: ${formatDelaySeconds(delayWindow.min)}. Max: ${formatDelaySeconds(
+    delayWindow.max,
+  )}.`;
+}
+
+function pipelineVerification({ reachedAt, previousReachedAt, deltaMilliseconds, delayWindow }) {
+  if (!reachedAt) {
+    return {
+      label: "Pending",
+      status: "pending",
+    };
+  }
+
+  if (!delayWindow || !previousReachedAt || deltaMilliseconds == null) {
+    return {
+      label: "Created",
+      status: "neutral",
+    };
+  }
+
+  const elapsedSeconds = deltaMilliseconds / 1000;
+  const minSeconds = delayWindow.min;
+  const maxSeconds = delayWindow.max + PIPELINE_VERIFICATION_TOLERANCE_SECONDS;
+  const verified = elapsedSeconds >= minSeconds && elapsedSeconds <= maxSeconds;
+
+  return verified
+    ? {
+        label: "Verified",
+        status: "verified",
+      }
+    : {
+        label: "Not verified",
+        status: "unverified",
+      };
+}
+
+function pipelineDeltaTooltip({ delayWindow }) {
+  return delayWindowText(delayWindow);
+}
+
 function orderIdFromPath(pathname) {
   if (!pathname.startsWith(ORDER_DETAIL_ROUTE_PREFIX)) {
     return null;
@@ -116,6 +219,10 @@ function selectedOrderIdFromLocation() {
   return orderIdFromPath(window.location.pathname);
 }
 
+function orderDetailPath(orderId) {
+  return `${ORDER_DETAIL_ROUTE_PREFIX}${encodeURIComponent(orderId)}`;
+}
+
 function pushRoute(path) {
   // This dashboard has one lightweight detail route, so native history keeps the
   // URL shareable without adding a routing dependency for this small page split.
@@ -124,6 +231,31 @@ function pushRoute(path) {
   }
 
   window.history.pushState({}, "", path);
+}
+
+function connectionLabelFor(status, hasPayload) {
+  if (status === "online" || status === "refreshing") {
+    return "Live";
+  }
+
+  if (status === "offline") {
+    return hasPayload ? "Stale" : "Offline";
+  }
+
+  return "Loading";
+}
+
+function shouldUseNativeLinkNavigation(event) {
+  // Real links preserve expected browser behavior: Command-click, Ctrl-click,
+  // Shift-click, and middle-click can open the order page in a new tab/window.
+  return (
+    event.defaultPrevented ||
+    event.button !== 0 ||
+    event.metaKey ||
+    event.ctrlKey ||
+    event.shiftKey ||
+    event.altKey
+  );
 }
 
 async function requestDashboard(path, { signal } = {}) {
@@ -393,25 +525,35 @@ function App() {
     };
   }, [overview]);
 
-  const connectionLabel =
-    status === "online" || status === "refreshing"
-      ? "Live"
-      : status === "offline"
-        ? overview
-          ? "Stale"
-          : "Offline"
-        : "Loading";
+  const pageStatus = selectedOrderId ? orderDetailStatus : status;
+  const pageLastRefreshAt = selectedOrderId
+    ? orderDetailLastRefreshAt
+    : lastRefreshAt;
+  const connectionLabel = connectionLabelFor(
+    pageStatus,
+    Boolean(selectedOrderId ? orderDetail : overview),
+  );
 
   function updateLoadgenForm(field, value) {
     setLoadgenForm((current) => ({ ...current, [field]: value }));
   }
 
-  function openOrderDetail(orderId) {
-    pushRoute(`${ORDER_DETAIL_ROUTE_PREFIX}${encodeURIComponent(orderId)}`);
+  function openOrderDetail(orderId, event) {
+    if (event && shouldUseNativeLinkNavigation(event)) {
+      return;
+    }
+
+    event?.preventDefault();
+    pushRoute(orderDetailPath(orderId));
     setSelectedOrderId(orderId);
   }
 
-  function closeOrderDetail() {
+  function closeOrderDetail(event) {
+    if (event && shouldUseNativeLinkNavigation(event)) {
+      return;
+    }
+
+    event?.preventDefault();
     pushRoute("/");
     setSelectedOrderId(null);
   }
@@ -488,17 +630,6 @@ function App() {
     );
   }
 
-  async function updateLoadgenRate() {
-    await runLoadgenAction("rate", () =>
-      requestLoadgen("/load/rate", {
-        method: "PATCH",
-        body: {
-          rate_per_second: readPositiveNumber(loadgenForm.ratePerSecond, "Rate"),
-        },
-      }),
-    );
-  }
-
   return (
     <main className="dashboard-shell">
       <header className="topbar">
@@ -507,8 +638,10 @@ function App() {
           <h1>Order Pipeline Dashboard</h1>
         </div>
         <div className="topbar-meta" aria-live="polite">
-          <span className={`connection ${status}`}>{connectionLabel}</span>
-          <span>Last refresh {lastRefreshAt ? formatTime(lastRefreshAt) : "pending"}</span>
+          <span className={`connection ${pageStatus}`}>{connectionLabel}</span>
+          <span>
+            Last refresh {pageLastRefreshAt ? formatTime(pageLastRefreshAt) : "pending"}
+          </span>
         </div>
       </header>
 
@@ -522,9 +655,7 @@ function App() {
         <OrderDetailPage
           detail={orderDetail}
           error={orderDetailError}
-          lastRefreshAt={orderDetailLastRefreshAt}
           onBack={closeOrderDetail}
-          status={orderDetailStatus}
         />
       ) : (
         <>
@@ -581,7 +712,6 @@ function App() {
             onChange={updateLoadgenForm}
             onStart={startLoadgen}
             onStop={stopLoadgen}
-            onUpdateRate={updateLoadgenRate}
             status={loadgenStatus}
           />
 
@@ -602,27 +732,17 @@ function App() {
   );
 }
 
-function OrderDetailPage({ detail, error, lastRefreshAt, onBack, status }) {
+function OrderDetailPage({ detail, error, onBack }) {
   const order = detail?.order;
   const tasks = detail?.tasks ?? [];
   const events = detail?.events ?? [];
-  const statusLabel =
-    status === "online" || status === "refreshing"
-      ? "Live"
-      : status === "offline"
-        ? "Stale"
-        : "Loading";
 
   return (
     <section className="detail-page">
       <div className="detail-toolbar">
-        <button className="button" type="button" onClick={onBack}>
+        <a className="button" href="/" onClick={onBack}>
           Back to Dashboard
-        </button>
-        <div className="detail-toolbar-meta">
-          <span className={`connection ${status}`}>{statusLabel}</span>
-          <span>Updated {lastRefreshAt ? formatTime(lastRefreshAt) : "pending"}</span>
-        </div>
+        </a>
       </div>
 
       {error ? (
@@ -703,6 +823,22 @@ function PipelinePanel({ order, events }) {
       <div className="pipeline">
         {PIPELINE_STATES.map((state, index) => {
           const reachedAt = reachedAtByState.get(state);
+          const previousState = PIPELINE_STATES[index - 1];
+          const previousReachedAt = previousState
+            ? reachedAtByState.get(previousState)
+            : null;
+          const deltaMilliseconds =
+            reachedAt && previousReachedAt
+              ? millisecondsBetween(previousReachedAt, reachedAt)
+              : null;
+          const delayWindow = PIPELINE_DELAY_WINDOWS[state] ?? null;
+          const verification = pipelineVerification({
+            reachedAt,
+            previousReachedAt,
+            deltaMilliseconds,
+            delayWindow,
+          });
+          const tooltipText = pipelineDeltaTooltip({ delayWindow });
           const stageStatus =
             currentIndex === -1
               ? reachedAt
@@ -714,11 +850,21 @@ function PipelinePanel({ order, events }) {
                   ? "current"
                   : "waiting";
           return (
-            <div className={`pipeline-step ${stageStatus}`} key={state}>
+            <div
+              aria-label={tooltipText}
+              className={`pipeline-step ${stageStatus}`}
+              data-tooltip={tooltipText}
+              key={state}
+              tabIndex="0"
+              title={tooltipText}
+            >
               <span className="pipeline-dot" />
               <div>
                 <strong>{humanize(state)}</strong>
                 <small>{reachedAt ? formatTime(reachedAt) : "Pending"}</small>
+                <span className={`pipeline-verification ${verification.status}`}>
+                  {verification.label}
+                </span>
               </div>
             </div>
           );
@@ -827,7 +973,6 @@ function LoadgenControlPanel({
   onChange,
   onStart,
   onStop,
-  onUpdateRate,
   status,
 }) {
   const running = Boolean(status?.running);
@@ -903,14 +1048,6 @@ function LoadgenControlPanel({
               onClick={onStop}
             >
               {actionPending === "stop" ? "Stopping" : "Stop"}
-            </button>
-            <button
-              className="button"
-              disabled={disabled || !running}
-              type="button"
-              onClick={onUpdateRate}
-            >
-              {actionPending === "rate" ? "Updating" : "Update Rate"}
             </button>
           </div>
 
@@ -1082,15 +1219,15 @@ function RecentOrdersPanel({ overview, onSelectOrder }) {
         {placedRows.length ? (
           <div className="placed-watch-list">
             {placedRows.map((order) => (
-              <button
+              <a
                 className="placed-watch-item"
+                href={orderDetailPath(order.order_id)}
                 key={order.order_id}
-                type="button"
-                onClick={() => onSelectOrder(order.order_id)}
+                onClick={(event) => onSelectOrder(order.order_id, event)}
               >
                 <span title={order.order_id}>{order.idempotency_key}</span>
                 <small>{formatTime(order.created_at)}</small>
-              </button>
+              </a>
             ))}
           </div>
         ) : (
@@ -1113,13 +1250,13 @@ function RecentOrdersPanel({ overview, onSelectOrder }) {
               rows.map((order) => (
                 <tr key={order.order_id}>
                   <td title={order.order_id}>
-                    <button
+                    <a
                       className="text-button"
-                      type="button"
-                      onClick={() => onSelectOrder(order.order_id)}
+                      href={orderDetailPath(order.order_id)}
+                      onClick={(event) => onSelectOrder(order.order_id, event)}
                     >
                       {order.idempotency_key}
-                    </button>
+                    </a>
                   </td>
                   <td>{humanize(order.state)}</td>
                   <td>{order.restaurant_ref}</td>
