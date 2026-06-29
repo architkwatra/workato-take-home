@@ -8,13 +8,15 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(title="Downstream Simulator")
 
-# Demo prep duration used when RESTAURANT_READY_AFTER_SECONDS is not set. The
-# simulator returns "ready" once now >= prep_started_at + this many seconds.
+# Demo prep duration used when neither a fixed restaurant delay nor a restaurant
+# delay range is configured. The simulator returns "ready" once now is past the
+# per-order ready_at timestamp.
 DEFAULT_RESTAURANT_READY_AFTER_SECONDS = 6.0
 # Poll hint used when RESTAURANT_READY_RETRY_AFTER_SECONDS is not set. Workers
 # cap this by the task deadline before scheduling the next check_ready attempt.
 DEFAULT_RESTAURANT_READY_RETRY_AFTER_SECONDS = 2.0
-# Courier delivery gate: "delivered" once now >= dispatched_at + this many seconds.
+# Courier delivery duration used when neither a fixed courier delay nor a
+# courier delay range is configured.
 DEFAULT_COURIER_DELIVERED_AFTER_SECONDS = 8.0
 # Poll hint returned with "in_transit". Workers cap this by the task deadline.
 DEFAULT_COURIER_DELIVERED_RETRY_AFTER_SECONDS = 3.0
@@ -104,6 +106,72 @@ def _read_positive_float_env(env_name: str, default: float) -> float:
     return value if value > 0 else default
 
 
+def _read_delay_range(
+    *,
+    min_env_name: str,
+    max_env_name: str,
+    fixed_env_name: str,
+    default: float,
+) -> tuple[float, float]:
+    """Return the configured delay window for one simulator phase.
+
+    A fixed delay env var remains supported for existing configs. When min/max
+    env vars are present, the simulator uses the range to stagger orders while
+    keeping the response contract unchanged for workers.
+    """
+    fixed_delay = _read_positive_float_env(fixed_env_name, default)
+    raw_min = os.getenv(min_env_name)
+    raw_max = os.getenv(max_env_name)
+    if raw_min is None and raw_max is None:
+        return fixed_delay, fixed_delay
+
+    minimum = _read_positive_float_env(min_env_name, fixed_delay)
+    maximum = _read_positive_float_env(max_env_name, minimum)
+    if maximum < minimum:
+        # Treat a misordered range as a fixed delay rather than failing every
+        # simulator request. The bad config remains visible because all orders
+        # collapse to the configured minimum.
+        return minimum, minimum
+
+    return minimum, maximum
+
+
+def _stable_unit_interval(value: str) -> float:
+    """Map a string to a stable 0..1 value for deterministic jitter."""
+    digest = hashlib.sha256(value.encode()).digest()
+    bucket = int.from_bytes(digest[:8], "big")
+    return bucket / ((1 << 64) - 1)
+
+
+def _deterministic_delay_seconds(
+    *,
+    order_id: str,
+    salt: str,
+    min_env_name: str,
+    max_env_name: str,
+    fixed_env_name: str,
+    default: float,
+) -> float:
+    """Return a stable per-order delay inside the configured range.
+
+    This is intentionally not random per request. A given order_id always gets
+    the same delay for the same phase, so worker retries remain predictable and
+    dashboard demos show real staggered state instead of fake response data.
+    """
+    minimum, maximum = _read_delay_range(
+        min_env_name=min_env_name,
+        max_env_name=max_env_name,
+        fixed_env_name=fixed_env_name,
+        default=default,
+    )
+    if minimum == maximum:
+        return minimum
+
+    return minimum + (
+        _stable_unit_interval(f"{salt}:{order_id}") * (maximum - minimum)
+    )
+
+
 def _utc_datetime(value: datetime) -> datetime:
     """Normalize incoming timestamps so readiness math is timezone-safe."""
     if value.tzinfo is None:
@@ -164,9 +232,13 @@ async def check_restaurant_ready(
     request: RestaurantCheckReadyRequest,
 ) -> dict[str, float | str]:
     """Return whether enough deterministic prep time has elapsed for an order."""
-    ready_after_seconds = _read_positive_float_env(
-        "RESTAURANT_READY_AFTER_SECONDS",
-        DEFAULT_RESTAURANT_READY_AFTER_SECONDS,
+    ready_after_seconds = _deterministic_delay_seconds(
+        order_id=request.order_id,
+        salt="restaurant-ready",
+        min_env_name="RESTAURANT_READY_AFTER_SECONDS_MIN",
+        max_env_name="RESTAURANT_READY_AFTER_SECONDS_MAX",
+        fixed_env_name="RESTAURANT_READY_AFTER_SECONDS",
+        default=DEFAULT_RESTAURANT_READY_AFTER_SECONDS,
     )
     retry_after_seconds = _read_positive_float_env(
         "RESTAURANT_READY_RETRY_AFTER_SECONDS",
@@ -205,9 +277,13 @@ async def check_courier_delivery(
     request: CourierCheckDeliveryRequest,
 ) -> dict[str, float | str]:
     """Return whether enough deterministic delivery time has elapsed for an order."""
-    delivered_after_seconds = _read_positive_float_env(
-        "COURIER_DELIVERED_AFTER_SECONDS",
-        DEFAULT_COURIER_DELIVERED_AFTER_SECONDS,
+    delivered_after_seconds = _deterministic_delay_seconds(
+        order_id=request.order_id,
+        salt="courier-delivery",
+        min_env_name="COURIER_DELIVERED_AFTER_SECONDS_MIN",
+        max_env_name="COURIER_DELIVERED_AFTER_SECONDS_MAX",
+        fixed_env_name="COURIER_DELIVERED_AFTER_SECONDS",
+        default=DEFAULT_COURIER_DELIVERED_AFTER_SECONDS,
     )
     retry_after_seconds = _read_positive_float_env(
         "COURIER_DELIVERED_RETRY_AFTER_SECONDS",

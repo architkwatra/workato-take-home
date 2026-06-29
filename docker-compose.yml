@@ -24,6 +24,7 @@ services:
     environment:
       SERVICE_NAME: api
       DATABASE_URL: postgresql://app:app@postgres:5432/orders
+      DASHBOARD_CORS_ORIGINS: http://localhost:3000
     ports:
       - "8080:8000"
     depends_on:
@@ -47,9 +48,11 @@ services:
     command: uvicorn downstream_sim.app:app --host 0.0.0.0 --port 8000
     environment:
       SERVICE_NAME: downstream-sim
-      RESTAURANT_READY_AFTER_SECONDS: "6"
+      RESTAURANT_READY_AFTER_SECONDS_MIN: "5"
+      RESTAURANT_READY_AFTER_SECONDS_MAX: "30"
       RESTAURANT_READY_RETRY_AFTER_SECONDS: "2"
-      COURIER_DELIVERED_AFTER_SECONDS: "8"
+      COURIER_DELIVERED_AFTER_SECONDS_MIN: "10"
+      COURIER_DELIVERED_AFTER_SECONDS_MAX: "60"
       COURIER_DELIVERED_RETRY_AFTER_SECONDS: "3"
     ports:
       - "8081:8000"
