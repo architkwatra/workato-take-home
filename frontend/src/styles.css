@@ -90,6 +90,28 @@ h2 {
   white-space: nowrap;
 }
 
+.topbar-popover-anchor {
+  position: relative;
+}
+
+.topbar-action {
+  min-height: 36px;
+  white-space: nowrap;
+}
+
+.topbar-popover {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  width: min(420px, calc(100vw - 48px));
+  z-index: 20;
+}
+
+.topbar-downstream {
+  box-shadow: 0 18px 40px rgba(23, 32, 42, 0.18);
+  margin-bottom: 0;
+}
+
 .connection {
   color: #5b6570;
   font-weight: 700;
@@ -251,6 +273,28 @@ h2 {
 
 .downstream-panel {
   margin-bottom: 16px;
+}
+
+.downstream-heading {
+  align-items: flex-start;
+}
+
+.downstream-heading div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.downstream-heading span {
+  color: #66717d;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.downstream-heading strong {
+  color: #263241;
+  font-size: 13px;
+  white-space: nowrap;
 }
 
 .dropdown-panel {
@@ -926,6 +970,11 @@ tbody tr:last-child td {
     min-width: 0;
   }
 
+  .topbar-popover {
+    left: 0;
+    right: auto;
+  }
+
   .summary-grid,
   .content-grid,
   .content-grid.wide,
@@ -950,6 +999,15 @@ tbody tr:last-child td {
   }
 
   .topbar-meta > span {
+    width: 100%;
+  }
+
+  .topbar-popover-anchor,
+  .topbar-action {
+    width: 100%;
+  }
+
+  .topbar-popover {
     width: 100%;
   }
 
