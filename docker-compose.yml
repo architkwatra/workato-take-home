@@ -118,7 +118,10 @@ services:
       DATABASE_POOL_MAX_SIZE: "2"
       DOWNSTREAM_SIM_BASE_URL: http://downstream-sim:8000
       DOWNSTREAM_REQUEST_TIMEOUT_SECONDS: "2"
+      # Base and cap for retryable downstream/local errors. Normal not-ready
+      # polling uses its own interval/deadline settings below.
       TASK_RETRY_DELAY_SECONDS: "5"
+      TASK_RETRY_MAX_DELAY_SECONDS: "60"
       READY_CHECK_INITIAL_DELAY_SECONDS: "2"
       READY_CHECK_INTERVAL_SECONDS: "2"
       READY_CHECK_DEADLINE_SECONDS: "60"
