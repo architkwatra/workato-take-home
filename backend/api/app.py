@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from api.dashboard_store import get_dashboard_order_detail, get_dashboard_overview
-from api.order_store import IdempotencyConflictError, create_or_get_order
+from api.order_store import IdempotencyConflictError, cancel_order, create_or_get_order
 from api.task_store import retry_failed_tasks_for_order
 from common.db import (
     DatabaseConfigError,
@@ -208,6 +208,25 @@ def create_order(
         status.HTTP_201_CREATED if was_created else status.HTTP_200_OK
     )
     return order
+
+
+@app.post("/orders/{order_id}/cancel", response_model=OrderResponse)
+def cancel_existing_order(order_id: UUID) -> dict[str, Any]:
+    """Cancel a non-terminal order and invalidate its open task rows."""
+    try:
+        result = cancel_order(order_id=str(order_id))
+    except DatabaseConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except psycopg.Error as exc:
+        raise HTTPException(status_code=503, detail="postgres is not reachable") from exc
+
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="order not found",
+        )
+
+    return result
 
 
 @app.post(

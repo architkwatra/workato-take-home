@@ -36,6 +36,8 @@ const ORDER_STATES = [
   "failed",
 ];
 
+const TERMINAL_ORDER_STATES = new Set(["delivered", "cancelled", "failed"]);
+
 const PIPELINE_STATES = [
   "placed",
   "confirmed",
@@ -73,7 +75,6 @@ const PIPELINE_DELAY_WINDOWS = {
   },
 };
 
-const TASK_STATUSES = ["pending", "running", "completed", "failed", "cancelled"];
 const DOWNSTREAM_SERVICES = [
   "restaurant_confirm",
   "restaurant_start_prep",
@@ -93,8 +94,8 @@ const LABELS = {
 const METRIC_HELP = {
   orders: "Total order rows in the database, across every order state.",
   delivered: "Orders whose current state is delivered.",
-  taskRate:
-    "Completed tasks in the last dashboard throughput window divided by that window size.",
+  taskCompletionRate:
+    "Completed task rows per second over the rolling dashboard window. This is worker throughput, not delivered-order rate.",
   taskIssues:
     "Failed tasks plus running tasks whose worker lease has expired.",
   workers:
@@ -408,6 +409,8 @@ function App() {
   const [downstreamActionPending, setDownstreamActionPending] = useState("");
   const [retryActionPendingOrderId, setRetryActionPendingOrderId] = useState("");
   const [retryActionError, setRetryActionError] = useState("");
+  const [cancelActionPendingOrderId, setCancelActionPendingOrderId] = useState("");
+  const [cancelActionError, setCancelActionError] = useState("");
 
   useEffect(() => {
     function handlePopState() {
@@ -792,6 +795,32 @@ function App() {
     }
   }
 
+  async function cancelOrder(orderId) {
+    const confirmed = window.confirm(
+      "Cancel this order? This stops any remaining pipeline work for it.",
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setCancelActionPendingOrderId(orderId);
+    setCancelActionError("");
+
+    try {
+      await requestDashboard(`/orders/${encodeURIComponent(orderId)}/cancel`, {
+        method: "POST",
+      });
+      setOverviewRefreshToken((current) => current + 1);
+      if (selectedOrderId) {
+        setOrderDetailRefreshToken((current) => current + 1);
+      }
+    } catch (caughtError) {
+      setCancelActionError(caughtError.message || "cancel order request failed");
+    } finally {
+      setCancelActionPendingOrderId("");
+    }
+  }
+
   return (
     <main className="dashboard-shell">
       <header className="topbar">
@@ -818,7 +847,10 @@ function App() {
           detail={orderDetail}
           error={orderDetailError}
           onBack={closeOrderDetail}
+          onCancelOrder={cancelOrder}
           onRetryFailedTasks={retryFailedTasks}
+          cancelActionError={cancelActionError}
+          cancelActionPendingOrderId={cancelActionPendingOrderId}
           retryActionError={retryActionError}
           retryActionPendingOrderId={retryActionPendingOrderId}
         />
@@ -839,12 +871,12 @@ function App() {
               tone="good"
             />
             <Metric
-              label="Task Rate"
+              label="Task Completion Rate"
               value={`${rateText(totals.tasksCompletedPerSecond)}/s`}
-              detail={`${numberText(totals.tasksCompletedRecent)} in last ${
+              detail={`${numberText(totals.tasksCompletedRecent)} completed in last ${
                 totals.throughputWindowSeconds
               }s`}
-              helpText={METRIC_HELP.taskRate}
+              helpText={METRIC_HELP.taskCompletionRate}
               tone={totals.tasksCompletedPerSecond > 0 ? "good" : "neutral"}
             />
             <Metric
@@ -867,6 +899,16 @@ function App() {
             />
           </section>
 
+          <DownstreamControlPanel
+            actionError={downstreamActionError}
+            actionPending={downstreamActionPending}
+            connection={downstreamConnection}
+            error={downstreamError}
+            lastRefreshAt={downstreamLastRefreshAt}
+            onToggle={setDownstreamKilled}
+            services={downstreamServices}
+          />
+
           <LoadgenControlPanel
             actionError={loadgenActionError}
             actionPending={loadgenActionPending}
@@ -885,16 +927,6 @@ function App() {
             <RecentOrdersPanel overview={overview} onSelectOrder={openOrderDetail} />
           </div>
 
-          <DownstreamControlPanel
-            actionError={downstreamActionError}
-            actionPending={downstreamActionPending}
-            connection={downstreamConnection}
-            error={downstreamError}
-            lastRefreshAt={downstreamLastRefreshAt}
-            onToggle={setDownstreamKilled}
-            services={downstreamServices}
-          />
-
           <div className="content-grid wide">
             <ProblemTaskPanel
               overview={overview}
@@ -904,8 +936,6 @@ function App() {
             />
             <RecentEventsPanel overview={overview} />
           </div>
-
-          <TaskHealthPanel overview={overview} />
         </>
       )}
     </main>
@@ -916,7 +946,10 @@ function OrderDetailPage({
   detail,
   error,
   onBack,
+  onCancelOrder,
   onRetryFailedTasks,
+  cancelActionError,
+  cancelActionPendingOrderId,
   retryActionError,
   retryActionPendingOrderId,
 }) {
@@ -925,6 +958,11 @@ function OrderDetailPage({
   const events = detail?.events ?? [];
   const failedTaskCount = tasks.filter((task) => task.status === "failed").length;
   const retryPending = order?.order_id === retryActionPendingOrderId;
+  const cancelPending = order?.order_id === cancelActionPendingOrderId;
+  const orderActionPending = Boolean(
+    retryActionPendingOrderId || cancelActionPendingOrderId,
+  );
+  const canCancelOrder = order && !TERMINAL_ORDER_STATES.has(order.state);
   const retryButtonText =
     failedTaskCount === 1
       ? "Retry Failed Task"
@@ -936,16 +974,28 @@ function OrderDetailPage({
         <a className="button" href="/" onClick={onBack}>
           Back to Dashboard
         </a>
-        {order && failedTaskCount > 0 ? (
-          <button
-            className="button primary"
-            disabled={Boolean(retryActionPendingOrderId)}
-            type="button"
-            onClick={() => onRetryFailedTasks(order.order_id)}
-          >
-            {retryPending ? "Retrying" : retryButtonText}
-          </button>
-        ) : null}
+        <div className="button-row">
+          {order && failedTaskCount > 0 ? (
+            <button
+              className="button primary"
+              disabled={orderActionPending}
+              type="button"
+              onClick={() => onRetryFailedTasks(order.order_id)}
+            >
+              {retryPending ? "Retrying" : retryButtonText}
+            </button>
+          ) : null}
+          {canCancelOrder ? (
+            <button
+              className="button danger"
+              disabled={orderActionPending}
+              type="button"
+              onClick={() => onCancelOrder(order.order_id)}
+            >
+              {cancelPending ? "Cancelling" : "Cancel Order"}
+            </button>
+          ) : null}
+        </div>
       </div>
 
       {error ? (
@@ -956,6 +1006,11 @@ function OrderDetailPage({
       {retryActionError ? (
         <div className="alert" role="status">
           Retry issue: {retryActionError}
+        </div>
+      ) : null}
+      {cancelActionError ? (
+        <div className="alert" role="status">
+          Cancel issue: {cancelActionError}
         </div>
       ) : null}
 
@@ -1311,63 +1366,80 @@ function DownstreamControlPanel({
   const serviceByName = new Map(
     services.map((serviceState) => [serviceState.service, serviceState]),
   );
+  const killedCount = DOWNSTREAM_SERVICES.filter((serviceName) =>
+    Boolean(serviceByName.get(serviceName)?.killed),
+  ).length;
   const connectionLabel =
     connection === "online" || connection === "refreshing"
       ? "Connected"
       : connection === "offline"
         ? "Offline"
         : "Loading";
+  const statusText = lastRefreshAt
+    ? `Updated ${formatTime(lastRefreshAt)}`
+    : connectionLabel;
+  const killSummary =
+    services.length === 0
+      ? "Pending"
+      : killedCount > 0
+        ? `${numberText(killedCount)} killed`
+        : "All enabled";
 
   return (
-    <section className="section downstream-panel">
-      <div className="section-heading">
-        <h2>Downstream Kill Switches</h2>
-        <span>{lastRefreshAt ? `Updated ${formatTime(lastRefreshAt)}` : connectionLabel}</span>
-      </div>
+    <details className="section downstream-panel dropdown-panel">
+      <summary className="dropdown-summary">
+        <div>
+          <h2>Downstream Kill Switches</h2>
+          <span>{statusText}</span>
+        </div>
+        <strong>{killSummary}</strong>
+      </summary>
 
-      <div className="service-list">
-        {DOWNSTREAM_SERVICES.map((serviceName) => {
-          const serviceState = serviceByName.get(serviceName);
-          const killed = Boolean(serviceState?.killed);
-          const pendingKill = actionPending === `${serviceName}:kill`;
-          const pendingRestore = actionPending === `${serviceName}:restore`;
-          const pending = pendingKill || pendingRestore;
-          const disabled = Boolean(actionPending) || connection === "offline";
+      <div className="dropdown-content">
+        <div className="service-list">
+          {DOWNSTREAM_SERVICES.map((serviceName) => {
+            const serviceState = serviceByName.get(serviceName);
+            const killed = Boolean(serviceState?.killed);
+            const pendingKill = actionPending === `${serviceName}:kill`;
+            const pendingRestore = actionPending === `${serviceName}:restore`;
+            const pending = pendingKill || pendingRestore;
+            const disabled = Boolean(actionPending) || connection === "offline";
 
-          return (
-            <div className="service-row" key={serviceName}>
-              <div>
-                <strong>{humanize(serviceName)}</strong>
-                <span
-                  className={`service-state ${
-                    killed ? "killed" : serviceState ? "online" : "unknown"
-                  }`}
+            return (
+              <div className="service-row" key={serviceName}>
+                <div>
+                  <strong>{humanize(serviceName)}</strong>
+                  <span
+                    className={`service-state ${
+                      killed ? "killed" : serviceState ? "online" : "unknown"
+                    }`}
+                  >
+                    {killed ? "Killed" : serviceState ? "Online" : "Unknown"}
+                  </span>
+                </div>
+                <button
+                  className={`button ${killed ? "primary" : "danger"}`}
+                  disabled={disabled}
+                  type="button"
+                  onClick={() => onToggle(serviceName, !killed)}
                 >
-                  {killed ? "Killed" : serviceState ? "Online" : "Unknown"}
-                </span>
+                  {pending
+                    ? pendingKill
+                      ? "Killing"
+                      : "Restoring"
+                    : killed
+                      ? "Restore"
+                      : "Kill"}
+                </button>
               </div>
-              <button
-                className={`button ${killed ? "primary" : "danger"}`}
-                disabled={disabled}
-                type="button"
-                onClick={() => onToggle(serviceName, !killed)}
-              >
-                {pending
-                  ? pendingKill
-                    ? "Killing"
-                    : "Restoring"
-                  : killed
-                    ? "Restore"
-                    : "Kill"}
-              </button>
-            </div>
-          );
-        })}
-      </div>
+            );
+          })}
+        </div>
 
-      {error ? <p className="inline-error">downstream-sim: {error}</p> : null}
-      {actionError ? <p className="inline-error">{actionError}</p> : null}
-    </section>
+        {error ? <p className="inline-error">downstream-sim: {error}</p> : null}
+        {actionError ? <p className="inline-error">{actionError}</p> : null}
+      </div>
+    </details>
   );
 }
 
@@ -1397,37 +1469,6 @@ function LifecyclePanel({ overview }) {
             </div>
           );
         })}
-      </div>
-    </section>
-  );
-}
-
-function TaskHealthPanel({ overview }) {
-  const counts = overview?.tasks?.by_status ?? {};
-
-  return (
-    <section className="section">
-      <div className="section-heading">
-        <h2>Task Health</h2>
-        <span>{numberText(overview?.tasks?.total ?? 0)} total</span>
-      </div>
-      <div className="status-grid">
-        {TASK_STATUSES.map((taskStatus) => (
-          <div className="status-count" key={taskStatus}>
-            <span>{humanize(taskStatus)}</span>
-            <strong>{numberText(counts[taskStatus] ?? 0)}</strong>
-          </div>
-        ))}
-      </div>
-      <div className="health-lines">
-        <div>
-          <span>Due pending</span>
-          <strong>{numberText(overview?.tasks?.due_pending ?? 0)}</strong>
-        </div>
-        <div>
-          <span>Expired running</span>
-          <strong>{numberText(overview?.tasks?.expired_running ?? 0)}</strong>
-        </div>
       </div>
     </section>
   );
