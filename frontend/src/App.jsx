@@ -89,6 +89,9 @@ const LABELS = {
   check_pickup: "check pickup",
   check_ready: "check ready",
   advance_state: "advance state",
+  due_retry: "due retry",
+  pending_retry: "pending retry",
+  retry_running: "retry running",
 };
 
 const METRIC_HELP = {
@@ -97,7 +100,7 @@ const METRIC_HELP = {
   taskCompletionRate:
     "Completed task rows per second over the rolling dashboard window. This is worker throughput, not delivered-order rate.",
   taskIssues:
-    "Failed tasks plus running tasks whose worker lease has expired.",
+    "Failed tasks, expired running tasks, and tasks retrying after a previous error.",
   workers:
     "Workers with a heartbeat in the active window divided by the configured worker replica count.",
 };
@@ -634,6 +637,8 @@ function App() {
       deliveredOrders: orderCounts.delivered ?? 0,
       failedTasks: taskCounts.failed ?? 0,
       expiredRunning: overview?.tasks?.expired_running ?? 0,
+      retryingPending: overview?.tasks?.retrying_pending ?? 0,
+      retryingRunning: overview?.tasks?.retrying_running ?? 0,
       tasksCompletedPerSecond:
         overview?.throughput?.tasks_completed_per_second ?? 0,
       tasksCompletedRecent: overview?.throughput?.tasks_completed ?? 0,
@@ -652,6 +657,11 @@ function App() {
     pageStatus,
     Boolean(selectedOrderId ? orderDetail : overview),
   );
+  const taskIssueCount =
+    totals.failedTasks +
+    totals.expiredRunning +
+    totals.retryingPending +
+    totals.retryingRunning;
 
   function updateLoadgenForm(field, value) {
     setLoadgenForm((current) => ({ ...current, [field]: value }));
@@ -881,10 +891,10 @@ function App() {
             />
             <Metric
               label="Task Issues"
-              value={numberText(totals.failedTasks + totals.expiredRunning)}
-              detail="failed or expired"
+              value={numberText(taskIssueCount)}
+              detail="failed, expired, or retrying"
               helpText={METRIC_HELP.taskIssues}
-              tone={totals.failedTasks + totals.expiredRunning > 0 ? "bad" : "neutral"}
+              tone={taskIssueCount > 0 ? "bad" : "neutral"}
             />
             <Metric
               label="Workers"
@@ -1501,6 +1511,7 @@ function ProblemTaskPanel({
               <th>Task</th>
               <th>Order</th>
               <th>Attempts</th>
+              <th>Next Run</th>
               <th>Error</th>
               <th>Action</th>
             </tr>
@@ -1519,6 +1530,7 @@ function ProblemTaskPanel({
                     <td>
                       {numberText(task.attempts)}/{numberText(task.max_attempts)}
                     </td>
+                    <td>{formatTime(task.next_run_at)}</td>
                     <td className="truncate" title={task.last_error ?? ""}>
                       {task.last_error ?? "None"}
                     </td>
@@ -1540,7 +1552,7 @@ function ProblemTaskPanel({
                 );
               })
             ) : (
-              <EmptyRow colSpan={6}>No failed, expired, or error-bearing due tasks</EmptyRow>
+              <EmptyRow colSpan={7}>No failed, expired, or retrying tasks</EmptyRow>
             )}
           </tbody>
         </table>
