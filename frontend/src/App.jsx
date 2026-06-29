@@ -106,6 +106,8 @@ const METRIC_HELP = {
     "Orders delivered per minute over the rolling dashboard window.",
   pipelineLatency:
     "End-to-end p95 time from order creation to delivery, across delivered orders.",
+  stuckOrders:
+    "Non-terminal orders whose time in the current lifecycle state is above that stage's configured stuck threshold.",
   taskCompletionRate:
     "Completed task rows per second over the rolling dashboard window. This is worker throughput, not delivered-order rate.",
   taskIssues:
@@ -123,6 +125,8 @@ const DETAIL_HELP = {
     "95th percentile elapsed time from order_created to delivered. 95% of delivered orders completed at or below this value.",
   stageLatency:
     "95th percentile elapsed time between consecutive lifecycle events for this transition, calculated from order_events.",
+  stuckOrders:
+    "Orders are marked stuck when they are not terminal and orders.updated_at is older than the configured threshold for the current state. Delivered, cancelled, and failed orders are excluded.",
   taskCompletionRate:
     "Completed order_tasks rows per second over the rolling dashboard window. This is worker throughput, not delivered-order rate.",
   duePending:
@@ -188,6 +192,13 @@ function formatDurationSeconds(seconds) {
     return "—";
   }
   return formatDuration(Number(seconds) * 1000) ?? "—";
+}
+
+function stuckThresholdText(thresholds = {}) {
+  const entries = PIPELINE_STATES.slice(0, -1).map(
+    (state) => `${humanize(state)} ${formatDurationSeconds(thresholds[state])}`,
+  );
+  return entries.join(", ");
 }
 
 function formatTime(value) {
@@ -758,6 +769,7 @@ function App() {
       pipelineAvgSeconds: overview?.latency?.pipeline?.avg_seconds ?? null,
       pipelineP95Seconds: overview?.latency?.pipeline?.p95_seconds ?? null,
       pipelineSampleCount: overview?.latency?.pipeline?.sample_count ?? 0,
+      stuckOrderCount: overview?.stuck_orders?.total ?? 0,
       activeWorkers: overview?.workers?.active_count ?? 0,
       configuredWorkers: overview?.workers?.configured_count ?? 0,
       workerActiveThresholdSeconds: overview?.workers?.active_threshold_seconds ?? 30,
@@ -772,11 +784,6 @@ function App() {
     pageStatus,
     Boolean(selectedOrderId ? orderDetail : overview),
   );
-  const taskIssueCount =
-    totals.failedTasks +
-    totals.expiredRunning +
-    totals.retryingPending +
-    totals.retryingRunning;
   const downstreamServiceByName = new Map(
     downstreamServices.map((serviceState) => [serviceState.service, serviceState]),
   );
@@ -1042,11 +1049,15 @@ function App() {
               tone={totals.pipelineP95Seconds == null ? "neutral" : "good"}
             />
             <Metric
-              label="Task Issues"
-              value={numberText(taskIssueCount)}
-              detail="failed, expired, or retrying"
-              helpText={METRIC_HELP.taskIssues}
-              tone={taskIssueCount > 0 ? "bad" : "neutral"}
+              label="Stuck Orders"
+              value={numberText(totals.stuckOrderCount)}
+              detail={
+                totals.stuckOrderCount > 0
+                  ? "over stage threshold"
+                  : "none over threshold"
+              }
+              helpText={METRIC_HELP.stuckOrders}
+              tone={totals.stuckOrderCount > 0 ? "bad" : "neutral"}
             />
             <Metric
               label="Workers"
@@ -1085,14 +1096,16 @@ function App() {
           </div>
 
           <div className="content-grid wide">
+            <StuckOrdersPanel overview={overview} onSelectOrder={openOrderDetail} />
             <ProblemTaskPanel
               overview={overview}
               onRetryFailedTasks={retryFailedTasks}
               retryActionError={retryActionError}
               retryActionPendingOrderId={retryActionPendingOrderId}
             />
-            <RecentEventsPanel overview={overview} />
           </div>
+
+          <RecentEventsPanel overview={overview} />
         </>
       )}
     </main>
@@ -1736,6 +1749,95 @@ function LifecyclePanel({ overview }) {
           );
         })}
       </div>
+    </section>
+  );
+}
+
+function StuckOrdersPanel({ overview, onSelectOrder }) {
+  const stuckOverview = overview?.stuck_orders ?? {};
+  const rows = stuckOverview.items ?? [];
+  const total = stuckOverview.total ?? rows.length;
+  const limit = stuckOverview.limit ?? rows.length;
+  const thresholds = stuckOverview.thresholds_seconds ?? {};
+  const thresholdHelp = `${DETAIL_HELP.stuckOrders} Thresholds: ${stuckThresholdText(
+    thresholds,
+  )}.`;
+
+  return (
+    <section className="section stuck-orders-panel">
+      <div className="section-heading">
+        <h2>Stuck Orders</h2>
+        <span className="label-with-help">
+          {numberText(total)} over threshold
+          <HelpIcon text={thresholdHelp} />
+        </span>
+      </div>
+      <div className="table-wrap">
+        <table className="stuck-orders-table">
+          <thead>
+            <tr>
+              <th>Order</th>
+              <th>State</th>
+              <th>Stuck For</th>
+              <th>Threshold</th>
+              <th>Latest Task</th>
+              <th>Error</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.length ? (
+              rows.map((order) => (
+                <tr key={order.order_id}>
+                  <td>
+                    <a
+                      className="text-button"
+                      href={orderDetailPath(order.order_id)}
+                      title={order.idempotency_key}
+                      onClick={(event) => onSelectOrder(order.order_id, event)}
+                    >
+                      {shortKey(order.idempotency_key)}
+                    </a>
+                  </td>
+                  <td><StateBadge state={order.state} /></td>
+                  <td className="stuck-duration">
+                    {formatDurationSeconds(order.stuck_seconds)}
+                  </td>
+                  <td>{formatDurationSeconds(order.threshold_seconds)}</td>
+                  <td>
+                    {order.latest_task_type ? (
+                      <div className="task-stack">
+                        <span>
+                          {humanize(order.latest_task_type)}
+                          {order.latest_task_target_state
+                            ? ` → ${humanize(order.latest_task_target_state)}`
+                            : ""}
+                        </span>
+                        <TaskStatusBadge status={order.latest_task_status} />
+                      </div>
+                    ) : (
+                      "—"
+                    )}
+                  </td>
+                  <td
+                    className="truncate"
+                    title={order.latest_task_last_error ?? ""}
+                  >
+                    {order.latest_task_last_error ?? "—"}
+                  </td>
+                </tr>
+              ))
+            ) : (
+              <EmptyRow colSpan={6}>No orders are over their stage threshold</EmptyRow>
+            )}
+          </tbody>
+        </table>
+      </div>
+      {total > rows.length ? (
+        <p className="muted-text panel-footnote">
+          Showing oldest {numberText(Math.min(limit, rows.length))} of{" "}
+          {numberText(total)} stuck orders.
+        </p>
+      ) : null}
     </section>
   );
 }
