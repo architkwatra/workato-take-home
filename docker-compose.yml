@@ -101,6 +101,7 @@ services:
       READY_CHECK_INITIAL_DELAY_SECONDS: "2"
       READY_CHECK_INTERVAL_SECONDS: "2"
       READY_CHECK_DEADLINE_SECONDS: "60"
+      UNSUPPORTED_TASK_RELEASE_DELAY_SECONDS: "30"
     depends_on:
       migrator:
         condition: service_completed_successfully
