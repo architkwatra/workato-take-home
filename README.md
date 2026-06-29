@@ -107,7 +107,8 @@ Core rules:
 
 - The client/load generator creates a UUID idempotency key for each intended
   order and sends it with the request. The API stores it with a unique
-  constraint and returns the existing order if the same key is retried.
+  constraint and returns the existing order if the same key is retried with the
+  same request body. Reusing the key with a different body returns `409`.
 - Every lifecycle change is written transactionally.
 - Workers claim work with a 30-second lease, for example `locked_by` and
   `locked_until`, so tasks from a killed worker become reclaimable quickly during
@@ -117,7 +118,8 @@ Core rules:
   claim; others skip to the next available task.
 - Expired leases are recoverable by another worker.
 - Tasks retry up to 5 times by default, configurable per stage. After that, the
-  order is marked `failed` and no automatic requeue is attempted.
+  task is marked `failed`, while the order remains in its source state until an
+  explicit operator retry or a later order-failure policy handles it.
 - Expected poll results such as `not_ready`, `not_picked_up`, or `not_delivered`
   are not errors and do not increment attempts; they only move `next_run_at`.
 - Rate limit responses (`429`) are handled separately from normal transient
@@ -207,8 +209,14 @@ acceptable demo limitation and would need a production retention policy.
    next step is waiting on slow external progress, it inserts a future task with
    `next_run_at` and releases the lease.
 6. On transient failure, the worker records the attempt and schedules a retry.
-7. On repeated failure or invalid state, the order is marked `failed` or the task
-   is discarded as a safe no-op.
+7. On repeated failure, the task is marked `failed` and can be reopened through
+   the operator retry endpoint. Invalid or stale work is completed as a safe
+   no-op.
+
+Manual recovery endpoint:
+
+- `POST /orders/{order_id}/tasks/retry-failed` resets failed task rows for that
+  order back to `pending` without changing the order state.
 
 Important downstream handoffs:
 
@@ -308,6 +316,7 @@ Expected behavior:
 
 - Orders already stored in Postgres remain visible.
 - In-flight leased tasks become retryable after the lease expires.
+- Failed tasks stay terminal until an operator explicitly resets them.
 - Duplicate processing attempts do not create duplicate business effects.
 - The dashboard shows backlog growth, retries, failures, and recovery.
 

@@ -36,6 +36,9 @@ DEFAULT_TASK_RETRY_DELAY_SECONDS = 5.0
 DEFAULT_READY_CHECK_INITIAL_DELAY_SECONDS = 2.0
 DEFAULT_READY_CHECK_INTERVAL_SECONDS = 2.0
 DEFAULT_READY_CHECK_DEADLINE_SECONDS = 60.0
+# Future-slice tasks should stay visible but not spin the worker loop before
+# their handler exists. This delay is only for unsupported task release.
+DEFAULT_UNSUPPORTED_TASK_RELEASE_DELAY_SECONDS = 30.0
 MAX_LAST_ERROR_LENGTH = 300
 MAX_CLAIM_LOG_CACHE_SIZE = 1000
 _logged_claimed_task_ids: set[str] = set()
@@ -232,6 +235,14 @@ def _ready_check_deadline_seconds() -> float:
     )
 
 
+def _unsupported_task_release_delay_seconds() -> float:
+    """Return how long unsupported tasks wait before workers inspect them again."""
+    return _read_positive_float_env(
+        "UNSUPPORTED_TASK_RELEASE_DELAY_SECONDS",
+        DEFAULT_UNSUPPORTED_TASK_RELEASE_DELAY_SECONDS,
+    )
+
+
 def _short_error(message: str) -> str:
     """Keep task last_error small enough for dashboards and logs."""
     cleaned = " ".join(message.split())
@@ -346,8 +357,15 @@ def claim_one_task(*, worker_id: str) -> ClaimedTask | None:
                 )
 
 
-def release_claimed_task(*, task_id: str, worker_id: str) -> bool:
+def release_claimed_task(
+    *,
+    task_id: str,
+    worker_id: str,
+    next_run_at: datetime | None = None,
+    last_error: str | None = None,
+) -> bool:
     """Release a claimed task back to pending without completing it."""
+    updated_at = datetime.now(timezone.utc)
     with open_db_connection() as conn:
         with conn.transaction():
             with conn.cursor() as cur:
@@ -356,9 +374,11 @@ def release_claimed_task(*, task_id: str, worker_id: str) -> bool:
                     update order_tasks
                     set
                         status = %s::task_status,
+                        next_run_at = coalesce(%s, next_run_at),
+                        last_error = coalesce(%s, last_error),
                         locked_by = null,
                         locked_until = null,
-                        updated_at = now()
+                        updated_at = %s
                     where
                         id = %s::uuid
                         and status = %s::task_status
@@ -366,6 +386,9 @@ def release_claimed_task(*, task_id: str, worker_id: str) -> bool:
                     """,
                     (
                         TASK_STATUS_PENDING,
+                        next_run_at,
+                        last_error,
+                        updated_at,
                         task_id,
                         TASK_STATUS_RUNNING,
                         worker_id,
@@ -1560,16 +1583,29 @@ def claim_and_process_one_task(*, worker_id: str) -> bool:
         result = None
 
     if result is None:
-        # Unsupported tasks are not failed here. Releasing them preserves forward
-        # compatibility with the next lifecycle slices that will claim the same
-        # durable rows after their handlers are added.
+        # Unsupported tasks are not failed here; a later slice may add the
+        # handler. Push next_run_at forward so unsupported future work cannot
+        # create a hot claim/release loop across all worker replicas.
+        unsupported_error = _short_error(
+            f"unsupported task type={task.task_type} target={task.target_state}; "
+            "waiting for handler"
+        )
+        next_run_at = datetime.now(timezone.utc) + timedelta(
+            seconds=_unsupported_task_release_delay_seconds()
+        )
         logger.warning(
-            "unsupported task %s type=%s target=%s; releasing for later slice",
+            "unsupported task %s type=%s target=%s; retrying after %s",
             task.id,
             task.task_type,
             task.target_state,
+            next_run_at.isoformat(),
         )
-        release_claimed_task(task_id=task.id, worker_id=worker_id)
+        release_claimed_task(
+            task_id=task.id,
+            worker_id=worker_id,
+            next_run_at=next_run_at,
+            last_error=unsupported_error,
+        )
         return True
 
     if result.action == PROCESSING_ACTION_TRANSITIONED:

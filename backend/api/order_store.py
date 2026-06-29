@@ -10,6 +10,28 @@ from common.state_machine import ORDER_STATE_CONFIRMED, ORDER_STATE_PLACED
 from common.task_types import TASK_STATUS_PENDING, TASK_TYPE_ADVANCE_STATE
 
 
+class IdempotencyConflictError(RuntimeError):
+    """Raised when a reused idempotency key has a different request body."""
+
+    def __init__(
+        self,
+        *,
+        idempotency_key: str,
+        existing_order_id: str,
+        existing_restaurant_ref: str,
+        existing_customer_ref: str | None,
+        requested_restaurant_ref: str,
+        requested_customer_ref: str | None,
+    ) -> None:
+        super().__init__("idempotency key reused with a different order request")
+        self.idempotency_key = idempotency_key
+        self.existing_order_id = existing_order_id
+        self.existing_restaurant_ref = existing_restaurant_ref
+        self.existing_customer_ref = existing_customer_ref
+        self.requested_restaurant_ref = requested_restaurant_ref
+        self.requested_customer_ref = requested_customer_ref
+
+
 def create_or_get_order(
     *,
     idempotency_key: str,
@@ -142,5 +164,22 @@ def create_or_get_order(
                 existing_order = cur.fetchone()
                 if existing_order is None:
                     raise RuntimeError("idempotent order lookup failed after conflict")
+
+                # Idempotency keys are only valid for identical retries. If the
+                # same key arrives with a different body, returning the existing
+                # order would make the client think a different order was
+                # accepted. Surface that as a conflict instead.
+                if (
+                    existing_order["restaurant_ref"] != restaurant_ref
+                    or existing_order["customer_ref"] != customer_ref
+                ):
+                    raise IdempotencyConflictError(
+                        idempotency_key=idempotency_key,
+                        existing_order_id=existing_order["id"],
+                        existing_restaurant_ref=existing_order["restaurant_ref"],
+                        existing_customer_ref=existing_order["customer_ref"],
+                        requested_restaurant_ref=restaurant_ref,
+                        requested_customer_ref=customer_ref,
+                    )
 
                 return dict(existing_order), False

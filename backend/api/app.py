@@ -3,12 +3,14 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
+from uuid import UUID
 
 import psycopg
 from fastapi import FastAPI, Header, HTTPException, Response, status
 from pydantic import BaseModel, Field
 
-from api.order_store import create_or_get_order
+from api.order_store import IdempotencyConflictError, create_or_get_order
+from api.task_store import retry_failed_tasks_for_order
 from common.db import (
     DatabaseConfigError,
     check_database_ready,
@@ -52,6 +54,27 @@ class OrderResponse(BaseModel):
     customer_ref: str | None
     created_at: datetime
     updated_at: datetime
+
+
+class RetriedTaskResponse(BaseModel):
+    """One failed task that an operator reset for another worker attempt."""
+
+    task_id: str
+    task_type: str
+    target_state: str | None
+    next_run_at: datetime
+    deadline_at: datetime | None
+    previous_attempts: int
+    previous_max_attempts: int
+    previous_last_error: str | None
+
+
+class RetryFailedTasksResponse(BaseModel):
+    """Operator response after reopening failed task rows for one order."""
+
+    order_id: str
+    retried_count: int
+    tasks: list[RetriedTaskResponse]
 
 
 @app.get("/healthz")
@@ -105,6 +128,23 @@ def create_order(
             restaurant_ref=request.restaurant_ref,
             customer_ref=request.customer_ref,
         )
+    except IdempotencyConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "Idempotency-Key is already used for a different order request",
+                "idempotency_key": exc.idempotency_key,
+                "existing_order_id": exc.existing_order_id,
+                "existing": {
+                    "restaurant_ref": exc.existing_restaurant_ref,
+                    "customer_ref": exc.existing_customer_ref,
+                },
+                "requested": {
+                    "restaurant_ref": exc.requested_restaurant_ref,
+                    "customer_ref": exc.requested_customer_ref,
+                },
+            },
+        ) from exc
     except DatabaseConfigError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except psycopg.Error as exc:
@@ -114,3 +154,25 @@ def create_order(
         status.HTTP_201_CREATED if was_created else status.HTTP_200_OK
     )
     return order
+
+
+@app.post(
+    "/orders/{order_id}/tasks/retry-failed",
+    response_model=RetryFailedTasksResponse,
+)
+def retry_failed_order_tasks(order_id: UUID) -> dict[str, Any]:
+    """Reopen failed tasks for an order without mutating the order state."""
+    try:
+        result = retry_failed_tasks_for_order(order_id=str(order_id))
+    except DatabaseConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except psycopg.Error as exc:
+        raise HTTPException(status_code=503, detail="postgres is not reachable") from exc
+
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="order not found",
+        )
+
+    return result
