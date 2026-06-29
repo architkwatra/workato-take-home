@@ -48,6 +48,13 @@ function numberText(value) {
   return Number(value ?? 0).toLocaleString();
 }
 
+function rateText(value) {
+  const parsed = Number(value ?? 0);
+  return parsed.toLocaleString(undefined, {
+    maximumFractionDigits: 1,
+  });
+}
+
 function shortId(value) {
   if (!value) {
     return "None";
@@ -254,6 +261,10 @@ function App() {
       failedTasks: taskCounts.failed ?? 0,
       duePending: overview?.tasks?.due_pending ?? 0,
       expiredRunning: overview?.tasks?.expired_running ?? 0,
+      tasksCompletedPerSecond:
+        overview?.throughput?.tasks_completed_per_second ?? 0,
+      tasksCompletedRecent: overview?.throughput?.tasks_completed ?? 0,
+      throughputWindowSeconds: overview?.throughput?.window_seconds ?? 30,
       activeWorkers: overview?.workers?.active_count ?? 0,
       seenWorkers: overview?.workers?.total_seen ?? 0,
     };
@@ -390,6 +401,14 @@ function App() {
           value={numberText(totals.duePending)}
           detail="pending now"
           tone={totals.duePending > 0 ? "watch" : "neutral"}
+        />
+        <Metric
+          label="Task Rate"
+          value={`${rateText(totals.tasksCompletedPerSecond)}/s`}
+          detail={`${numberText(totals.tasksCompletedRecent)} in last ${
+            totals.throughputWindowSeconds
+          }s`}
+          tone={totals.tasksCompletedPerSecond > 0 ? "good" : "neutral"}
         />
         <Metric
           label="Task Issues"

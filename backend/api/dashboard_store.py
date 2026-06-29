@@ -7,6 +7,7 @@ from common.db import open_db_connection
 from common.state_machine import ORDER_STATES
 from common.task_types import (
     ORDER_TASK_STATUSES,
+    TASK_STATUS_COMPLETED,
     TASK_STATUS_FAILED,
     TASK_STATUS_PENDING,
     TASK_STATUS_RUNNING,
@@ -19,6 +20,10 @@ ACTIVE_WORKER_THRESHOLD_SECONDS = 30
 RECENT_ORDER_LIMIT = 12
 RECENT_EVENT_LIMIT = 20
 PROBLEM_TASK_LIMIT = 20
+# Keep throughput derived from a short rolling window. This is intentionally
+# read-model-only for the local dashboard; durable metrics storage can come
+# later if we need historical charts.
+THROUGHPUT_WINDOW_SECONDS = 30
 
 
 def _count_map(
@@ -74,10 +79,20 @@ def get_dashboard_overview() -> dict[str, Any]:
                         where
                             status = %s::task_status
                             and locked_until < now()
-                    )::int as expired_running
+                    )::int as expired_running,
+                    count(*) filter (
+                        where
+                            status = %s::task_status
+                            and updated_at >= now() - (%s * interval '1 second')
+                    )::int as completed_recent
                 from order_tasks
                 """,
-                (TASK_STATUS_PENDING, TASK_STATUS_RUNNING),
+                (
+                    TASK_STATUS_PENDING,
+                    TASK_STATUS_RUNNING,
+                    TASK_STATUS_COMPLETED,
+                    THROUGHPUT_WINDOW_SECONDS,
+                ),
             )
             task_health = dict(cur.fetchone())
 
@@ -97,6 +112,14 @@ def get_dashboard_overview() -> dict[str, Any]:
             "by_status": task_counts,
             "due_pending": task_health["due_pending"],
             "expired_running": task_health["expired_running"],
+        },
+        "throughput": {
+            "window_seconds": THROUGHPUT_WINDOW_SECONDS,
+            "tasks_completed": task_health["completed_recent"],
+            "tasks_completed_per_second": round(
+                task_health["completed_recent"] / THROUGHPUT_WINDOW_SECONDS,
+                2,
+            ),
         },
         "workers": workers,
         "problem_tasks": problem_tasks,
