@@ -27,6 +27,15 @@ const ORDER_STATES = [
   "failed",
 ];
 
+const PIPELINE_STATES = [
+  "placed",
+  "confirmed",
+  "preparing",
+  "ready",
+  "out_for_delivery",
+  "delivered",
+];
+
 const TASK_STATUSES = ["pending", "running", "completed", "failed", "cancelled"];
 
 const LABELS = {
@@ -89,6 +98,14 @@ function formatAge(seconds) {
   return `${Math.floor(safeSeconds / 3600)}h ${Math.floor((safeSeconds % 3600) / 60)}m`;
 }
 
+async function requestDashboard(path, { signal } = {}) {
+  const response = await fetch(`${API_BASE_URL}${path}`, { signal });
+  if (!response.ok) {
+    throw new Error(`API returned ${response.status}`);
+  }
+  return response.json();
+}
+
 async function requestLoadgen(path, { method = "GET", body, signal } = {}) {
   const response = await fetch(`${LOADGEN_BASE_URL}${path}`, {
     method,
@@ -138,6 +155,11 @@ function App() {
   const [status, setStatus] = useState("loading");
   const [error, setError] = useState("");
   const [lastRefreshAt, setLastRefreshAt] = useState(null);
+  const [selectedOrderId, setSelectedOrderId] = useState(null);
+  const [orderDetail, setOrderDetail] = useState(null);
+  const [orderDetailStatus, setOrderDetailStatus] = useState("idle");
+  const [orderDetailError, setOrderDetailError] = useState("");
+  const [orderDetailLastRefreshAt, setOrderDetailLastRefreshAt] = useState(null);
   const [loadgenStatus, setLoadgenStatus] = useState(null);
   const [loadgenConnection, setLoadgenConnection] = useState("loading");
   const [loadgenError, setLoadgenError] = useState("");
@@ -161,14 +183,9 @@ function App() {
       setStatus((current) => (current === "online" ? "refreshing" : "loading"));
 
       try {
-        const response = await fetch(`${API_BASE_URL}/dashboard/overview`, {
+        const payload = await requestDashboard("/dashboard/overview", {
           signal: controller.signal,
         });
-        if (!response.ok) {
-          throw new Error(`API returned ${response.status}`);
-        }
-
-        const payload = await response.json();
         if (stopped) {
           return;
         }
@@ -202,6 +219,61 @@ function App() {
       controller?.abort();
     };
   }, []);
+
+  useEffect(() => {
+    if (!selectedOrderId) {
+      setOrderDetail(null);
+      setOrderDetailStatus("idle");
+      setOrderDetailError("");
+      setOrderDetailLastRefreshAt(null);
+      return undefined;
+    }
+
+    let stopped = false;
+    let timerId = null;
+    let controller = null;
+
+    async function loadOrderDetail() {
+      controller = new AbortController();
+      setOrderDetailStatus((current) =>
+        current === "online" ? "refreshing" : "loading",
+      );
+
+      try {
+        const payload = await requestDashboard(`/dashboard/orders/${selectedOrderId}`, {
+          signal: controller.signal,
+        });
+        if (stopped) {
+          return;
+        }
+
+        setOrderDetail(payload);
+        setOrderDetailStatus("online");
+        setOrderDetailError("");
+        setOrderDetailLastRefreshAt(new Date());
+      } catch (caughtError) {
+        if (stopped || caughtError.name === "AbortError") {
+          return;
+        }
+
+        setOrderDetailStatus("offline");
+        setOrderDetailError(caughtError.message || "order detail request failed");
+      } finally {
+        if (!stopped) {
+          timerId = window.setTimeout(loadOrderDetail, POLL_INTERVAL_MS);
+        }
+      }
+    }
+
+    setOrderDetail(null);
+    loadOrderDetail();
+
+    return () => {
+      stopped = true;
+      window.clearTimeout(timerId);
+      controller?.abort();
+    };
+  }, [selectedOrderId]);
 
   useEffect(() => {
     let stopped = false;
@@ -281,6 +353,14 @@ function App() {
 
   function updateLoadgenForm(field, value) {
     setLoadgenForm((current) => ({ ...current, [field]: value }));
+  }
+
+  function openOrderDetail(orderId) {
+    setSelectedOrderId(orderId);
+  }
+
+  function closeOrderDetail() {
+    setSelectedOrderId(null);
   }
 
   function readPositiveNumber(value, label) {
@@ -388,64 +468,291 @@ function App() {
         </div>
       ) : null}
 
-      <section className="summary-grid" aria-label="Pipeline summary">
-        <Metric label="Orders" value={numberText(totals.totalOrders)} detail="total created" />
-        <Metric
-          label="Delivered"
-          value={numberText(totals.deliveredOrders)}
-          detail="terminal success"
-          tone="good"
+      {selectedOrderId ? (
+        <OrderDetailPage
+          detail={orderDetail}
+          error={orderDetailError}
+          lastRefreshAt={orderDetailLastRefreshAt}
+          onBack={closeOrderDetail}
+          status={orderDetailStatus}
         />
-        <Metric
-          label="Due Work"
-          value={numberText(totals.duePending)}
-          detail="pending now"
-          tone={totals.duePending > 0 ? "watch" : "neutral"}
-        />
-        <Metric
-          label="Task Rate"
-          value={`${rateText(totals.tasksCompletedPerSecond)}/s`}
-          detail={`${numberText(totals.tasksCompletedRecent)} in last ${
-            totals.throughputWindowSeconds
-          }s`}
-          tone={totals.tasksCompletedPerSecond > 0 ? "good" : "neutral"}
-        />
-        <Metric
-          label="Task Issues"
-          value={numberText(totals.failedTasks + totals.expiredRunning)}
-          detail="failed or expired"
-          tone={totals.failedTasks + totals.expiredRunning > 0 ? "bad" : "neutral"}
-        />
-      </section>
+      ) : (
+        <>
+          <section className="summary-grid" aria-label="Pipeline summary">
+            <Metric label="Orders" value={numberText(totals.totalOrders)} detail="total created" />
+            <Metric
+              label="Delivered"
+              value={numberText(totals.deliveredOrders)}
+              detail="terminal success"
+              tone="good"
+            />
+            <Metric
+              label="Due Work"
+              value={numberText(totals.duePending)}
+              detail="pending now"
+              tone={totals.duePending > 0 ? "watch" : "neutral"}
+            />
+            <Metric
+              label="Task Rate"
+              value={`${rateText(totals.tasksCompletedPerSecond)}/s`}
+              detail={`${numberText(totals.tasksCompletedRecent)} in last ${
+                totals.throughputWindowSeconds
+              }s`}
+              tone={totals.tasksCompletedPerSecond > 0 ? "good" : "neutral"}
+            />
+            <Metric
+              label="Task Issues"
+              value={numberText(totals.failedTasks + totals.expiredRunning)}
+              detail="failed or expired"
+              tone={totals.failedTasks + totals.expiredRunning > 0 ? "bad" : "neutral"}
+            />
+          </section>
 
-      <LoadgenControlPanel
-        actionError={loadgenActionError}
-        actionPending={loadgenActionPending}
-        connection={loadgenConnection}
-        error={loadgenError}
-        form={loadgenForm}
-        lastRefreshAt={loadgenLastRefreshAt}
-        onChange={updateLoadgenForm}
-        onStart={startLoadgen}
-        onStop={stopLoadgen}
-        onUpdateRate={updateLoadgenRate}
-        status={loadgenStatus}
-      />
+          <LoadgenControlPanel
+            actionError={loadgenActionError}
+            actionPending={loadgenActionPending}
+            connection={loadgenConnection}
+            error={loadgenError}
+            form={loadgenForm}
+            lastRefreshAt={loadgenLastRefreshAt}
+            onChange={updateLoadgenForm}
+            onStart={startLoadgen}
+            onStop={stopLoadgen}
+            onUpdateRate={updateLoadgenRate}
+            status={loadgenStatus}
+          />
 
-      <div className="content-grid">
-        <LifecyclePanel overview={overview} />
-        <TaskHealthPanel overview={overview} />
-      </div>
+          <div className="content-grid">
+            <LifecyclePanel overview={overview} />
+            <RecentOrdersPanel overview={overview} onSelectOrder={openOrderDetail} />
+          </div>
 
-      <WorkerPanel overview={overview} />
+          <WorkerPanel overview={overview} />
 
-      <div className="content-grid wide">
-        <ProblemTaskPanel overview={overview} />
-        <RecentOrdersPanel overview={overview} />
-      </div>
+          <div className="content-grid wide">
+            <ProblemTaskPanel overview={overview} />
+            <RecentEventsPanel overview={overview} />
+          </div>
 
-      <RecentEventsPanel overview={overview} />
+          <TaskHealthPanel overview={overview} />
+        </>
+      )}
     </main>
+  );
+}
+
+function OrderDetailPage({ detail, error, lastRefreshAt, onBack, status }) {
+  const order = detail?.order;
+  const tasks = detail?.tasks ?? [];
+  const events = detail?.events ?? [];
+  const statusLabel =
+    status === "online" || status === "refreshing"
+      ? "Live"
+      : status === "offline"
+        ? "Stale"
+        : "Loading";
+
+  return (
+    <section className="detail-page">
+      <div className="detail-toolbar">
+        <button className="button" type="button" onClick={onBack}>
+          Back to Dashboard
+        </button>
+        <div className="detail-toolbar-meta">
+          <span className={`connection ${status}`}>{statusLabel}</span>
+          <span>Updated {lastRefreshAt ? formatTime(lastRefreshAt) : "pending"}</span>
+        </div>
+      </div>
+
+      {error ? (
+        <div className="alert" role="status">
+          Order detail issue: {error}
+        </div>
+      ) : null}
+
+      {order ? (
+        <>
+          <section className="section order-summary">
+            <div>
+              <p className="eyebrow">Order</p>
+              <h2 title={order.order_id}>{order.idempotency_key}</h2>
+            </div>
+            <dl className="order-meta">
+              <div>
+                <dt>State</dt>
+                <dd>{humanize(order.state)}</dd>
+              </div>
+              <div>
+                <dt>Restaurant</dt>
+                <dd>{order.restaurant_ref}</dd>
+              </div>
+              <div>
+                <dt>Courier</dt>
+                <dd>{order.courier_ref ?? "None"}</dd>
+              </div>
+              <div>
+                <dt>Customer</dt>
+                <dd>{order.customer_ref ?? "None"}</dd>
+              </div>
+              <div>
+                <dt>Created</dt>
+                <dd>{formatTime(order.created_at)}</dd>
+              </div>
+              <div>
+                <dt>Updated</dt>
+                <dd>{formatTime(order.updated_at)}</dd>
+              </div>
+            </dl>
+          </section>
+
+          <PipelinePanel order={order} events={events} />
+
+          <div className="content-grid wide">
+            <OrderTasksPanel tasks={tasks} />
+            <OrderEventsPanel events={events} />
+          </div>
+        </>
+      ) : (
+        <section className="section">
+          <div className="empty-state">Loading order detail</div>
+        </section>
+      )}
+    </section>
+  );
+}
+
+function PipelinePanel({ order, events }) {
+  const currentIndex = PIPELINE_STATES.indexOf(order.state);
+  const reachedAtByState = new Map();
+  for (const event of events) {
+    if (event.event_type === "order_created") {
+      reachedAtByState.set("placed", event.occurred_at);
+    }
+    if (event.to_state && !reachedAtByState.has(event.to_state)) {
+      reachedAtByState.set(event.to_state, event.occurred_at);
+    }
+  }
+
+  return (
+    <section className="section">
+      <div className="section-heading">
+        <h2>Order Pipeline</h2>
+        <span>{humanize(order.state)}</span>
+      </div>
+      <div className="pipeline">
+        {PIPELINE_STATES.map((state, index) => {
+          const reachedAt = reachedAtByState.get(state);
+          const stageStatus =
+            currentIndex === -1
+              ? reachedAt
+                ? "done"
+                : "waiting"
+              : index < currentIndex
+                ? "done"
+                : index === currentIndex
+                  ? "current"
+                  : "waiting";
+          return (
+            <div className={`pipeline-step ${stageStatus}`} key={state}>
+              <span className="pipeline-dot" />
+              <div>
+                <strong>{humanize(state)}</strong>
+                <small>{reachedAt ? formatTime(reachedAt) : "Pending"}</small>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {order.state === "cancelled" || order.state === "failed" ? (
+        <p className="inline-error">Order ended in {humanize(order.state)}</p>
+      ) : null}
+    </section>
+  );
+}
+
+function OrderTasksPanel({ tasks }) {
+  return (
+    <section className="section">
+      <div className="section-heading">
+        <h2>Order Tasks</h2>
+        <span>{numberText(tasks.length)} shown</span>
+      </div>
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Task</th>
+              <th>Target</th>
+              <th>Status</th>
+              <th>Attempts</th>
+              <th>Next Run</th>
+              <th>Error</th>
+            </tr>
+          </thead>
+          <tbody>
+            {tasks.length ? (
+              tasks.map((task) => (
+                <tr key={task.task_id}>
+                  <td title={task.task_id}>{humanize(task.task_type)}</td>
+                  <td>{humanize(task.target_state)}</td>
+                  <td>{humanize(task.status)}</td>
+                  <td>
+                    {numberText(task.attempts)}/{numberText(task.max_attempts)}
+                  </td>
+                  <td>{formatTime(task.next_run_at)}</td>
+                  <td className="truncate" title={task.last_error ?? ""}>
+                    {task.last_error ?? "None"}
+                  </td>
+                </tr>
+              ))
+            ) : (
+              <EmptyRow colSpan={6}>No task rows for this order</EmptyRow>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+function OrderEventsPanel({ events }) {
+  return (
+    <section className="section">
+      <div className="section-heading">
+        <h2>Order Events</h2>
+        <span>{numberText(events.length)} shown</span>
+      </div>
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Event</th>
+              <th>Transition</th>
+              <th>Worker</th>
+            </tr>
+          </thead>
+          <tbody>
+            {events.length ? (
+              events.map((event) => (
+                <tr key={event.event_id}>
+                  <td>{formatTime(event.occurred_at)}</td>
+                  <td>{humanize(event.event_type)}</td>
+                  <td>
+                    {event.from_state || event.to_state
+                      ? `${humanize(event.from_state)} -> ${humanize(event.to_state)}`
+                      : "None"}
+                  </td>
+                  <td title={event.worker_id ?? ""}>{shortId(event.worker_id)}</td>
+                </tr>
+              ))
+            ) : (
+              <EmptyRow colSpan={4}>No events for this order yet</EmptyRow>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </section>
   );
 }
 
@@ -741,7 +1048,7 @@ function ProblemTaskPanel({ overview }) {
   );
 }
 
-function RecentOrdersPanel({ overview }) {
+function RecentOrdersPanel({ overview, onSelectOrder }) {
   const rows = overview?.recent_orders ?? [];
 
   return (
@@ -765,7 +1072,15 @@ function RecentOrdersPanel({ overview }) {
             {rows.length ? (
               rows.map((order) => (
                 <tr key={order.order_id}>
-                  <td title={order.order_id}>{order.idempotency_key}</td>
+                  <td title={order.order_id}>
+                    <button
+                      className="text-button"
+                      type="button"
+                      onClick={() => onSelectOrder(order.order_id)}
+                    >
+                      {order.idempotency_key}
+                    </button>
+                  </td>
                   <td>{humanize(order.state)}</td>
                   <td>{order.restaurant_ref}</td>
                   <td>{order.courier_ref ?? "None"}</td>
