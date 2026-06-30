@@ -1117,11 +1117,6 @@ function App() {
             <RecentOrdersPanel overview={overview} onSelectOrder={openOrderDetail} />
           </div>
 
-          <div className="content-grid wide">
-            <PipelineLatencyPanel overview={overview} />
-            <QueueHealthPanel totals={totals} />
-          </div>
-
           <AttentionOrdersPanel
             overview={overview}
             onSelectOrder={openOrderDetail}
@@ -1129,6 +1124,11 @@ function App() {
             retryActionError={retryActionError}
             retryActionPendingOrderId={retryActionPendingOrderId}
           />
+
+          <div className="content-grid wide">
+            <PipelineLatencyPanel overview={overview} />
+            <QueueHealthPanel totals={totals} />
+          </div>
 
           <RecentEventsPanel overview={overview} />
         </>
@@ -1830,26 +1830,66 @@ function ReasonChips({ order }) {
   );
 }
 
+function compactSearchText(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+function attentionSearchValues(order) {
+  return [
+    order.order_id,
+    shortId(order.order_id),
+    order.idempotency_key,
+    shortKey(order.idempotency_key),
+    order.state,
+    humanize(order.state),
+    formatDurationSeconds(order.age_seconds),
+    formatDurationSeconds(order.state_seconds),
+    formatDurationSeconds(order.overdue_seconds),
+    formatDurationSeconds(order.stuck_seconds),
+    order.latest_task_id,
+    shortId(order.latest_task_id),
+    order.latest_task_type,
+    humanize(order.latest_task_type),
+    order.latest_task_target_state,
+    humanize(order.latest_task_target_state),
+    order.latest_task_status,
+    humanize(order.latest_task_status),
+    formatTime(order.latest_task_next_run_at),
+    order.latest_task_last_error,
+    ...attentionReasons(order),
+  ].filter(Boolean);
+}
+
 function matchesAttentionSearch(order, query) {
   if (!query) {
     return true;
   }
 
-  const searchable = [
-    order.order_id,
-    order.idempotency_key,
-    order.state,
-    order.latest_task_type,
-    order.latest_task_target_state,
-    order.latest_task_status,
-    order.latest_task_last_error,
-    ...attentionReasons(order),
-  ]
-    .filter(Boolean)
+  const searchable = attentionSearchValues(order)
     .join(" ")
     .toLowerCase();
+  if (searchable.includes(query)) {
+    return true;
+  }
 
-  return searchable.includes(query);
+  const compactSearchable = compactSearchText(searchable);
+  const compactQuery = compactSearchText(query);
+  if (compactQuery && compactSearchable.includes(compactQuery)) {
+    return true;
+  }
+
+  return query
+    .split(/\s+/)
+    .filter(Boolean)
+    .every((token) => {
+      const compactToken = compactSearchText(token);
+      return (
+        searchable.includes(token) ||
+        (compactToken && compactSearchable.includes(compactToken))
+      );
+    });
 }
 
 function AttentionOrdersPanel({
