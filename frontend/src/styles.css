@@ -803,7 +803,12 @@ h2 {
 .pipeline {
   display: grid;
   gap: 0;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(
+    var(--pipeline-state-count, 7),
+    minmax(128px, 1fr)
+  );
+  overflow-x: auto;
+  padding-bottom: 4px;
 }
 
 .pipeline-step {
@@ -1136,11 +1141,6 @@ tbody tr:last-child td {
   .loadgen-top {
     flex-wrap: wrap;
   }
-
-  .pipeline {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    row-gap: 18px;
-  }
 }
 
 @media (max-width: 560px) {
@@ -1171,8 +1171,7 @@ tbody tr:last-child td {
 
   .loadgen-controls,
   .order-meta,
-  .secondary-metrics,
-  .pipeline {
+  .secondary-metrics {
     grid-template-columns: 1fr;
   }
 

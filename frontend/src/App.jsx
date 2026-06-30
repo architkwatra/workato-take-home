@@ -1432,7 +1432,10 @@ function PipelinePanel({ order, events }) {
         <h2>Order Pipeline</h2>
         <StateBadge state={order.state} />
       </div>
-      <div className="pipeline">
+      <div
+        className="pipeline"
+        style={{ "--pipeline-state-count": PIPELINE_STATES.length }}
+      >
         {PIPELINE_STATES.map((state, index) => {
           const reachedAt = reachedAtByState.get(state);
           const previousState = PIPELINE_STATES[index - 1];
