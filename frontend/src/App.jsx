@@ -106,6 +106,8 @@ const METRIC_HELP = {
     "Orders delivered per minute over the rolling dashboard window.",
   pipelineLatency:
     "End-to-end p95 time from order creation to delivery, across orders delivered in the current latency window.",
+  overdueOrders:
+    "Active orders that were created more than the configured delivery SLA ago and have not reached a terminal state.",
   stuckOrders:
     "Non-terminal orders whose time in the current lifecycle state is above that stage's configured stuck threshold.",
   taskCompletionRate:
@@ -125,6 +127,8 @@ const DETAIL_HELP = {
     "95th percentile elapsed time from order_created to delivered. 95% of delivered orders in the current latency window completed at or below this value.",
   stageLatency:
     "95th percentile elapsed time between consecutive lifecycle events for transitions reached in the current latency window, calculated from order_events.",
+  overdueOrders:
+    "Orders are marked overdue when orders.created_at is older than the configured end-to-end delivery SLA and the order is still active. Delivered, cancelled, and failed orders are excluded.",
   stuckOrders:
     "Orders are marked stuck when they are not terminal and orders.updated_at is older than the configured threshold for the current state. Delivered, cancelled, and failed orders are excluded.",
   taskCompletionRate:
@@ -792,6 +796,8 @@ function App() {
       pipelineP95Seconds: overview?.latency?.pipeline?.p95_seconds ?? null,
       pipelineSampleCount: overview?.latency?.pipeline?.sample_count ?? 0,
       latencyWindowSeconds: overview?.latency?.window_seconds ?? 300,
+      overdueOrderCount: overview?.overdue_orders?.total ?? 0,
+      orderDeliverySlaSeconds: overview?.overdue_orders?.threshold_seconds ?? 120,
       stuckOrderCount: overview?.stuck_orders?.total ?? 0,
       activeWorkers: overview?.workers?.active_count ?? 0,
       configuredWorkers: overview?.workers?.configured_count ?? 0,
@@ -1072,6 +1078,13 @@ function App() {
               tone={totals.pipelineP95Seconds == null ? "neutral" : "good"}
             />
             <Metric
+              label="Overdue Orders"
+              value={numberText(totals.overdueOrderCount)}
+              detail={`>${formatDurationSeconds(totals.orderDeliverySlaSeconds)} since created`}
+              helpText={METRIC_HELP.overdueOrders}
+              tone={totals.overdueOrderCount > 0 ? "bad" : "neutral"}
+            />
+            <Metric
               label="Stuck Orders"
               value={numberText(totals.stuckOrderCount)}
               detail={
@@ -1119,14 +1132,16 @@ function App() {
           </div>
 
           <div className="content-grid wide">
+            <OverdueOrdersPanel overview={overview} onSelectOrder={openOrderDetail} />
             <StuckOrdersPanel overview={overview} onSelectOrder={openOrderDetail} />
-            <ProblemTaskPanel
-              overview={overview}
-              onRetryFailedTasks={retryFailedTasks}
-              retryActionError={retryActionError}
-              retryActionPendingOrderId={retryActionPendingOrderId}
-            />
           </div>
+
+          <ProblemTaskPanel
+            overview={overview}
+            onRetryFailedTasks={retryFailedTasks}
+            retryActionError={retryActionError}
+            retryActionPendingOrderId={retryActionPendingOrderId}
+          />
 
           <RecentEventsPanel overview={overview} />
         </>
@@ -1780,6 +1795,98 @@ function LifecyclePanel({ overview }) {
   );
 }
 
+function LatestTaskSummary({ item }) {
+  if (!item.latest_task_type) {
+    return "—";
+  }
+
+  return (
+    <div className="task-stack">
+      <span>
+        {humanize(item.latest_task_type)}
+        {item.latest_task_target_state
+          ? ` → ${humanize(item.latest_task_target_state)}`
+          : ""}
+      </span>
+      <TaskStatusBadge status={item.latest_task_status} />
+    </div>
+  );
+}
+
+function OverdueOrdersPanel({ overview, onSelectOrder }) {
+  const overdueOverview = overview?.overdue_orders ?? {};
+  const rows = overdueOverview.items ?? [];
+  const total = overdueOverview.total ?? rows.length;
+  const limit = overdueOverview.limit ?? rows.length;
+  const thresholdSeconds = overdueOverview.threshold_seconds ?? 120;
+  const thresholdLabel = formatDurationSeconds(thresholdSeconds);
+  const thresholdHelp = `${DETAIL_HELP.overdueOrders} SLA: ${thresholdLabel}.`;
+
+  return (
+    <section className="section overdue-orders-panel">
+      <div className="section-heading">
+        <h2>Overdue Orders</h2>
+        <span className="label-with-help">
+          {numberText(total)} over SLA
+          <HelpIcon text={thresholdHelp} />
+        </span>
+      </div>
+      <div className="table-wrap">
+        <table className="overdue-orders-table">
+          <thead>
+            <tr>
+              <th>Order</th>
+              <th>State</th>
+              <th>Age</th>
+              <th>Overdue By</th>
+              <th>Latest Task</th>
+              <th>Error</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.length ? (
+              rows.map((order) => (
+                <tr key={order.order_id}>
+                  <td>
+                    <a
+                      className="text-button"
+                      href={orderDetailPath(order.order_id)}
+                      title={order.idempotency_key}
+                      onClick={(event) => onSelectOrder(order.order_id, event)}
+                    >
+                      {shortKey(order.idempotency_key)}
+                    </a>
+                  </td>
+                  <td><StateBadge state={order.state} /></td>
+                  <td>{formatDurationSeconds(order.age_seconds)}</td>
+                  <td className="overdue-duration">
+                    {formatDurationSeconds(order.overdue_seconds)}
+                  </td>
+                  <td><LatestTaskSummary item={order} /></td>
+                  <td
+                    className="truncate"
+                    title={order.latest_task_last_error ?? ""}
+                  >
+                    {order.latest_task_last_error ?? "—"}
+                  </td>
+                </tr>
+              ))
+            ) : (
+              <EmptyRow colSpan={6}>No active orders are over the delivery SLA</EmptyRow>
+            )}
+          </tbody>
+        </table>
+      </div>
+      {total > rows.length ? (
+        <p className="muted-text panel-footnote">
+          Showing oldest {numberText(Math.min(limit, rows.length))} of{" "}
+          {numberText(total)} overdue orders.
+        </p>
+      ) : null}
+    </section>
+  );
+}
+
 function StuckOrdersPanel({ overview, onSelectOrder }) {
   const stuckOverview = overview?.stuck_orders ?? {};
   const rows = stuckOverview.items ?? [];
@@ -1830,21 +1937,7 @@ function StuckOrdersPanel({ overview, onSelectOrder }) {
                     {formatDurationSeconds(order.stuck_seconds)}
                   </td>
                   <td>{formatDurationSeconds(order.threshold_seconds)}</td>
-                  <td>
-                    {order.latest_task_type ? (
-                      <div className="task-stack">
-                        <span>
-                          {humanize(order.latest_task_type)}
-                          {order.latest_task_target_state
-                            ? ` → ${humanize(order.latest_task_target_state)}`
-                            : ""}
-                        </span>
-                        <TaskStatusBadge status={order.latest_task_status} />
-                      </div>
-                    ) : (
-                      "—"
-                    )}
-                  </td>
+                  <td><LatestTaskSummary item={order} /></td>
                   <td
                     className="truncate"
                     title={order.latest_task_last_error ?? ""}

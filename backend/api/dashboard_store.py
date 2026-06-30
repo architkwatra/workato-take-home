@@ -7,8 +7,10 @@ from psycopg.rows import dict_row
 from common.db import open_db_connection
 from common.event_types import EVENT_TYPE_ORDER_CREATED, EVENT_TYPE_STATE_TRANSITION
 from common.state_machine import (
+    ORDER_STATE_CANCELLED,
     ORDER_STATE_CONFIRMED,
     ORDER_STATE_DELIVERED,
+    ORDER_STATE_FAILED,
     ORDER_STATE_OUT_FOR_DELIVERY,
     ORDER_STATE_PLACED,
     ORDER_STATE_PREPARING,
@@ -33,6 +35,7 @@ RECENT_EVENT_LIMIT = 20
 PROBLEM_TASK_LIMIT = 20
 PLACED_ORDER_LIMIT = 5
 STUCK_ORDER_LIMIT = 12
+OVERDUE_ORDER_LIMIT = 12
 ORDER_DETAIL_EVENT_LIMIT = 50
 ORDER_DETAIL_TASK_LIMIT = 50
 # Keep throughput derived from a short rolling window. This is intentionally
@@ -42,6 +45,7 @@ THROUGHPUT_WINDOW_SECONDS = 30
 # Latency is also windowed, but over a longer interval so the dashboard remains
 # responsive to a new loadgen run without going blank between deliveries.
 DEFAULT_LATENCY_WINDOW_SECONDS = 300
+DEFAULT_ORDER_DELIVERY_SLA_SECONDS = 120
 DEFAULT_STUCK_ORDER_THRESHOLDS_SECONDS = {
     ORDER_STATE_PLACED: 18,
     ORDER_STATE_CONFIRMED: 18,
@@ -91,6 +95,13 @@ def _latency_window_seconds() -> int:
     return _positive_int_env(
         "DASHBOARD_LATENCY_WINDOW_SECONDS",
         DEFAULT_LATENCY_WINDOW_SECONDS,
+    )
+
+
+def _order_delivery_sla_seconds() -> int:
+    return _positive_int_env(
+        "DASHBOARD_ORDER_DELIVERY_SLA_SECONDS",
+        DEFAULT_ORDER_DELIVERY_SLA_SECONDS,
     )
 
 
@@ -194,6 +205,11 @@ def get_dashboard_overview() -> dict[str, Any]:
 
             order_throughput = _load_order_throughput(cur)
             latency = _load_latency_overview(cur, _latency_window_seconds())
+            order_delivery_sla_seconds = _order_delivery_sla_seconds()
+            overdue_orders = _load_overdue_order_overview(
+                cur,
+                order_delivery_sla_seconds,
+            )
             stuck_thresholds = _stuck_order_thresholds()
             stuck_orders = _load_stuck_order_overview(cur, stuck_thresholds)
             workers = _load_worker_overview(cur)
@@ -233,6 +249,12 @@ def get_dashboard_overview() -> dict[str, Any]:
             ),
         },
         "latency": latency,
+        "overdue_orders": {
+            "total": overdue_orders["total"],
+            "limit": OVERDUE_ORDER_LIMIT,
+            "threshold_seconds": order_delivery_sla_seconds,
+            "items": overdue_orders["items"],
+        },
         "stuck_orders": {
             "total": stuck_orders["total"],
             "limit": STUCK_ORDER_LIMIT,
@@ -244,6 +266,94 @@ def get_dashboard_overview() -> dict[str, Any]:
         "placed_orders": placed_orders,
         "recent_orders": recent_orders,
         "recent_events": recent_events,
+    }
+
+
+def _load_overdue_order_overview(
+    cur,
+    threshold_seconds: int,
+) -> dict[str, Any]:
+    """Return active orders that have exceeded the end-to-end delivery SLA."""
+    cur.execute(
+        """
+        with overdue as (
+            select
+                orders.id,
+                orders.id::text as order_id,
+                orders.idempotency_key,
+                orders.state::text,
+                orders.restaurant_ref,
+                orders.courier_ref,
+                orders.created_at,
+                orders.updated_at,
+                extract(epoch from now() - orders.created_at)::int
+                    as age_seconds,
+                (
+                    extract(epoch from now() - orders.created_at)::int - %s
+                ) as overdue_seconds
+            from orders
+            where
+                orders.state not in (
+                    %s::order_state,
+                    %s::order_state,
+                    %s::order_state
+                )
+                and orders.created_at <= now() - (%s * interval '1 second')
+        )
+        select
+            count(*) over()::int as total_count,
+            overdue.order_id,
+            overdue.idempotency_key,
+            overdue.state,
+            overdue.restaurant_ref,
+            overdue.courier_ref,
+            overdue.created_at,
+            overdue.updated_at,
+            overdue.age_seconds,
+            overdue.overdue_seconds,
+            task.id::text as latest_task_id,
+            task.task_type::text as latest_task_type,
+            task.target_state::text as latest_task_target_state,
+            task.status::text as latest_task_status,
+            task.next_run_at as latest_task_next_run_at,
+            task.locked_until as latest_task_locked_until,
+            task.last_error as latest_task_last_error
+        from overdue
+        left join lateral (
+            select
+                id,
+                task_type,
+                target_state,
+                status,
+                next_run_at,
+                locked_until,
+                last_error
+            from order_tasks
+            where order_id = overdue.id
+            order by updated_at desc, created_at desc, id desc
+            limit 1
+        ) as task on true
+        order by overdue.age_seconds desc, overdue.created_at asc
+        limit %s
+        """,
+        (
+            threshold_seconds,
+            ORDER_STATE_DELIVERED,
+            ORDER_STATE_CANCELLED,
+            ORDER_STATE_FAILED,
+            threshold_seconds,
+            OVERDUE_ORDER_LIMIT,
+        ),
+    )
+    rows = [dict(row) for row in cur.fetchall()]
+    total_count = rows[0]["total_count"] if rows else 0
+
+    for row in rows:
+        del row["total_count"]
+
+    return {
+        "total": total_count,
+        "items": rows,
     }
 
 

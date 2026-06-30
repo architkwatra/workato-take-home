@@ -142,7 +142,7 @@ h2 {
 .summary-grid {
   display: grid;
   gap: 12px;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   margin-bottom: 16px;
 }
 
@@ -1016,10 +1016,12 @@ tbody tr:last-child td {
   white-space: nowrap;
 }
 
+.overdue-orders-table,
 .stuck-orders-table {
   min-width: 760px;
 }
 
+.overdue-duration,
 .stuck-duration {
   color: #a33b2f;
   font-weight: 900;
