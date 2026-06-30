@@ -102,8 +102,6 @@ const METRIC_HELP = {
   orders: "Total order rows in the database, across every order state.",
   ordersCreatedRate:
     "Orders accepted per minute over the rolling dashboard window.",
-  ordersDeliveredRate:
-    "Counts order_events where event_type is state_transition and to_state is delivered in the last 30 seconds, then normalizes to per minute: delivered count * 60 / 30.",
   pipelineLatency:
     "End-to-end p95 time from order creation to delivery, across orders delivered in the current latency window.",
   attentionOrders:
@@ -210,6 +208,18 @@ function formatLatencySeconds(seconds) {
 function formatWindowLabel(seconds) {
   const duration = formatDurationSeconds(seconds);
   return duration === "—" ? "current window" : `last ${duration}`;
+}
+
+function deliveredRateHelpText(windowSeconds) {
+  const parsed = Number(windowSeconds);
+  const windowLabel = Number.isFinite(parsed) && parsed > 0
+    ? formatWindowLabel(parsed)
+    : "the rolling dashboard window";
+  const divisor = Number.isFinite(parsed) && parsed > 0
+    ? numberText(parsed)
+    : "window seconds";
+
+  return `Counts order_events where event_type is state_transition and to_state is delivered in ${windowLabel}, then normalizes to per minute: delivered count * 60 / ${divisor}.`;
 }
 
 function stuckThresholdText(thresholds = {}) {
@@ -1063,7 +1073,7 @@ function App() {
               detail={`${numberText(totals.ordersDeliveredRecent)} in last ${
                 totals.throughputWindowSeconds
               }s`}
-              helpText={METRIC_HELP.ordersDeliveredRate}
+              helpText={deliveredRateHelpText(totals.throughputWindowSeconds)}
               tone={totals.ordersDeliveredPerMinute > 0 ? "good" : "neutral"}
             />
             <Metric
