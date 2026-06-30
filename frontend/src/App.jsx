@@ -1856,6 +1856,11 @@ function attentionSearchValues(order) {
     humanize(order.latest_task_target_state),
     order.latest_task_status,
     humanize(order.latest_task_status),
+    `${numberText(order.latest_task_attempts)}/${numberText(
+      order.latest_task_max_attempts,
+    )}`,
+    `${numberText(order.latest_task_attempts)} attempts`,
+    `${numberText(order.latest_task_max_attempts)} max attempts`,
     formatTime(order.latest_task_next_run_at),
     order.latest_task_last_error,
     ...attentionReasons(order),
@@ -1977,6 +1982,7 @@ function AttentionOrdersPanel({
               <th>State Time</th>
               <th>Reasons</th>
               <th>Task</th>
+              <th>Retries</th>
               <th>Next Run</th>
               <th>Error</th>
               <th>Action</th>
@@ -2009,6 +2015,15 @@ function AttentionOrdersPanel({
                     </td>
                     <td><ReasonChips order={order} /></td>
                     <td><LatestTaskSummary item={order} /></td>
+                    <td>
+                      <span
+                        className="retry-count"
+                        title="Retryable errors consumed by this task"
+                      >
+                        {numberText(order.latest_task_attempts)}/
+                        {numberText(order.latest_task_max_attempts)}
+                      </span>
+                    </td>
                     <td>{formatTime(order.latest_task_next_run_at)}</td>
                     <td
                       className="truncate"
@@ -2032,7 +2047,7 @@ function AttentionOrdersPanel({
                 );
               })
             ) : (
-              <EmptyRow colSpan={9}>No matching orders need attention</EmptyRow>
+              <EmptyRow colSpan={10}>No matching orders need attention</EmptyRow>
             )}
           </tbody>
         </table>

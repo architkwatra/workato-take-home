@@ -1057,6 +1057,13 @@ tbody tr:last-child td {
   font-weight: 900;
 }
 
+.retry-count {
+  color: #263241;
+  font-variant-numeric: tabular-nums;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
 .task-stack {
   display: grid;
   gap: 5px;

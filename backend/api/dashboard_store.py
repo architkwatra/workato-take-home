@@ -409,6 +409,8 @@ def _load_attention_order_overview(
             task.task_type::text as latest_task_type,
             task.target_state::text as latest_task_target_state,
             task.status::text as latest_task_status,
+            task.attempts as latest_task_attempts,
+            task.max_attempts as latest_task_max_attempts,
             task.next_run_at as latest_task_next_run_at,
             task.locked_until as latest_task_locked_until,
             task.last_error as latest_task_last_error
@@ -419,6 +421,8 @@ def _load_attention_order_overview(
                 task_type,
                 target_state,
                 status,
+                attempts,
+                max_attempts,
                 next_run_at,
                 locked_until,
                 last_error
