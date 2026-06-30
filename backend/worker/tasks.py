@@ -9,17 +9,24 @@ import httpx
 from psycopg.rows import dict_row
 
 from common.db import open_db_connection
-from common.event_types import EVENT_TYPE_ORDER_CREATED, EVENT_TYPE_STATE_TRANSITION
+from common.event_types import (
+    EVENT_TYPE_ORDER_CREATED,
+    EVENT_TYPE_ORDER_FAILED,
+    EVENT_TYPE_STATE_TRANSITION,
+)
 from common.state_machine import (
     ORDER_STATE_CONFIRMED,
     ORDER_STATE_DELIVERED,
+    ORDER_STATE_FAILED,
     ORDER_STATE_OUT_FOR_DELIVERY,
+    ORDER_STATE_PAYMENT_CHECK,
     ORDER_STATE_PLACED,
     ORDER_STATE_PREPARING,
     ORDER_STATE_READY,
     is_terminal_order_state,
 )
 from common.task_types import (
+    TASK_STATUS_CANCELLED,
     TASK_STATUS_COMPLETED,
     TASK_STATUS_FAILED,
     TASK_STATUS_PENDING,
@@ -59,12 +66,17 @@ ALLOWED_EXTRA_ORDER_COLUMNS = frozenset({"courier_ref"})
 
 DELIVERY_CHECK_STATUS_DELIVERED = "delivered"
 DELIVERY_CHECK_STATUS_IN_TRANSIT = "in_transit"
+PAYMENT_AUTHORIZE_STATUS_AUTHORIZED = "authorized"
+PAYMENT_AUTHORIZE_STATUS_PENDING = "pending"
+PAYMENT_AUTHORIZE_STATUS_UNAUTHORIZED = "unauthorized"
+PAYMENT_UNAUTHORIZED_REASON = "payment authorization failed"
 TRANSITION_STATUS_NOT_CONFIRMED = "not_confirmed"
 TRANSITION_STATUS_NOT_PREPARING = "not_preparing"
 COURIER_ASSIGN_STATUS_ASSIGNED = "assigned"
 COURIER_ASSIGN_STATUS_NOT_ASSIGNED = "not_assigned"
 
 PROCESSING_ACTION_TRANSITIONED = "transitioned"
+PROCESSING_ACTION_ORDER_FAILED = "order_failed"
 PROCESSING_ACTION_RETRY_SCHEDULED = "retry_scheduled"
 PROCESSING_ACTION_FAILED = "failed"
 PROCESSING_ACTION_MISSING_TASK = "missing_task"
@@ -133,6 +145,9 @@ class RestaurantTransitionSpec:
     source_started_at_field: str
     next_task_type: str | None = None
     next_target_state: str | None = None
+    failed_status: str | None = None
+    failure_reason: str | None = None
+    include_restaurant_ref: bool = True
 
 
 @dataclass(frozen=True)
@@ -151,6 +166,7 @@ class TransitionCallOutcome:
 
     status: str
     retry_after_seconds: float | None = None
+    failure_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -213,14 +229,28 @@ READY_CHECK_STATUS_NOT_READY = "not_ready"
 # returns the success status or a valid pending status with retry_after_seconds;
 # workers never hold DB locks while waiting for the simulated delay to pass.
 RESTAURANT_TRANSITION_SPECS = {
-    ORDER_STATE_CONFIRMED: RestaurantTransitionSpec(
+    ORDER_STATE_PAYMENT_CHECK: RestaurantTransitionSpec(
         source_state=ORDER_STATE_PLACED,
+        target_state=ORDER_STATE_PAYMENT_CHECK,
+        endpoint_path="/payment/authorize",
+        expected_status=PAYMENT_AUTHORIZE_STATUS_AUTHORIZED,
+        pending_status=PAYMENT_AUTHORIZE_STATUS_PENDING,
+        action_name="payment authorize",
+        source_started_at_field="placed_at",
+        next_task_type=TASK_TYPE_ADVANCE_STATE,
+        next_target_state=ORDER_STATE_CONFIRMED,
+        failed_status=PAYMENT_AUTHORIZE_STATUS_UNAUTHORIZED,
+        failure_reason=PAYMENT_UNAUTHORIZED_REASON,
+        include_restaurant_ref=False,
+    ),
+    ORDER_STATE_CONFIRMED: RestaurantTransitionSpec(
+        source_state=ORDER_STATE_PAYMENT_CHECK,
         target_state=ORDER_STATE_CONFIRMED,
         endpoint_path="/restaurant/confirm",
         expected_status=ORDER_STATE_CONFIRMED,
         pending_status=TRANSITION_STATUS_NOT_CONFIRMED,
         action_name="restaurant confirm",
-        source_started_at_field="placed_at",
+        source_started_at_field="payment_checked_at",
         next_task_type=TASK_TYPE_ADVANCE_STATE,
         next_target_state=ORDER_STATE_PREPARING,
     ),
@@ -1060,9 +1090,10 @@ def _call_restaurant_transition(
     url = f"{_downstream_sim_base_url()}{call.spec.endpoint_path}"
     payload = {
         "order_id": call.order_id,
-        "restaurant_ref": call.restaurant_ref,
         call.spec.source_started_at_field: call.source_started_at.isoformat(),
     }
+    if call.spec.include_restaurant_ref:
+        payload["restaurant_ref"] = call.restaurant_ref
 
     # This is intentionally not full durable downstream idempotency yet. These
     # simulator endpoints are deterministic and side-effect-free for this slice,
@@ -1109,6 +1140,12 @@ def _call_restaurant_transition(
         return TransitionCallOutcome(
             status=call.spec.pending_status,
             retry_after_seconds=_valid_positive_number(body.get("retry_after_seconds")),
+        )
+    if call.spec.failed_status is not None and status == call.spec.failed_status:
+        reason = body.get("reason")
+        return TransitionCallOutcome(
+            status=call.spec.failed_status,
+            failure_reason=reason if isinstance(reason, str) else None,
         )
 
     return _short_error(
@@ -1809,6 +1846,164 @@ def _finalize_transition_task(
                 )
 
 
+def _finalize_failed_transition_task(
+    *,
+    task: ClaimedTask,
+    worker_id: str,
+    spec: RestaurantTransitionSpec,
+    failure_reason: str,
+) -> ProcessingResult:
+    """Persist a terminal business failure returned by downstream."""
+    occurred_at = datetime.now(timezone.utc)
+    with open_db_connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                row = _load_transition_task_row(
+                    cur,
+                    task_id=task.id,
+                    source_state=spec.source_state,
+                )
+                skip_result = _owned_task_check_result(row, worker_id=worker_id)
+                if skip_result is not None:
+                    return skip_result
+
+                order_state = row["order_state"]
+                order_id = row["order_id"]
+                if is_terminal_order_state(order_state):
+                    _complete_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        completed_at=occurred_at,
+                    )
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_COMPLETED_TERMINAL_NOOP,
+                        order_id=order_id,
+                        from_state=order_state,
+                    )
+
+                if order_state != spec.source_state:
+                    _complete_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        completed_at=occurred_at,
+                    )
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_COMPLETED_STALE_NOOP,
+                        order_id=order_id,
+                        from_state=order_state,
+                    )
+
+                cur.execute(
+                    """
+                    update orders
+                    set
+                        state = %s::order_state,
+                        version = version + 1,
+                        terminal_reason = %s,
+                        updated_at = %s
+                    where
+                        id = %s::uuid
+                        and version = %s
+                        and state = %s::order_state
+                    """,
+                    (
+                        ORDER_STATE_FAILED,
+                        failure_reason,
+                        occurred_at,
+                        order_id,
+                        row["version"],
+                        spec.source_state,
+                    ),
+                )
+                if cur.rowcount == 0:
+                    _complete_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        completed_at=occurred_at,
+                    )
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_COMPLETED_OPTIMISTIC_NOOP,
+                        order_id=order_id,
+                        from_state=spec.source_state,
+                    )
+
+                cur.execute(
+                    """
+                    update order_tasks
+                    set
+                        status = %s::task_status,
+                        locked_by = null,
+                        locked_until = null,
+                        last_error = %s,
+                        updated_at = %s
+                    where
+                        order_id = %s::uuid
+                        and id <> %s::uuid
+                        and status = any(%s::task_status[])
+                    """,
+                    (
+                        TASK_STATUS_CANCELLED,
+                        failure_reason,
+                        occurred_at,
+                        order_id,
+                        task.id,
+                        [TASK_STATUS_PENDING, TASK_STATUS_RUNNING],
+                    ),
+                )
+
+                cur.execute(
+                    """
+                    insert into order_events (
+                        id,
+                        order_id,
+                        event_type,
+                        from_state,
+                        to_state,
+                        task_id,
+                        worker_id,
+                        occurred_at
+                    )
+                    values (
+                        %s::uuid,
+                        %s::uuid,
+                        %s::event_type,
+                        %s::order_state,
+                        %s::order_state,
+                        %s::uuid,
+                        %s,
+                        %s
+                    )
+                    """,
+                    (
+                        uuid4(),
+                        order_id,
+                        EVENT_TYPE_ORDER_FAILED,
+                        spec.source_state,
+                        ORDER_STATE_FAILED,
+                        task.id,
+                        worker_id,
+                        occurred_at,
+                    ),
+                )
+
+                _complete_claimed_task(
+                    cur,
+                    task_id=task.id,
+                    worker_id=worker_id,
+                    completed_at=occurred_at,
+                )
+                return ProcessingResult(
+                    action=PROCESSING_ACTION_ORDER_FAILED,
+                    order_id=order_id,
+                    from_state=spec.source_state,
+                    to_state=ORDER_STATE_FAILED,
+                    error=failure_reason,
+                )
+
+
 def _reschedule_transition_after_pending(
     *,
     task: ClaimedTask,
@@ -2014,6 +2209,16 @@ def process_transition_task(
             worker_id=worker_id,
             spec=spec,
             retry_after_seconds=outcome.retry_after_seconds,
+        )
+
+    if spec.failed_status is not None and outcome.status == spec.failed_status:
+        return _finalize_failed_transition_task(
+            task=task,
+            worker_id=worker_id,
+            spec=spec,
+            failure_reason=outcome.failure_reason
+            or spec.failure_reason
+            or f"{spec.action_name} failed",
         )
 
     return _finalize_transition_task(task=task, worker_id=worker_id, spec=spec)
@@ -2535,6 +2740,15 @@ def claim_and_process_one_task(*, worker_id: str) -> bool:
             result.to_state,
             task.id,
             worker_id,
+        )
+    elif result.action == PROCESSING_ACTION_ORDER_FAILED:
+        logger.warning(
+            "marked order %s failed from %s with task %s by %s: %s",
+            result.order_id,
+            result.from_state,
+            task.id,
+            worker_id,
+            result.error,
         )
     elif result.action == PROCESSING_ACTION_RETRY_SCHEDULED:
         logger.warning(

@@ -803,7 +803,12 @@ h2 {
 .pipeline {
   display: grid;
   gap: 0;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(
+    var(--pipeline-state-count, 7),
+    minmax(128px, 1fr)
+  );
+  overflow-x: auto;
+  padding-bottom: 4px;
 }
 
 .pipeline-step {
@@ -965,6 +970,10 @@ h2 {
 .state-failed,
 .state-cancelled {
   background: #b13f35;
+}
+
+.state-payment_check {
+  background: #2d7f86;
 }
 
 .state-ready {
@@ -1132,11 +1141,6 @@ tbody tr:last-child td {
   .loadgen-top {
     flex-wrap: wrap;
   }
-
-  .pipeline {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    row-gap: 18px;
-  }
 }
 
 @media (max-width: 560px) {
@@ -1167,8 +1171,7 @@ tbody tr:last-child td {
 
   .loadgen-controls,
   .order-meta,
-  .secondary-metrics,
-  .pipeline {
+  .secondary-metrics {
     grid-template-columns: 1fr;
   }
 
@@ -1231,6 +1234,7 @@ tbody tr:last-child td {
 }
 
 .state-badge--placed         { background: #e9edf2; color: #4a5562; }
+.state-badge--payment-check  { background: #dff4f2; color: #1d6268; }
 .state-badge--confirmed      { background: #ddeef9; color: #1a5a8a; }
 .state-badge--preparing      { background: #fef3e2; color: #7a4a0a; }
 .state-badge--ready          { background: #fde8c8; color: #8a4010; }

@@ -45,10 +45,9 @@ def retry_failed_tasks_for_order(*, order_id: str) -> dict[str, Any] | None:
                     return None
 
                 # Failed tasks are terminal until an operator explicitly resets
-                # them. For poll tasks (check_ready, check_delivery), start a
-                # fresh deadline window based on the original window length;
-                # otherwise a timed-out poll task would fail immediately after
-                # manual recovery.
+                # them. For poll tasks, start a fresh deadline window based on
+                # the original window length; otherwise a timed-out poll task
+                # would fail immediately after manual recovery.
                 cur.execute(
                     """
                     with failed_task as (

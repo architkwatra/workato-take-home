@@ -1,8 +1,8 @@
 # Workato Take-Home: Order Pipeline
 
 A local food-delivery order pipeline simulation with order intake, durable worker
-processing, downstream restaurant/courier simulators, load generation, and a live
-operations dashboard.
+processing, downstream payment/restaurant/courier simulators, load generation,
+and a live operations dashboard.
 
 Longer background notes from the original README live in
 [docs/project-notes.md](docs/project-notes.md).
@@ -53,8 +53,8 @@ From the dashboard:
 2. In **Load Generator**, set **Rate / second**.
 3. Set **Max orders** for a bounded run.
 4. Click **Start**.
-5. Watch lifecycle counts, orders/min, deliveries/min, latency, stuck orders,
-   workers, problem tasks, and recent events update.
+5. Watch lifecycle counts, orders/min, deliveries/min, latency, attention
+   orders, workers, queue health, and recent events update.
 
 From the CLI:
 
@@ -93,6 +93,7 @@ curl -X POST http://localhost:8081/control/kill-switches/courier_assign \
 
 Available downstream kill switches:
 
+- `payment_authorize`
 - `restaurant_confirm`
 - `restaurant_start_prep`
 - `restaurant_check_ready`
@@ -120,15 +121,15 @@ docker compose up -d --scale worker=5 worker
 - `api`: FastAPI order intake, dashboard read model, order actions.
 - `postgres`: durable source of truth for orders, tasks, events, and workers.
 - `worker`: five stateless worker replicas claim and process `order_tasks`.
-- `downstream-sim`: FastAPI restaurant/courier simulator with kill switches and
-  deterministic per-order stage delays.
+- `downstream-sim`: FastAPI payment/restaurant/courier simulator with kill
+  switches and deterministic per-order stage delays.
 - `loadgen`: rate-controlled traffic generator for demo and stress runs.
 - `migrator`: one-shot Alembic migration container.
 
 Order lifecycle:
 
 ```text
-placed -> confirmed -> preparing -> ready -> out_for_delivery -> delivered
+placed -> payment_check -> confirmed -> preparing -> ready -> out_for_delivery -> delivered
 ```
 
 Terminal states:
@@ -145,9 +146,11 @@ cancelled, failed
   optimistic locking and task leases to avoid duplicate lifecycle advances.
 - Downstream delays are deterministic per order/stage: each order gets a
   staggered delay, but retries for the same order do not re-sample a new delay.
-- Retryable downstream errors use exponential backoff; normal "not ready yet"
-  responses use the simulator's `retry_after_seconds` and do not consume retry
-  attempts.
+- Retryable downstream errors use exponential backoff; normal pending responses
+  such as payment pending, restaurant not ready, or courier in transit use the
+  simulator's `retry_after_seconds` and do not consume retry attempts.
+- Payment authorization can also return `unauthorized`; that is treated as a
+  valid business failure and moves the order to terminal `failed`.
 - Dashboard polling is intentionally simple: the browser polls every 3 seconds,
   but very large datasets can make the effective top-level refresh slower
   because the next poll is scheduled after the previous request finishes.

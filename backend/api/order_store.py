@@ -9,7 +9,7 @@ from common.db import open_db_connection
 from common.event_types import EVENT_TYPE_ORDER_CANCELLED, EVENT_TYPE_ORDER_CREATED
 from common.state_machine import (
     ORDER_STATE_CANCELLED,
-    ORDER_STATE_CONFIRMED,
+    ORDER_STATE_PAYMENT_CHECK,
     ORDER_STATE_PLACED,
     is_terminal_order_state,
 )
@@ -151,10 +151,10 @@ def create_or_get_order(
                             uuid4(),
                             order_id,
                             TASK_TYPE_ADVANCE_STATE,
-                            ORDER_STATE_CONFIRMED,
+                            ORDER_STATE_PAYMENT_CHECK,
                             TASK_STATUS_PENDING,
                             created_at,
-                            f"{order_id}:{TASK_TYPE_ADVANCE_STATE}:{ORDER_STATE_CONFIRMED}",
+                            f"{order_id}:{TASK_TYPE_ADVANCE_STATE}:{ORDER_STATE_PAYMENT_CHECK}",
                             created_at,
                             created_at,
                         ),

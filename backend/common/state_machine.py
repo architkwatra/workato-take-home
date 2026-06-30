@@ -9,6 +9,7 @@ migrations stay self-contained and do not change when application code changes.
 # code. If a state name changes, most application code should only need to
 # update imports, not hunt for string literals.
 ORDER_STATE_PLACED = "placed"  # API accepted the order; downstream work has not started.
+ORDER_STATE_PAYMENT_CHECK = "payment_check"  # Payment authorization has completed.
 ORDER_STATE_CONFIRMED = "confirmed"  # Restaurant accepted the order.
 ORDER_STATE_PREPARING = "preparing"  # Restaurant is preparing the food.
 ORDER_STATE_READY = "ready"  # Restaurant marked the order ready for pickup.
@@ -22,6 +23,7 @@ ORDER_STATE_FAILED = "failed"  # Pipeline could not complete the order; terminal
 # in the same order the lifecycle normally follows.
 ORDER_STATES = (
     ORDER_STATE_PLACED,
+    ORDER_STATE_PAYMENT_CHECK,
     ORDER_STATE_CONFIRMED,
     ORDER_STATE_PREPARING,
     ORDER_STATE_READY,
@@ -35,7 +37,8 @@ ORDER_STATES = (
 # lifecycle step should be for an `advance_state` task. Terminal and exceptional
 # states are intentionally absent because workers must not auto-advance them.
 ORDER_TRANSITIONS = {
-    ORDER_STATE_PLACED: ORDER_STATE_CONFIRMED,
+    ORDER_STATE_PLACED: ORDER_STATE_PAYMENT_CHECK,
+    ORDER_STATE_PAYMENT_CHECK: ORDER_STATE_CONFIRMED,
     ORDER_STATE_CONFIRMED: ORDER_STATE_PREPARING,
     ORDER_STATE_PREPARING: ORDER_STATE_READY,
     ORDER_STATE_READY: ORDER_STATE_OUT_FOR_DELIVERY,

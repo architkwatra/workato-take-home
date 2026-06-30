@@ -31,6 +31,7 @@ const ORDER_DETAIL_ROUTE_PREFIX = "/orders/";
 
 const ORDER_STATES = [
   "placed",
+  "payment_check",
   "confirmed",
   "preparing",
   "ready",
@@ -44,6 +45,7 @@ const TERMINAL_ORDER_STATES = new Set(["delivered", "cancelled", "failed"]);
 
 const PIPELINE_STATES = [
   "placed",
+  "payment_check",
   "confirmed",
   "preparing",
   "ready",
@@ -52,6 +54,11 @@ const PIPELINE_STATES = [
 ];
 
 const PIPELINE_DELAY_WINDOWS = {
+  payment_check: {
+    label: "payment authorization",
+    min: numberEnv("VITE_PAYMENT_AUTHORIZE_AFTER_SECONDS_MIN", 1),
+    max: numberEnv("VITE_PAYMENT_AUTHORIZE_AFTER_SECONDS_MAX", 5),
+  },
   confirmed: {
     label: "restaurant confirmation",
     min: numberEnv("VITE_RESTAURANT_CONFIRM_AFTER_SECONDS_MIN", 1),
@@ -80,6 +87,7 @@ const PIPELINE_DELAY_WINDOWS = {
 };
 
 const DOWNSTREAM_SERVICES = [
+  "payment_authorize",
   "restaurant_confirm",
   "restaurant_start_prep",
   "restaurant_check_ready",
@@ -88,6 +96,8 @@ const DOWNSTREAM_SERVICES = [
 ];
 
 const LABELS = {
+  payment_check: "payment authorized",
+  payment_authorize: "payment authorize",
   out_for_delivery: "out for delivery",
   check_delivery: "check delivery",
   check_pickup: "check pickup",
@@ -1422,7 +1432,10 @@ function PipelinePanel({ order, events }) {
         <h2>Order Pipeline</h2>
         <StateBadge state={order.state} />
       </div>
-      <div className="pipeline">
+      <div
+        className="pipeline"
+        style={{ "--pipeline-state-count": PIPELINE_STATES.length }}
+      >
         {PIPELINE_STATES.map((state, index) => {
           const reachedAt = reachedAtByState.get(state);
           const previousState = PIPELINE_STATES[index - 1];
