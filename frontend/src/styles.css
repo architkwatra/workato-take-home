@@ -61,7 +61,7 @@ p {
 }
 
 h1 {
-  font-size: 30px;
+  font-size: 22px;
   line-height: 1.15;
   margin-bottom: 0;
 }
@@ -152,8 +152,8 @@ h2 {
   border: 1px solid #d8dee5;
   border-left: 4px solid #6f7d8a;
   border-radius: 8px;
-  min-height: 106px;
-  padding: 16px;
+  min-height: 88px;
+  padding: 14px;
 }
 
 .metric.good {
@@ -215,7 +215,7 @@ h2 {
   color: #ffffff;
   content: attr(data-tooltip);
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 400;
   left: 50%;
   line-height: 1.35;
   max-width: min(260px, 70vw);
@@ -242,9 +242,9 @@ h2 {
 
 .metric strong {
   display: block;
-  font-size: 30px;
+  font-size: 24px;
   line-height: 1;
-  margin-bottom: 8px;
+  margin-bottom: 6px;
 }
 
 .metric-detail {
@@ -297,9 +297,9 @@ h2 {
 .latency-summary strong {
   color: #263241;
   display: block;
-  font-size: 26px;
+  font-size: 22px;
   line-height: 1;
-  margin-top: 8px;
+  margin-top: 6px;
 }
 
 .stage-latency-list-header {
@@ -368,7 +368,7 @@ h2 {
 
 .secondary-metrics dd {
   color: #263241;
-  font-size: 24px;
+  font-size: 20px;
   font-weight: 900;
   line-height: 1;
   margin: 0;
@@ -607,8 +607,7 @@ h2 {
 .loadgen-stats dt {
   color: #66717d;
   font-size: 12px;
-  font-weight: 800;
-  text-transform: uppercase;
+  font-weight: 700;
 }
 
 .loadgen-stats dd {
@@ -730,6 +729,25 @@ h2 {
   margin-bottom: 16px;
 }
 
+.breadcrumb-link {
+  align-items: center;
+  color: #25636f;
+  display: inline-flex;
+  font-size: 13px;
+  font-weight: 700;
+  gap: 5px;
+  text-decoration: none;
+}
+
+.breadcrumb-link::before {
+  content: "←";
+  font-size: 14px;
+}
+
+.breadcrumb-link:hover {
+  text-decoration: underline;
+}
+
 .detail-toolbar-meta {
   align-items: center;
   color: #4a5562;
@@ -770,8 +788,7 @@ h2 {
 .order-meta dt {
   color: #66717d;
   font-size: 12px;
-  font-weight: 800;
-  text-transform: uppercase;
+  font-weight: 700;
 }
 
 .order-meta dd {
@@ -979,8 +996,8 @@ td {
 th {
   color: #5c6875;
   font-size: 12px;
-  font-weight: 800;
-  text-transform: uppercase;
+  font-weight: 700;
+  letter-spacing: 0.01em;
 }
 
 td {
@@ -1029,9 +1046,8 @@ tbody tr:last-child td {
   color: #5c6875;
   display: grid;
   font-size: 12px;
-  font-weight: 800;
+  font-weight: 700;
   gap: 6px;
-  text-transform: uppercase;
 }
 
 .attention-toolbar input,

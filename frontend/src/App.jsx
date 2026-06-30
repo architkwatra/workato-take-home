@@ -103,7 +103,7 @@ const METRIC_HELP = {
   ordersCreatedRate:
     "Orders accepted per minute over the rolling dashboard window.",
   ordersDeliveredRate:
-    "Orders delivered per minute over the rolling dashboard window.",
+    "Counts order_events where event_type is state_transition and to_state is delivered in the last 30 seconds, then normalizes to per minute: delivered count * 60 / 30.",
   pipelineLatency:
     "End-to-end p95 time from order creation to delivery, across orders delivered in the current latency window.",
   attentionOrders:
@@ -984,7 +984,7 @@ function App() {
       <header className="topbar">
         <div>
           <p className="eyebrow">Workato Take-Home</p>
-          <h1>Order Pipeline Dashboard</h1>
+          <h1>{selectedOrderId ? "Order Detail" : "Order Pipeline Dashboard"}</h1>
         </div>
         <div className="topbar-meta" aria-live="polite">
           <span className={`connection ${pageStatus}`}>{connectionLabel}</span>
@@ -1060,7 +1060,9 @@ function App() {
             <Metric
               label="Delivered / Min"
               value={`${rateText(totals.ordersDeliveredPerMinute)}/min`}
-              detail={`${numberText(totals.deliveredOrders)} total delivered`}
+              detail={`${numberText(totals.ordersDeliveredRecent)} in last ${
+                totals.throughputWindowSeconds
+              }s`}
               helpText={METRIC_HELP.ordersDeliveredRate}
               tone={totals.ordersDeliveredPerMinute > 0 ? "good" : "neutral"}
             />
@@ -1298,8 +1300,8 @@ function OrderDetailPage({
   return (
     <section className="detail-page">
       <div className="detail-toolbar">
-        <a className="button" href="/" onClick={onBack}>
-          Back to Dashboard
+        <a className="breadcrumb-link" href="/" onClick={onBack}>
+          Pipeline Dashboard
         </a>
         <div className="button-row">
           {order && failedTaskCount > 0 ? (
@@ -1346,7 +1348,7 @@ function OrderDetailPage({
           <section className="section order-summary">
             <div>
               <p className="eyebrow">Order</p>
-              <h2 title={order.order_id}>{order.idempotency_key}</h2>
+              <h2 title={order.idempotency_key}>{shortKey(order.idempotency_key)}</h2>
             </div>
             <dl className="order-meta">
               <div>
