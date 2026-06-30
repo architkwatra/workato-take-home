@@ -17,15 +17,11 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    """Add payment authorization state and task enum values."""
+    """Add the payment authorization lifecycle state."""
     with op.get_context().autocommit_block():
         op.execute(
             "ALTER TYPE order_state ADD VALUE IF NOT EXISTS "
             "'payment_check' AFTER 'placed'"
-        )
-        op.execute(
-            "ALTER TYPE task_type ADD VALUE IF NOT EXISTS "
-            "'check_payment' AFTER 'advance_state'"
         )
 
 

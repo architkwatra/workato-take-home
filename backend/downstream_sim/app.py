@@ -15,8 +15,9 @@ app = FastAPI(title="Downstream Simulator")
 # delay; it never sleeps inside an HTTP request.
 DEFAULT_RESTAURANT_CONFIRM_AFTER_SECONDS = 3.0
 DEFAULT_RESTAURANT_CONFIRM_RETRY_AFTER_SECONDS = 1.0
-DEFAULT_PAYMENT_CHECK_AFTER_SECONDS = 2.0
-DEFAULT_PAYMENT_CHECK_RETRY_AFTER_SECONDS = 1.0
+DEFAULT_PAYMENT_AUTHORIZE_AFTER_SECONDS = 2.0
+DEFAULT_PAYMENT_AUTHORIZE_RETRY_AFTER_SECONDS = 1.0
+DEFAULT_PAYMENT_UNAUTHORIZED_RATE = 0.0
 DEFAULT_RESTAURANT_START_PREP_AFTER_SECONDS = 3.0
 DEFAULT_RESTAURANT_START_PREP_RETRY_AFTER_SECONDS = 1.0
 DEFAULT_RESTAURANT_READY_AFTER_SECONDS = 6.0
@@ -25,14 +26,14 @@ DEFAULT_COURIER_ASSIGN_AFTER_SECONDS = 3.0
 DEFAULT_COURIER_ASSIGN_RETRY_AFTER_SECONDS = 1.0
 DEFAULT_COURIER_DELIVERED_AFTER_SECONDS = 8.0
 DEFAULT_COURIER_DELIVERED_RETRY_AFTER_SECONDS = 3.0
-SIMULATED_SERVICE_PAYMENT_CHECK = "payment_check"
+SIMULATED_SERVICE_PAYMENT_AUTHORIZE = "payment_authorize"
 SIMULATED_SERVICE_RESTAURANT_CONFIRM = "restaurant_confirm"
 SIMULATED_SERVICE_RESTAURANT_START_PREP = "restaurant_start_prep"
 SIMULATED_SERVICE_RESTAURANT_CHECK_READY = "restaurant_check_ready"
 SIMULATED_SERVICE_COURIER_ASSIGN = "courier_assign"
 SIMULATED_SERVICE_COURIER_CHECK_DELIVERY = "courier_check_delivery"
 SIMULATED_SERVICES = (
-    SIMULATED_SERVICE_PAYMENT_CHECK,
+    SIMULATED_SERVICE_PAYMENT_AUTHORIZE,
     SIMULATED_SERVICE_RESTAURANT_CONFIRM,
     SIMULATED_SERVICE_RESTAURANT_START_PREP,
     SIMULATED_SERVICE_RESTAURANT_CHECK_READY,
@@ -78,18 +79,19 @@ class RestaurantConfirmResponse(BaseModel):
     retry_after_seconds: float | None = None
 
 
-class PaymentCheckRequest(BaseModel):
+class PaymentAuthorizeRequest(BaseModel):
     """Payment authorization request sent by the worker."""
 
     order_id: str = Field(min_length=1)
     placed_at: datetime
 
 
-class PaymentCheckResponse(BaseModel):
+class PaymentAuthorizeResponse(BaseModel):
     """Deterministic payment authorization response."""
 
     status: str
     retry_after_seconds: float | None = None
+    reason: str | None = None
 
 
 class RestaurantStartPrepRequest(BaseModel):
@@ -232,6 +234,20 @@ def _read_positive_float_env(env_name: str, default: float) -> float:
         return default
 
     return value if value > 0 else default
+
+
+def _read_probability_env(env_name: str, default: float) -> float:
+    """Read a 0..1 probability env var while keeping deterministic defaults."""
+    raw_value = os.getenv(env_name)
+    if raw_value is None:
+        return default
+
+    try:
+        value = float(raw_value)
+    except ValueError:
+        return default
+
+    return value if 0 <= value <= 1 else default
 
 
 def _read_delay_range(
@@ -388,25 +404,42 @@ async def update_kill_switch(
     return _set_kill_switch(service_name, request.killed)
 
 
-@app.post("/payment/check", response_model=PaymentCheckResponse)
-async def check_payment(
-    request: PaymentCheckRequest,
+@app.post("/payment/authorize", response_model=PaymentAuthorizeResponse)
+async def authorize_payment(
+    request: PaymentAuthorizeRequest,
 ) -> dict[str, float | str]:
-    """Return whether enough deterministic payment authorization time elapsed."""
-    _raise_if_service_killed(SIMULATED_SERVICE_PAYMENT_CHECK)
-    return _delayed_status_response(
+    """Authorize payment for an order after a deterministic per-order delay."""
+    _raise_if_service_killed(SIMULATED_SERVICE_PAYMENT_AUTHORIZE)
+    delay_response = _delayed_status_response(
         order_id=request.order_id,
         source_started_at=request.placed_at,
-        salt="payment-check",
-        min_env_name="PAYMENT_CHECK_AFTER_SECONDS_MIN",
-        max_env_name="PAYMENT_CHECK_AFTER_SECONDS_MAX",
-        fixed_env_name="PAYMENT_CHECK_AFTER_SECONDS",
-        default_delay_seconds=DEFAULT_PAYMENT_CHECK_AFTER_SECONDS,
-        retry_after_env_name="PAYMENT_CHECK_RETRY_AFTER_SECONDS",
-        default_retry_after_seconds=DEFAULT_PAYMENT_CHECK_RETRY_AFTER_SECONDS,
+        salt="payment-authorize",
+        min_env_name="PAYMENT_AUTHORIZE_AFTER_SECONDS_MIN",
+        max_env_name="PAYMENT_AUTHORIZE_AFTER_SECONDS_MAX",
+        fixed_env_name="PAYMENT_AUTHORIZE_AFTER_SECONDS",
+        default_delay_seconds=DEFAULT_PAYMENT_AUTHORIZE_AFTER_SECONDS,
+        retry_after_env_name="PAYMENT_AUTHORIZE_RETRY_AFTER_SECONDS",
+        default_retry_after_seconds=DEFAULT_PAYMENT_AUTHORIZE_RETRY_AFTER_SECONDS,
         ready_status="authorized",
         pending_status="pending",
     )
+    if delay_response["status"] != "authorized":
+        return delay_response
+
+    unauthorized_rate = _read_probability_env(
+        "PAYMENT_UNAUTHORIZED_RATE",
+        DEFAULT_PAYMENT_UNAUTHORIZED_RATE,
+    )
+    unauthorized_bucket = _stable_unit_interval(
+        f"payment-unauthorized:{request.order_id}"
+    )
+    if unauthorized_bucket < unauthorized_rate:
+        return {
+            "status": "unauthorized",
+            "reason": "payment authorization failed",
+        }
+
+    return {"status": "authorized"}
 
 
 @app.post("/restaurant/confirm", response_model=RestaurantConfirmResponse)

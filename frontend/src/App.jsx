@@ -56,8 +56,8 @@ const PIPELINE_STATES = [
 const PIPELINE_DELAY_WINDOWS = {
   payment_check: {
     label: "payment authorization",
-    min: numberEnv("VITE_PAYMENT_CHECK_AFTER_SECONDS_MIN", 1),
-    max: numberEnv("VITE_PAYMENT_CHECK_AFTER_SECONDS_MAX", 5),
+    min: numberEnv("VITE_PAYMENT_AUTHORIZE_AFTER_SECONDS_MIN", 1),
+    max: numberEnv("VITE_PAYMENT_AUTHORIZE_AFTER_SECONDS_MAX", 5),
   },
   confirmed: {
     label: "restaurant confirmation",
@@ -87,7 +87,7 @@ const PIPELINE_DELAY_WINDOWS = {
 };
 
 const DOWNSTREAM_SERVICES = [
-  "payment_check",
+  "payment_authorize",
   "restaurant_confirm",
   "restaurant_start_prep",
   "restaurant_check_ready",
@@ -96,8 +96,8 @@ const DOWNSTREAM_SERVICES = [
 ];
 
 const LABELS = {
-  payment_check: "payment check",
-  check_payment: "check payment",
+  payment_check: "payment authorized",
+  payment_authorize: "payment authorize",
   out_for_delivery: "out for delivery",
   check_delivery: "check delivery",
   check_pickup: "check pickup",

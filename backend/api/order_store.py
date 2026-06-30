@@ -1,5 +1,4 @@
-import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -18,33 +17,12 @@ from common.task_types import (
     TASK_STATUS_CANCELLED,
     TASK_STATUS_PENDING,
     TASK_STATUS_RUNNING,
-    TASK_TYPE_CHECK_PAYMENT,
+    TASK_TYPE_ADVANCE_STATE,
 )
 
 
 ORDER_CANCELLED_REASON = "operator_cancelled"
 ORDER_CANCELLED_TASK_ERROR = "order cancelled by operator"
-DEFAULT_PAYMENT_CHECK_DEADLINE_SECONDS = 60.0
-
-
-def _read_positive_float_env(env_name: str, default: float) -> float:
-    raw_value = os.getenv(env_name)
-    if raw_value is None:
-        return default
-
-    try:
-        value = float(raw_value)
-    except ValueError:
-        return default
-
-    return value if value > 0 else default
-
-
-def _payment_check_deadline_seconds() -> float:
-    return _read_positive_float_env(
-        "PAYMENT_CHECK_DEADLINE_SECONDS",
-        DEFAULT_PAYMENT_CHECK_DEADLINE_SECONDS,
-    )
 
 
 class IdempotencyConflictError(RuntimeError):
@@ -153,7 +131,6 @@ def create_or_get_order(
                             target_state,
                             status,
                             next_run_at,
-                            deadline_at,
                             dedupe_key,
                             created_at,
                             updated_at
@@ -167,20 +144,17 @@ def create_or_get_order(
                             %s,
                             %s,
                             %s,
-                            %s,
                             %s
                         )
                         """,
                         (
                             uuid4(),
                             order_id,
-                            TASK_TYPE_CHECK_PAYMENT,
+                            TASK_TYPE_ADVANCE_STATE,
                             ORDER_STATE_PAYMENT_CHECK,
                             TASK_STATUS_PENDING,
                             created_at,
-                            created_at
-                            + timedelta(seconds=_payment_check_deadline_seconds()),
-                            f"{order_id}:{TASK_TYPE_CHECK_PAYMENT}:{ORDER_STATE_PAYMENT_CHECK}",
+                            f"{order_id}:{TASK_TYPE_ADVANCE_STATE}:{ORDER_STATE_PAYMENT_CHECK}",
                             created_at,
                             created_at,
                         ),

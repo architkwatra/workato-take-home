@@ -93,7 +93,7 @@ curl -X POST http://localhost:8081/control/kill-switches/courier_assign \
 
 Available downstream kill switches:
 
-- `payment_check`
+- `payment_authorize`
 - `restaurant_confirm`
 - `restaurant_start_prep`
 - `restaurant_check_ready`
@@ -149,6 +149,8 @@ cancelled, failed
 - Retryable downstream errors use exponential backoff; normal pending responses
   such as payment pending, restaurant not ready, or courier in transit use the
   simulator's `retry_after_seconds` and do not consume retry attempts.
+- Payment authorization can also return `unauthorized`; that is treated as a
+  valid business failure and moves the order to terminal `failed`.
 - Dashboard polling is intentionally simple: the browser polls every 3 seconds,
   but very large datasets can make the effective top-level refresh slower
   because the next poll is scheduled after the previous request finishes.

@@ -10,7 +10,6 @@ from common.event_types import EVENT_TYPE_RETRY_SCHEDULED
 from common.task_types import (
     TASK_STATUS_FAILED,
     TASK_STATUS_PENDING,
-    TASK_TYPE_CHECK_PAYMENT,
     TASK_TYPE_CHECK_DELIVERY,
     TASK_TYPE_CHECK_READY,
 )
@@ -106,11 +105,7 @@ def retry_failed_tasks_for_order(*, order_id: str) -> dict[str, Any] | None:
                         TASK_STATUS_FAILED,
                         TASK_STATUS_PENDING,
                         recovered_at,
-                        [
-                            TASK_TYPE_CHECK_PAYMENT,
-                            TASK_TYPE_CHECK_READY,
-                            TASK_TYPE_CHECK_DELIVERY,
-                        ],
+                        [TASK_TYPE_CHECK_READY, TASK_TYPE_CHECK_DELIVERY],
                         recovered_at,
                         recovered_at,
                     ),

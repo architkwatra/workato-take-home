@@ -6,7 +6,6 @@ values. Migrations keep their own copy so historical migrations remain stable.
 
 # Task type constants describe what unit of work a worker should perform.
 TASK_TYPE_ADVANCE_STATE = "advance_state"  # Move the order to target_state.
-TASK_TYPE_CHECK_PAYMENT = "check_payment"  # Poll payment authorization.
 TASK_TYPE_CHECK_READY = "check_ready"  # Check restaurant prep without blocking.
 TASK_TYPE_CHECK_PICKUP = "check_pickup"  # Check courier pickup progress.
 TASK_TYPE_CHECK_DELIVERY = "check_delivery"  # Check courier delivery progress.
@@ -22,7 +21,6 @@ TASK_STATUS_CANCELLED = "cancelled"  # Invalidated by terminal order state.
 # out of route and worker code.
 ORDER_TASK_TYPES = (
     TASK_TYPE_ADVANCE_STATE,
-    TASK_TYPE_CHECK_PAYMENT,
     TASK_TYPE_CHECK_READY,
     TASK_TYPE_CHECK_PICKUP,
     TASK_TYPE_CHECK_DELIVERY,
