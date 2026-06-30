@@ -96,7 +96,7 @@ const DOWNSTREAM_SERVICES = [
 ];
 
 const LABELS = {
-  payment_check: "payment authorized",
+  payment_check: "payment",
   payment_authorize: "payment authorize",
   out_for_delivery: "out for delivery",
   check_delivery: "check delivery",
