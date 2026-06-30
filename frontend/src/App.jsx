@@ -102,12 +102,10 @@ const METRIC_HELP = {
   orders: "Total order rows in the database, across every order state.",
   ordersCreatedRate:
     "Orders accepted per minute over the rolling dashboard window.",
-  ordersDeliveredRate:
-    "Orders delivered per minute over the rolling dashboard window.",
   pipelineLatency:
     "End-to-end p95 time from order creation to delivery, across orders delivered in the current latency window.",
-  stuckOrders:
-    "Non-terminal orders whose time in the current lifecycle state is above that stage's configured stuck threshold.",
+  attentionOrders:
+    "Active orders that are over the end-to-end SLA, over their current-stage threshold, or blocked by a problem task.",
   taskCompletionRate:
     "Completed task rows per second over the rolling dashboard window. This is worker throughput, not delivered-order rate.",
   taskIssues:
@@ -125,8 +123,8 @@ const DETAIL_HELP = {
     "95th percentile elapsed time from order_created to delivered. 95% of delivered orders in the current latency window completed at or below this value.",
   stageLatency:
     "95th percentile elapsed time between consecutive lifecycle events for transitions reached in the current latency window, calculated from order_events.",
-  stuckOrders:
-    "Orders are marked stuck when they are not terminal and orders.updated_at is older than the configured threshold for the current state. Delivered, cancelled, and failed orders are excluded.",
+  attentionOrders:
+    "One row per active order that needs attention. SLA uses orders.created_at, stage time uses orders.updated_at, and task reasons come from open or failed order_tasks.",
   taskCompletionRate:
     "Completed order_tasks rows per second over the rolling dashboard window. This is worker throughput, not delivered-order rate.",
   duePending:
@@ -210,6 +208,18 @@ function formatLatencySeconds(seconds) {
 function formatWindowLabel(seconds) {
   const duration = formatDurationSeconds(seconds);
   return duration === "—" ? "current window" : `last ${duration}`;
+}
+
+function deliveredRateHelpText(windowSeconds) {
+  const parsed = Number(windowSeconds);
+  const windowLabel = Number.isFinite(parsed) && parsed > 0
+    ? formatWindowLabel(parsed)
+    : "the rolling dashboard window";
+  const divisor = Number.isFinite(parsed) && parsed > 0
+    ? numberText(parsed)
+    : "window seconds";
+
+  return `Counts order_events where event_type is state_transition and to_state is delivered in ${windowLabel}, then normalizes to per minute: delivered count * 60 / ${divisor}.`;
 }
 
 function stuckThresholdText(thresholds = {}) {
@@ -792,7 +802,9 @@ function App() {
       pipelineP95Seconds: overview?.latency?.pipeline?.p95_seconds ?? null,
       pipelineSampleCount: overview?.latency?.pipeline?.sample_count ?? 0,
       latencyWindowSeconds: overview?.latency?.window_seconds ?? 300,
-      stuckOrderCount: overview?.stuck_orders?.total ?? 0,
+      attentionOrderCount: overview?.attention_orders?.total ?? 0,
+      orderDeliverySlaSeconds:
+        overview?.attention_orders?.order_sla_seconds ?? 120,
       activeWorkers: overview?.workers?.active_count ?? 0,
       configuredWorkers: overview?.workers?.configured_count ?? 0,
       workerActiveThresholdSeconds: overview?.workers?.active_threshold_seconds ?? 30,
@@ -982,7 +994,7 @@ function App() {
       <header className="topbar">
         <div>
           <p className="eyebrow">Workato Take-Home</p>
-          <h1>Order Pipeline Dashboard</h1>
+          <h1>{selectedOrderId ? "Order Detail" : "Order Pipeline Dashboard"}</h1>
         </div>
         <div className="topbar-meta" aria-live="polite">
           <span className={`connection ${pageStatus}`}>{connectionLabel}</span>
@@ -1058,8 +1070,10 @@ function App() {
             <Metric
               label="Delivered / Min"
               value={`${rateText(totals.ordersDeliveredPerMinute)}/min`}
-              detail={`${numberText(totals.deliveredOrders)} total delivered`}
-              helpText={METRIC_HELP.ordersDeliveredRate}
+              detail={`${numberText(totals.ordersDeliveredRecent)} in last ${
+                totals.throughputWindowSeconds
+              }s`}
+              helpText={deliveredRateHelpText(totals.throughputWindowSeconds)}
               tone={totals.ordersDeliveredPerMinute > 0 ? "good" : "neutral"}
             />
             <Metric
@@ -1072,15 +1086,17 @@ function App() {
               tone={totals.pipelineP95Seconds == null ? "neutral" : "good"}
             />
             <Metric
-              label="Stuck Orders"
-              value={numberText(totals.stuckOrderCount)}
+              label="Attention Required"
+              value={numberText(totals.attentionOrderCount)}
               detail={
-                totals.stuckOrderCount > 0
-                  ? "over stage threshold"
-                  : "none over threshold"
+                totals.attentionOrderCount > 0
+                  ? `review orders >${formatDurationSeconds(
+                      totals.orderDeliverySlaSeconds,
+                    )}`
+                  : "no blocked orders"
               }
-              helpText={METRIC_HELP.stuckOrders}
-              tone={totals.stuckOrderCount > 0 ? "bad" : "neutral"}
+              helpText={METRIC_HELP.attentionOrders}
+              tone={totals.attentionOrderCount > 0 ? "bad" : "neutral"}
             />
             <Metric
               label="Workers"
@@ -1113,19 +1129,17 @@ function App() {
             <RecentOrdersPanel overview={overview} onSelectOrder={openOrderDetail} />
           </div>
 
+          <AttentionOrdersPanel
+            overview={overview}
+            onSelectOrder={openOrderDetail}
+            onRetryFailedTasks={retryFailedTasks}
+            retryActionError={retryActionError}
+            retryActionPendingOrderId={retryActionPendingOrderId}
+          />
+
           <div className="content-grid wide">
             <PipelineLatencyPanel overview={overview} />
             <QueueHealthPanel totals={totals} />
-          </div>
-
-          <div className="content-grid wide">
-            <StuckOrdersPanel overview={overview} onSelectOrder={openOrderDetail} />
-            <ProblemTaskPanel
-              overview={overview}
-              onRetryFailedTasks={retryFailedTasks}
-              retryActionError={retryActionError}
-              retryActionPendingOrderId={retryActionPendingOrderId}
-            />
           </div>
 
           <RecentEventsPanel overview={overview} />
@@ -1296,8 +1310,8 @@ function OrderDetailPage({
   return (
     <section className="detail-page">
       <div className="detail-toolbar">
-        <a className="button" href="/" onClick={onBack}>
-          Back to Dashboard
+        <a className="breadcrumb-link" href="/" onClick={onBack}>
+          Pipeline Dashboard
         </a>
         <div className="button-row">
           {order && failedTaskCount > 0 ? (
@@ -1344,7 +1358,7 @@ function OrderDetailPage({
           <section className="section order-summary">
             <div>
               <p className="eyebrow">Order</p>
-              <h2 title={order.order_id}>{order.idempotency_key}</h2>
+              <h2 title={order.idempotency_key}>{shortKey(order.idempotency_key)}</h2>
             </div>
             <dl className="order-meta">
               <div>
@@ -1780,156 +1794,254 @@ function LifecyclePanel({ overview }) {
   );
 }
 
-function StuckOrdersPanel({ overview, onSelectOrder }) {
-  const stuckOverview = overview?.stuck_orders ?? {};
-  const rows = stuckOverview.items ?? [];
-  const total = stuckOverview.total ?? rows.length;
-  const limit = stuckOverview.limit ?? rows.length;
-  const thresholds = stuckOverview.thresholds_seconds ?? {};
-  const thresholdHelp = `${DETAIL_HELP.stuckOrders} Thresholds: ${stuckThresholdText(
-    thresholds,
-  )}.`;
+function LatestTaskSummary({ item }) {
+  if (!item.latest_task_type) {
+    return "—";
+  }
 
   return (
-    <section className="section stuck-orders-panel">
-      <div className="section-heading">
-        <h2>Stuck Orders</h2>
-        <span className="label-with-help">
-          {numberText(total)} over threshold
-          <HelpIcon text={thresholdHelp} />
-        </span>
-      </div>
-      <div className="table-wrap">
-        <table className="stuck-orders-table">
-          <thead>
-            <tr>
-              <th>Order</th>
-              <th>State</th>
-              <th>Stuck For</th>
-              <th>Threshold</th>
-              <th>Latest Task</th>
-              <th>Error</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.length ? (
-              rows.map((order) => (
-                <tr key={order.order_id}>
-                  <td>
-                    <a
-                      className="text-button"
-                      href={orderDetailPath(order.order_id)}
-                      title={order.idempotency_key}
-                      onClick={(event) => onSelectOrder(order.order_id, event)}
-                    >
-                      {shortKey(order.idempotency_key)}
-                    </a>
-                  </td>
-                  <td><StateBadge state={order.state} /></td>
-                  <td className="stuck-duration">
-                    {formatDurationSeconds(order.stuck_seconds)}
-                  </td>
-                  <td>{formatDurationSeconds(order.threshold_seconds)}</td>
-                  <td>
-                    {order.latest_task_type ? (
-                      <div className="task-stack">
-                        <span>
-                          {humanize(order.latest_task_type)}
-                          {order.latest_task_target_state
-                            ? ` → ${humanize(order.latest_task_target_state)}`
-                            : ""}
-                        </span>
-                        <TaskStatusBadge status={order.latest_task_status} />
-                      </div>
-                    ) : (
-                      "—"
-                    )}
-                  </td>
-                  <td
-                    className="truncate"
-                    title={order.latest_task_last_error ?? ""}
-                  >
-                    {order.latest_task_last_error ?? "—"}
-                  </td>
-                </tr>
-              ))
-            ) : (
-              <EmptyRow colSpan={6}>No orders are over their stage threshold</EmptyRow>
-            )}
-          </tbody>
-        </table>
-      </div>
-      {total > rows.length ? (
-        <p className="muted-text panel-footnote">
-          Showing oldest {numberText(Math.min(limit, rows.length))} of{" "}
-          {numberText(total)} stuck orders.
-        </p>
-      ) : null}
-    </section>
+    <div className="task-stack">
+      <span>
+        {humanize(item.latest_task_type)}
+        {item.latest_task_target_state
+          ? ` → ${humanize(item.latest_task_target_state)}`
+          : ""}
+      </span>
+      <TaskStatusBadge status={item.latest_task_status} />
+    </div>
   );
 }
 
-function ProblemTaskPanel({
+function attentionReasons(order) {
+  const reasons = [];
+  if (order.is_overdue) reasons.push("SLA breach");
+  if (order.is_stuck) reasons.push("stage stuck");
+  if (order.has_failed_task) reasons.push("failed task");
+  if (order.has_expired_lease) reasons.push("expired lease");
+  if (order.has_unsupported_task) reasons.push("unsupported");
+  if (order.has_retrying_task && !order.has_unsupported_task) {
+    reasons.push("retrying");
+  }
+  return reasons;
+}
+
+function ReasonChips({ order }) {
+  const reasons = attentionReasons(order);
+  if (!reasons.length) {
+    return "—";
+  }
+
+  return (
+    <div className="reason-list">
+      {reasons.map((reason) => (
+        <span className="reason-chip" key={reason}>
+          {reason}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function compactSearchText(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+function attentionSearchValues(order) {
+  return [
+    order.order_id,
+    shortId(order.order_id),
+    order.idempotency_key,
+    shortKey(order.idempotency_key),
+    order.state,
+    humanize(order.state),
+    formatDurationSeconds(order.age_seconds),
+    formatDurationSeconds(order.state_seconds),
+    formatDurationSeconds(order.overdue_seconds),
+    formatDurationSeconds(order.stuck_seconds),
+    order.latest_task_id,
+    shortId(order.latest_task_id),
+    order.latest_task_type,
+    humanize(order.latest_task_type),
+    order.latest_task_target_state,
+    humanize(order.latest_task_target_state),
+    order.latest_task_status,
+    humanize(order.latest_task_status),
+    `${numberText(order.latest_task_attempts)}/${numberText(
+      order.latest_task_max_attempts,
+    )}`,
+    `${numberText(order.latest_task_attempts)} attempts`,
+    `${numberText(order.latest_task_max_attempts)} max attempts`,
+    formatTime(order.latest_task_next_run_at),
+    order.latest_task_last_error,
+    ...attentionReasons(order),
+  ].filter(Boolean);
+}
+
+function matchesAttentionSearch(order, query) {
+  if (!query) {
+    return true;
+  }
+
+  const searchable = attentionSearchValues(order)
+    .join(" ")
+    .toLowerCase();
+  if (searchable.includes(query)) {
+    return true;
+  }
+
+  const compactSearchable = compactSearchText(searchable);
+  const compactQuery = compactSearchText(query);
+  if (compactQuery && compactSearchable.includes(compactQuery)) {
+    return true;
+  }
+
+  return query
+    .split(/\s+/)
+    .filter(Boolean)
+    .every((token) => {
+      const compactToken = compactSearchText(token);
+      return (
+        searchable.includes(token) ||
+        (compactToken && compactSearchable.includes(compactToken))
+      );
+    });
+}
+
+function AttentionOrdersPanel({
   overview,
+  onSelectOrder,
   onRetryFailedTasks,
   retryActionError,
   retryActionPendingOrderId,
 }) {
-  const rows = overview?.problem_tasks ?? [];
+  const [stateFilter, setStateFilter] = useState("all");
+  const [searchText, setSearchText] = useState("");
+  const attentionOverview = overview?.attention_orders ?? {};
+  const rows = attentionOverview.items ?? [];
+  const total = attentionOverview.total ?? rows.length;
+  const searchQuery = searchText.trim().toLowerCase();
+  const stateCounts = useMemo(() => {
+    const counts = new Map();
+    rows.forEach((order) => {
+      counts.set(order.state, (counts.get(order.state) ?? 0) + 1);
+    });
+    return counts;
+  }, [rows]);
+  const stateOptions = ORDER_STATES.filter((state) => stateCounts.has(state));
+  const filteredRows = useMemo(
+    () =>
+      rows.filter(
+        (order) =>
+          (stateFilter === "all" || order.state === stateFilter) &&
+          matchesAttentionSearch(order, searchQuery),
+      ),
+    [rows, stateFilter, searchQuery],
+  );
+  const thresholdHelp = `${DETAIL_HELP.attentionOrders} Order SLA: ${formatDurationSeconds(
+    attentionOverview.order_sla_seconds,
+  )}. Stage thresholds: ${stuckThresholdText(
+    attentionOverview.thresholds_seconds ?? {},
+  )}.`;
 
   return (
-    <section className="section">
+    <section className="section attention-orders-panel">
       <div className="section-heading">
-        <h2>Problem Tasks</h2>
-        <span>{numberText(rows.length)} shown</span>
+        <h2>Orders Needing Attention</h2>
+        <span className="label-with-help">
+          {numberText(total)} total
+          <HelpIcon text={thresholdHelp} />
+        </span>
       </div>
       {retryActionError ? (
         <p className="inline-error" role="status">
           {retryActionError}
         </p>
       ) : null}
+      <div className="attention-toolbar">
+        <label>
+          <span>State</span>
+          <select
+            value={stateFilter}
+            onChange={(event) => setStateFilter(event.target.value)}
+          >
+            <option value="all">All states</option>
+            {stateOptions.map((state) => (
+              <option key={state} value={state}>
+                {humanize(state)} ({numberText(stateCounts.get(state))})
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="attention-search">
+          <span>Search</span>
+          <input
+            type="search"
+            value={searchText}
+            placeholder="Order, task, or error"
+            onChange={(event) => setSearchText(event.target.value)}
+          />
+        </label>
+      </div>
       <div className="table-wrap">
-        <table>
+        <table className="attention-orders-table">
           <thead>
             <tr>
-              <th>Reason</th>
-              <th>Task</th>
               <th>Order</th>
-              <th>Attempts</th>
+              <th>State</th>
+              <th>Age</th>
+              <th>State Time</th>
+              <th>Reasons</th>
+              <th>Task</th>
+              <th>Retries</th>
               <th>Next Run</th>
               <th>Error</th>
               <th>Action</th>
             </tr>
           </thead>
           <tbody>
-            {rows.length ? (
-              rows.map((task) => {
-                const retryPending = task.order_id === retryActionPendingOrderId;
-                const canRetry = task.status === "failed";
+            {filteredRows.length ? (
+              filteredRows.map((order) => {
+                const retryPending = order.order_id === retryActionPendingOrderId;
+                const canRetry = Boolean(order.has_failed_task);
 
                 return (
-                  <tr key={task.task_id}>
-                    <td>
-                      <span className={`reason-badge reason-badge--${task.problem_reason ?? "unknown"}`}>
-                        {humanize(task.problem_reason)}
-                      </span>
-                    </td>
-                    <td>{humanize(task.task_type)}</td>
+                  <tr key={order.order_id}>
                     <td>
                       <a
                         className="text-button"
-                        href={orderDetailPath(task.order_id)}
-                        title={task.idempotency_key}
+                        href={orderDetailPath(order.order_id)}
+                        title={order.idempotency_key}
+                        onClick={(event) => onSelectOrder(order.order_id, event)}
                       >
-                        {shortKey(task.idempotency_key)}
+                        {shortKey(order.idempotency_key)}
                       </a>
                     </td>
+                    <td><StateBadge state={order.state} /></td>
                     <td>
-                      {numberText(task.attempts)}/{numberText(task.max_attempts)}
+                      {formatDurationSeconds(order.age_seconds)}
                     </td>
-                    <td>{formatTime(task.next_run_at)}</td>
-                    <td className="truncate" title={task.last_error ?? ""}>
-                      {task.last_error ?? "—"}
+                    <td className="attention-duration">
+                      {formatDurationSeconds(order.state_seconds)}
+                    </td>
+                    <td><ReasonChips order={order} /></td>
+                    <td><LatestTaskSummary item={order} /></td>
+                    <td>
+                      <span
+                        className="retry-count"
+                        title="Retryable errors consumed by this task"
+                      >
+                        {numberText(order.latest_task_attempts)}/
+                        {numberText(order.latest_task_max_attempts)}
+                      </span>
+                    </td>
+                    <td>{formatTime(order.latest_task_next_run_at)}</td>
+                    <td
+                      className="truncate"
+                      title={order.latest_task_last_error ?? ""}
+                    >
+                      {order.latest_task_last_error ?? "—"}
                     </td>
                     <td>
                       {canRetry ? (
@@ -1937,7 +2049,7 @@ function ProblemTaskPanel({
                           className="button small"
                           disabled={Boolean(retryActionPendingOrderId)}
                           type="button"
-                          onClick={() => onRetryFailedTasks(task.order_id)}
+                          onClick={() => onRetryFailedTasks(order.order_id)}
                         >
                           {retryPending ? "Retrying" : "Retry"}
                         </button>
@@ -1947,11 +2059,17 @@ function ProblemTaskPanel({
                 );
               })
             ) : (
-              <EmptyRow colSpan={7}>No failed, expired, or retrying tasks</EmptyRow>
+              <EmptyRow colSpan={10}>No matching orders need attention</EmptyRow>
             )}
           </tbody>
         </table>
       </div>
+      {total > rows.length || filteredRows.length !== rows.length ? (
+        <p className="muted-text panel-footnote">
+          Showing {numberText(filteredRows.length)} of {numberText(rows.length)} loaded
+          orders{total > rows.length ? `, from ${numberText(total)} total` : ""}.
+        </p>
+      ) : null}
     </section>
   );
 }

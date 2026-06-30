@@ -18,6 +18,7 @@ body {
 
 button,
 input,
+select,
 table {
   font: inherit;
 }
@@ -60,7 +61,7 @@ p {
 }
 
 h1 {
-  font-size: 30px;
+  font-size: 22px;
   line-height: 1.15;
   margin-bottom: 0;
 }
@@ -142,7 +143,7 @@ h2 {
 .summary-grid {
   display: grid;
   gap: 12px;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   margin-bottom: 16px;
 }
 
@@ -151,8 +152,8 @@ h2 {
   border: 1px solid #d8dee5;
   border-left: 4px solid #6f7d8a;
   border-radius: 8px;
-  min-height: 106px;
-  padding: 16px;
+  min-height: 88px;
+  padding: 14px;
 }
 
 .metric.good {
@@ -214,7 +215,7 @@ h2 {
   color: #ffffff;
   content: attr(data-tooltip);
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 400;
   left: 50%;
   line-height: 1.35;
   max-width: min(260px, 70vw);
@@ -241,9 +242,9 @@ h2 {
 
 .metric strong {
   display: block;
-  font-size: 30px;
+  font-size: 24px;
   line-height: 1;
-  margin-bottom: 8px;
+  margin-bottom: 6px;
 }
 
 .metric-detail {
@@ -296,9 +297,9 @@ h2 {
 .latency-summary strong {
   color: #263241;
   display: block;
-  font-size: 26px;
+  font-size: 22px;
   line-height: 1;
-  margin-top: 8px;
+  margin-top: 6px;
 }
 
 .stage-latency-list-header {
@@ -367,7 +368,7 @@ h2 {
 
 .secondary-metrics dd {
   color: #263241;
-  font-size: 24px;
+  font-size: 20px;
   font-weight: 900;
   line-height: 1;
   margin: 0;
@@ -606,8 +607,7 @@ h2 {
 .loadgen-stats dt {
   color: #66717d;
   font-size: 12px;
-  font-weight: 800;
-  text-transform: uppercase;
+  font-weight: 700;
 }
 
 .loadgen-stats dd {
@@ -729,6 +729,25 @@ h2 {
   margin-bottom: 16px;
 }
 
+.breadcrumb-link {
+  align-items: center;
+  color: #25636f;
+  display: inline-flex;
+  font-size: 13px;
+  font-weight: 700;
+  gap: 5px;
+  text-decoration: none;
+}
+
+.breadcrumb-link::before {
+  content: "←";
+  font-size: 14px;
+}
+
+.breadcrumb-link:hover {
+  text-decoration: underline;
+}
+
 .detail-toolbar-meta {
   align-items: center;
   color: #4a5562;
@@ -769,8 +788,7 @@ h2 {
 .order-meta dt {
   color: #66717d;
   font-size: 12px;
-  font-weight: 800;
-  text-transform: uppercase;
+  font-weight: 700;
 }
 
 .order-meta dd {
@@ -978,8 +996,8 @@ td {
 th {
   color: #5c6875;
   font-size: 12px;
-  font-weight: 800;
-  text-transform: uppercase;
+  font-weight: 700;
+  letter-spacing: 0.01em;
 }
 
 td {
@@ -1016,13 +1034,50 @@ tbody tr:last-child td {
   white-space: nowrap;
 }
 
-.stuck-orders-table {
-  min-width: 760px;
+.attention-toolbar {
+  align-items: end;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(180px, 220px) minmax(220px, 1fr);
+  margin-bottom: 14px;
 }
 
-.stuck-duration {
+.attention-toolbar label {
+  color: #5c6875;
+  display: grid;
+  font-size: 12px;
+  font-weight: 700;
+  gap: 6px;
+}
+
+.attention-toolbar input,
+.attention-toolbar select {
+  background: #ffffff;
+  border: 1px solid #cbd4dc;
+  border-radius: 6px;
+  color: #263241;
+  font-size: 13px;
+  font-weight: 650;
+  min-height: 36px;
+  padding: 7px 10px;
+  text-transform: none;
+  width: 100%;
+}
+
+.attention-orders-table {
+  min-width: 980px;
+}
+
+.attention-duration {
   color: #a33b2f;
   font-weight: 900;
+}
+
+.retry-count {
+  color: #263241;
+  font-variant-numeric: tabular-nums;
+  font-weight: 900;
+  white-space: nowrap;
 }
 
 .task-stack {
@@ -1121,6 +1176,10 @@ tbody tr:last-child td {
     grid-template-columns: 1fr;
   }
 
+  .attention-toolbar {
+    grid-template-columns: 1fr;
+  }
+
   .secondary-metrics div,
   .secondary-metrics div:nth-last-child(-n + 2) {
     border-bottom: 1px solid #e4e8ed;
@@ -1201,22 +1260,23 @@ tbody tr:last-child td {
 .task-badge--cancelled { background: #edf1f4; color: #5c6875; }
 .task-badge--unknown   { background: #edf1f4; color: #5c6875; }
 
-/* ── Problem reason badges ──────────────────────────────── */
+.reason-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 150px;
+}
 
-.reason-badge {
+.reason-chip {
+  background: #fef3e2;
   border-radius: 4px;
-  display: inline-block;
+  color: #7a4a0a;
   font-size: 11px;
   font-weight: 700;
   padding: 2px 8px;
+  text-transform: capitalize;
   white-space: nowrap;
 }
-
-.reason-badge--failed         { background: #fde8e6; color: #a33b2f; }
-.reason-badge--expired_running { background: #fef3e2; color: #7a4a0a; }
-.reason-badge--pending_retry  { background: #ddeef9; color: #1a5a8a; }
-.reason-badge--due_retry      { background: #fef3e2; color: #7a4a0a; }
-.reason-badge--unknown        { background: #edf1f4; color: #5c6875; }
 
 /* ── Pipeline duration annotation ──────────────────────── */
 

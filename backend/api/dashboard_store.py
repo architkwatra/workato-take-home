@@ -7,8 +7,10 @@ from psycopg.rows import dict_row
 from common.db import open_db_connection
 from common.event_types import EVENT_TYPE_ORDER_CREATED, EVENT_TYPE_STATE_TRANSITION
 from common.state_machine import (
+    ORDER_STATE_CANCELLED,
     ORDER_STATE_CONFIRMED,
     ORDER_STATE_DELIVERED,
+    ORDER_STATE_FAILED,
     ORDER_STATE_OUT_FOR_DELIVERY,
     ORDER_STATE_PLACED,
     ORDER_STATE_PREPARING,
@@ -30,9 +32,8 @@ DEFAULT_CONFIGURED_WORKER_COUNT = 3
 # aggregate counts continue to reflect the whole database.
 RECENT_ORDER_LIMIT = 12
 RECENT_EVENT_LIMIT = 20
-PROBLEM_TASK_LIMIT = 20
 PLACED_ORDER_LIMIT = 5
-STUCK_ORDER_LIMIT = 12
+ATTENTION_ORDER_LIMIT = 50
 ORDER_DETAIL_EVENT_LIMIT = 50
 ORDER_DETAIL_TASK_LIMIT = 50
 # Keep throughput derived from a short rolling window. This is intentionally
@@ -42,6 +43,7 @@ THROUGHPUT_WINDOW_SECONDS = 30
 # Latency is also windowed, but over a longer interval so the dashboard remains
 # responsive to a new loadgen run without going blank between deliveries.
 DEFAULT_LATENCY_WINDOW_SECONDS = 300
+DEFAULT_ORDER_DELIVERY_SLA_SECONDS = 120
 DEFAULT_STUCK_ORDER_THRESHOLDS_SECONDS = {
     ORDER_STATE_PLACED: 18,
     ORDER_STATE_CONFIRMED: 18,
@@ -91,6 +93,13 @@ def _latency_window_seconds() -> int:
     return _positive_int_env(
         "DASHBOARD_LATENCY_WINDOW_SECONDS",
         DEFAULT_LATENCY_WINDOW_SECONDS,
+    )
+
+
+def _order_delivery_sla_seconds() -> int:
+    return _positive_int_env(
+        "DASHBOARD_ORDER_DELIVERY_SLA_SECONDS",
+        DEFAULT_ORDER_DELIVERY_SLA_SECONDS,
     )
 
 
@@ -194,10 +203,14 @@ def get_dashboard_overview() -> dict[str, Any]:
 
             order_throughput = _load_order_throughput(cur)
             latency = _load_latency_overview(cur, _latency_window_seconds())
+            order_delivery_sla_seconds = _order_delivery_sla_seconds()
             stuck_thresholds = _stuck_order_thresholds()
-            stuck_orders = _load_stuck_order_overview(cur, stuck_thresholds)
+            attention_orders = _load_attention_order_overview(
+                cur,
+                order_delivery_sla_seconds=order_delivery_sla_seconds,
+                stuck_thresholds=stuck_thresholds,
+            )
             workers = _load_worker_overview(cur)
-            problem_tasks = _load_problem_tasks(cur)
             placed_orders = _load_placed_orders(cur)
             recent_orders = _load_recent_orders(cur)
             recent_events = _load_recent_events(cur)
@@ -233,38 +246,86 @@ def get_dashboard_overview() -> dict[str, Any]:
             ),
         },
         "latency": latency,
-        "stuck_orders": {
-            "total": stuck_orders["total"],
-            "limit": STUCK_ORDER_LIMIT,
+        "attention_orders": {
+            "total": attention_orders["total"],
+            "limit": ATTENTION_ORDER_LIMIT,
+            "order_sla_seconds": order_delivery_sla_seconds,
             "thresholds_seconds": stuck_thresholds,
-            "items": stuck_orders["items"],
+            "items": attention_orders["items"],
         },
         "workers": workers,
-        "problem_tasks": problem_tasks,
         "placed_orders": placed_orders,
         "recent_orders": recent_orders,
         "recent_events": recent_events,
     }
 
 
-def _load_stuck_order_overview(
+def _load_attention_order_overview(
     cur,
-    thresholds: dict[str, int],
+    *,
+    order_delivery_sla_seconds: int,
+    stuck_thresholds: dict[str, int],
 ) -> dict[str, Any]:
-    """Return non-terminal orders that have not moved past their stage SLA."""
-    threshold_rows = list(thresholds.items())
+    """Return active orders that need operator attention."""
+    threshold_rows = list(stuck_thresholds.items())
     values_sql = ", ".join(["(%s::order_state, %s::int)"] * len(threshold_rows))
+    retrying_task_statuses = [TASK_STATUS_PENDING, TASK_STATUS_RUNNING]
     params: list[Any] = []
     for state, threshold_seconds in threshold_rows:
         params.extend([state, threshold_seconds])
-    params.append(STUCK_ORDER_LIMIT)
+    params.extend(
+        [
+            TASK_STATUS_FAILED,
+            TASK_STATUS_RUNNING,
+            retrying_task_statuses,
+            TASK_STATUS_FAILED,
+            TASK_STATUS_RUNNING,
+            retrying_task_statuses,
+            order_delivery_sla_seconds,
+            order_delivery_sla_seconds,
+            ORDER_STATE_DELIVERED,
+            ORDER_STATE_CANCELLED,
+            ORDER_STATE_FAILED,
+            order_delivery_sla_seconds,
+            TASK_STATUS_FAILED,
+            TASK_STATUS_RUNNING,
+            ATTENTION_ORDER_LIMIT,
+        ]
+    )
 
     cur.execute(
         f"""
         with thresholds(state, threshold_seconds) as (
             values {values_sql}
         ),
-        stuck as (
+        problem_tasks as (
+            select
+                order_id,
+                bool_or(status = %s::task_status) as has_failed_task,
+                bool_or(
+                    status = %s::task_status
+                    and locked_until < now()
+                ) as has_expired_lease,
+                bool_or(
+                    status = any(%s::task_status[])
+                    and last_error is not null
+                ) as has_retrying_task,
+                bool_or(last_error like 'unsupported task%%')
+                    as has_unsupported_task
+            from order_tasks
+            where
+                status = %s::task_status
+                or (
+                    status = %s::task_status
+                    and locked_until < now()
+                )
+                or (
+                    status = any(%s::task_status[])
+                    and last_error is not null
+                )
+            group by order_id
+        ),
+        attention as (
             select
                 orders.id,
                 orders.id::text as order_id,
@@ -274,51 +335,126 @@ def _load_stuck_order_overview(
                 orders.courier_ref,
                 orders.created_at,
                 orders.updated_at,
+                extract(epoch from now() - orders.created_at)::int
+                    as age_seconds,
                 extract(epoch from now() - orders.updated_at)::int
-                    as stuck_seconds,
-                thresholds.threshold_seconds
-            from orders
-            join thresholds on thresholds.state = orders.state
-            where
-                orders.updated_at
-                    <= now() - (
+                    as state_seconds,
+                greatest(
+                    extract(epoch from now() - orders.created_at)::int - %s,
+                    0
+                ) as overdue_seconds,
+                greatest(
+                    extract(epoch from now() - orders.updated_at)::int
+                        - thresholds.threshold_seconds,
+                    0
+                ) as stuck_seconds,
+                thresholds.threshold_seconds as state_threshold_seconds,
+                orders.created_at <= now() - (%s * interval '1 second')
+                    as is_overdue,
+                (
+                    thresholds.state is not null
+                    and orders.updated_at <= now() - (
                         thresholds.threshold_seconds * interval '1 second'
                     )
+                ) as is_stuck,
+                coalesce(problem_tasks.has_failed_task, false)
+                    as has_failed_task,
+                coalesce(problem_tasks.has_expired_lease, false)
+                    as has_expired_lease,
+                coalesce(problem_tasks.has_retrying_task, false)
+                    as has_retrying_task,
+                coalesce(problem_tasks.has_unsupported_task, false)
+                    as has_unsupported_task
+            from orders
+            left join thresholds on thresholds.state = orders.state
+            left join problem_tasks on problem_tasks.order_id = orders.id
+            where
+                orders.state not in (
+                    %s::order_state,
+                    %s::order_state,
+                    %s::order_state
+                )
+                and (
+                    orders.created_at <= now() - (%s * interval '1 second')
+                    or (
+                        thresholds.state is not null
+                        and orders.updated_at <= now() - (
+                            thresholds.threshold_seconds * interval '1 second'
+                        )
+                    )
+                    or problem_tasks.order_id is not null
+                )
         )
         select
             count(*) over()::int as total_count,
-            stuck.order_id,
-            stuck.idempotency_key,
-            stuck.state,
-            stuck.restaurant_ref,
-            stuck.courier_ref,
-            stuck.created_at,
-            stuck.updated_at,
-            stuck.stuck_seconds,
-            stuck.threshold_seconds,
+            attention.order_id,
+            attention.idempotency_key,
+            attention.state,
+            attention.restaurant_ref,
+            attention.courier_ref,
+            attention.created_at,
+            attention.updated_at,
+            attention.age_seconds,
+            attention.state_seconds,
+            attention.overdue_seconds,
+            attention.stuck_seconds,
+            attention.state_threshold_seconds,
+            attention.is_overdue,
+            attention.is_stuck,
+            attention.has_failed_task,
+            attention.has_expired_lease,
+            attention.has_retrying_task,
+            attention.has_unsupported_task,
             task.id::text as latest_task_id,
             task.task_type::text as latest_task_type,
             task.target_state::text as latest_task_target_state,
             task.status::text as latest_task_status,
+            task.attempts as latest_task_attempts,
+            task.max_attempts as latest_task_max_attempts,
             task.next_run_at as latest_task_next_run_at,
             task.locked_until as latest_task_locked_until,
             task.last_error as latest_task_last_error
-        from stuck
+        from attention
         left join lateral (
             select
                 id,
                 task_type,
                 target_state,
                 status,
+                attempts,
+                max_attempts,
                 next_run_at,
                 locked_until,
                 last_error
             from order_tasks
-            where order_id = stuck.id
-            order by updated_at desc, created_at desc, id desc
+            where order_id = attention.id
+            order by
+                case
+                    when status = %s::task_status then 0
+                    when
+                        status = %s::task_status
+                        and locked_until < now()
+                        then 1
+                    when last_error like 'unsupported task%%' then 2
+                    when last_error is not null then 3
+                    else 4
+                end,
+                updated_at desc,
+                created_at desc,
+                id desc
             limit 1
         ) as task on true
-        order by stuck.stuck_seconds desc, stuck.updated_at asc
+        order by
+            case
+                when attention.has_failed_task then 0
+                when attention.has_expired_lease then 1
+                when attention.has_unsupported_task then 2
+                when attention.is_overdue then 3
+                when attention.is_stuck then 4
+                else 5
+            end,
+            greatest(attention.age_seconds, attention.state_seconds) desc,
+            attention.created_at asc
         limit %s
         """,
         params,
@@ -616,85 +752,6 @@ def _load_worker_overview(cur) -> dict[str, Any]:
         "configured_count": _configured_worker_count(),
         "total_seen": counts["total_seen"],
     }
-
-
-def _load_problem_tasks(cur) -> list[dict[str, Any]]:
-    """Load the tasks an operator should inspect first."""
-    # The dashboard only calls out tasks that are already failed, running past
-    # their lease, or waiting for retry after a previous failed attempt.
-    # Ordinary future pending tasks with no last_error are healthy scheduled
-    # work and are not useful in this operator-focused list.
-    cur.execute(
-        """
-        select
-            task.id::text as task_id,
-            task.order_id::text as order_id,
-            orders.idempotency_key,
-            task.task_type::text,
-            task.target_state::text,
-            task.status::text,
-            task.attempts,
-            task.max_attempts,
-            task.next_run_at,
-            task.deadline_at,
-            task.locked_by,
-            task.locked_until,
-            task.last_error,
-            case
-                when task.status = %s::task_status then 'failed'
-                when
-                    task.status = %s::task_status
-                    and task.locked_until < now()
-                    then 'expired_running'
-                when task.status = %s::task_status then 'retry_running'
-                when task.next_run_at > now() then 'pending_retry'
-                else 'due_retry'
-            end as problem_reason
-        from order_tasks as task
-        join orders on orders.id = task.order_id
-        where
-            task.status = %s::task_status
-            or (
-                task.status = %s::task_status
-                and task.locked_until < now()
-            )
-            or (
-                task.status = %s::task_status
-                and task.last_error is not null
-            )
-            or (
-                task.status = %s::task_status
-                and task.last_error is not null
-            )
-        order by
-            case
-                when task.status = %s::task_status then 0
-                when
-                    task.status = %s::task_status
-                    and task.locked_until < now()
-                    then 1
-                when task.status = %s::task_status then 2
-                when task.next_run_at <= now() then 3
-                else 4
-            end,
-            coalesce(task.locked_until, task.next_run_at, task.updated_at) asc
-        limit %s
-        """,
-        (
-            TASK_STATUS_FAILED,
-            TASK_STATUS_RUNNING,
-            TASK_STATUS_RUNNING,
-            TASK_STATUS_FAILED,
-            TASK_STATUS_RUNNING,
-            TASK_STATUS_PENDING,
-            TASK_STATUS_RUNNING,
-            TASK_STATUS_FAILED,
-            TASK_STATUS_RUNNING,
-            TASK_STATUS_RUNNING,
-            PROBLEM_TASK_LIMIT,
-        ),
-    )
-    return [dict(row) for row in cur.fetchall()]
 
 
 def _load_recent_orders(cur) -> list[dict[str, Any]]:
