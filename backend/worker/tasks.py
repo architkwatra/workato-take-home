@@ -14,6 +14,7 @@ from common.state_machine import (
     ORDER_STATE_CONFIRMED,
     ORDER_STATE_DELIVERED,
     ORDER_STATE_OUT_FOR_DELIVERY,
+    ORDER_STATE_PAYMENT_CHECK,
     ORDER_STATE_PLACED,
     ORDER_STATE_PREPARING,
     ORDER_STATE_READY,
@@ -25,6 +26,7 @@ from common.task_types import (
     TASK_STATUS_PENDING,
     TASK_STATUS_RUNNING,
     TASK_TYPE_ADVANCE_STATE,
+    TASK_TYPE_CHECK_PAYMENT,
     TASK_TYPE_CHECK_DELIVERY,
     TASK_TYPE_CHECK_READY,
 )
@@ -39,6 +41,8 @@ DEFAULT_DOWNSTREAM_REQUEST_TIMEOUT_SECONDS = 2.0
 # retryable failures grow exponentially until TASK_RETRY_MAX_DELAY_SECONDS.
 DEFAULT_TASK_RETRY_DELAY_SECONDS = 5.0
 DEFAULT_TASK_RETRY_MAX_DELAY_SECONDS = 60.0
+DEFAULT_PAYMENT_CHECK_INTERVAL_SECONDS = 1.0
+DEFAULT_PAYMENT_CHECK_DEADLINE_SECONDS = 60.0
 DEFAULT_READY_CHECK_INITIAL_DELAY_SECONDS = 2.0
 DEFAULT_READY_CHECK_INTERVAL_SECONDS = 2.0
 DEFAULT_READY_CHECK_DEADLINE_SECONDS = 60.0
@@ -59,6 +63,8 @@ ALLOWED_EXTRA_ORDER_COLUMNS = frozenset({"courier_ref"})
 
 DELIVERY_CHECK_STATUS_DELIVERED = "delivered"
 DELIVERY_CHECK_STATUS_IN_TRANSIT = "in_transit"
+PAYMENT_CHECK_STATUS_AUTHORIZED = "authorized"
+PAYMENT_CHECK_STATUS_PENDING = "pending"
 TRANSITION_STATUS_NOT_CONFIRMED = "not_confirmed"
 TRANSITION_STATUS_NOT_PREPARING = "not_preparing"
 COURIER_ASSIGN_STATUS_ASSIGNED = "assigned"
@@ -154,6 +160,22 @@ class TransitionCallOutcome:
 
 
 @dataclass(frozen=True)
+class PaymentCheckCall:
+    """Details needed for one payment authorization poll."""
+
+    order_id: str
+    placed_at: datetime
+
+
+@dataclass(frozen=True)
+class PaymentCheckOutcome:
+    """Validated response from the payment simulator endpoint."""
+
+    status: str
+    retry_after_seconds: float | None = None
+
+
+@dataclass(frozen=True)
 class CourierAssignCall:
     """Details needed for one courier assignment request."""
 
@@ -209,18 +231,30 @@ READY_CHECK_STATUS_READY = "ready"
 READY_CHECK_STATUS_NOT_READY = "not_ready"
 
 
+PAYMENT_FINALIZATION_SPEC = RestaurantTransitionSpec(
+    source_state=ORDER_STATE_PLACED,
+    target_state=ORDER_STATE_PAYMENT_CHECK,
+    endpoint_path="/payment/check",
+    expected_status=PAYMENT_CHECK_STATUS_AUTHORIZED,
+    pending_status=PAYMENT_CHECK_STATUS_PENDING,
+    action_name="payment check",
+    source_started_at_field="placed_at",
+    next_task_type=TASK_TYPE_ADVANCE_STATE,
+    next_target_state=ORDER_STATE_CONFIRMED,
+)
+
 # Each transition is modeled as a quick downstream check. Downstream either
 # returns the success status or a valid pending status with retry_after_seconds;
 # workers never hold DB locks while waiting for the simulated delay to pass.
 RESTAURANT_TRANSITION_SPECS = {
     ORDER_STATE_CONFIRMED: RestaurantTransitionSpec(
-        source_state=ORDER_STATE_PLACED,
+        source_state=ORDER_STATE_PAYMENT_CHECK,
         target_state=ORDER_STATE_CONFIRMED,
         endpoint_path="/restaurant/confirm",
         expected_status=ORDER_STATE_CONFIRMED,
         pending_status=TRANSITION_STATUS_NOT_CONFIRMED,
         action_name="restaurant confirm",
-        source_started_at_field="placed_at",
+        source_started_at_field="payment_checked_at",
         next_task_type=TASK_TYPE_ADVANCE_STATE,
         next_target_state=ORDER_STATE_PREPARING,
     ),
@@ -341,6 +375,22 @@ def _task_retry_delay_seconds(*, attempts: int) -> float:
     return min(retry_delay, _task_retry_max_delay_seconds())
 
 
+def _payment_check_interval_seconds() -> float:
+    """Return the fallback wait between normal payment-pending polls."""
+    return _read_positive_float_env(
+        "PAYMENT_CHECK_INTERVAL_SECONDS",
+        DEFAULT_PAYMENT_CHECK_INTERVAL_SECONDS,
+    )
+
+
+def _payment_check_deadline_seconds() -> float:
+    """Return the max wall-clock wait for payment authorization polling."""
+    return _read_positive_float_env(
+        "PAYMENT_CHECK_DEADLINE_SECONDS",
+        DEFAULT_PAYMENT_CHECK_DEADLINE_SECONDS,
+    )
+
+
 def _ready_check_initial_delay_seconds() -> float:
     """Return how long to wait before the first restaurant ready check."""
     return _read_positive_float_env(
@@ -425,6 +475,18 @@ def _valid_positive_number(value) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return float(value) if value > 0 else None
+
+
+def _bounded_payment_check_next_run_at(
+    *,
+    now: datetime,
+    retry_after_seconds: float | None,
+    deadline_at: datetime,
+) -> datetime:
+    """Return the next payment poll time, capped so the deadline gets checked."""
+    poll_delay_seconds = retry_after_seconds or _payment_check_interval_seconds()
+    proposed_next_run_at = now + timedelta(seconds=poll_delay_seconds)
+    return min(proposed_next_run_at, deadline_at)
 
 
 def _bounded_ready_check_next_run_at(
@@ -652,6 +714,43 @@ def _load_transition_task_row(
             ORDER_STATE_PLACED,
             EVENT_TYPE_STATE_TRANSITION,
             source_state,
+            task_id,
+        ),
+    )
+    return cur.fetchone()
+
+
+def _load_payment_check_task_row(cur, *, task_id: str) -> dict | None:
+    """Lock the check_payment task row and return current order details."""
+    cur.execute(
+        """
+        select
+            task.id::text as task_id,
+            task.order_id::text,
+            task.status::text as task_status,
+            task.locked_by,
+            task.attempts,
+            task.max_attempts,
+            task.deadline_at,
+            orders.state::text as order_state,
+            orders.version,
+            created_event.occurred_at as placed_at
+        from order_tasks as task
+        join orders on orders.id = task.order_id
+        left join lateral (
+            select occurred_at
+            from order_events
+            where
+                order_id = orders.id
+                and event_type = %s::event_type
+            order by occurred_at asc
+            limit 1
+        ) as created_event on true
+        where task.id = %s::uuid
+        for update of task
+        """,
+        (
+            EVENT_TYPE_ORDER_CREATED,
             task_id,
         ),
     )
@@ -1204,6 +1303,325 @@ def _call_courier_assign(
     return CourierAssignOutcome(
         status=COURIER_ASSIGN_STATUS_ASSIGNED,
         courier_ref=courier_ref,
+    )
+
+
+def _prepare_payment_check_call(
+    *,
+    task: ClaimedTask,
+    worker_id: str,
+) -> PaymentCheckCall | ProcessingResult:
+    """Validate the claimed check_payment task and return simulator call details."""
+    occurred_at = datetime.now(timezone.utc)
+    with open_db_connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                row = _load_payment_check_task_row(cur, task_id=task.id)
+                skip_result = _owned_task_check_result(row, worker_id=worker_id)
+                if skip_result is not None:
+                    return skip_result
+
+                order_state = row["order_state"]
+                order_id = row["order_id"]
+                if is_terminal_order_state(order_state):
+                    _complete_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        completed_at=occurred_at,
+                    )
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_COMPLETED_TERMINAL_NOOP,
+                        order_id=order_id,
+                        from_state=order_state,
+                    )
+
+                if order_state != ORDER_STATE_PLACED:
+                    _complete_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        completed_at=occurred_at,
+                    )
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_COMPLETED_STALE_NOOP,
+                        order_id=order_id,
+                        from_state=order_state,
+                    )
+
+                if row["deadline_at"] is None:
+                    return _retry_or_fail_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        order_id=order_id,
+                        from_state=ORDER_STATE_PLACED,
+                        to_state=ORDER_STATE_PAYMENT_CHECK,
+                        attempts=row["attempts"],
+                        max_attempts=row["max_attempts"],
+                        next_run_at=occurred_at
+                        + timedelta(
+                            seconds=_task_retry_delay_seconds(
+                                attempts=row["attempts"]
+                            )
+                        ),
+                        last_error="check_payment task is missing deadline_at",
+                        updated_at=occurred_at,
+                    )
+
+                if row["placed_at"] is None:
+                    return _retry_or_fail_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        order_id=order_id,
+                        from_state=ORDER_STATE_PLACED,
+                        to_state=ORDER_STATE_PAYMENT_CHECK,
+                        attempts=row["attempts"],
+                        max_attempts=row["max_attempts"],
+                        next_run_at=occurred_at
+                        + timedelta(
+                            seconds=_task_retry_delay_seconds(
+                                attempts=row["attempts"]
+                            )
+                        ),
+                        last_error="missing order_created event for check_payment",
+                        updated_at=occurred_at,
+                    )
+
+                return PaymentCheckCall(
+                    order_id=order_id,
+                    placed_at=row["placed_at"],
+                )
+
+
+def _call_payment_check(call: PaymentCheckCall) -> PaymentCheckOutcome | str:
+    """Call the payment simulator and return an outcome or retryable error."""
+    url = f"{_downstream_sim_base_url()}/payment/check"
+    payload = {
+        "order_id": call.order_id,
+        "placed_at": call.placed_at.isoformat(),
+    }
+
+    try:
+        response = httpx.post(
+            url,
+            json=payload,
+            timeout=_downstream_request_timeout_seconds(),
+        )
+    except httpx.TimeoutException as exc:
+        return _short_error(f"downstream timeout calling payment check: {exc}")
+    except httpx.RequestError as exc:
+        return _short_error(f"downstream request failed calling payment check: {exc}")
+
+    if response.status_code >= 500:
+        return _short_error(
+            f"downstream returned {response.status_code} from payment check"
+        )
+    if response.status_code != 200:
+        return _short_error(
+            f"downstream returned unexpected {response.status_code} from payment check"
+        )
+
+    try:
+        body = response.json()
+    except ValueError as exc:
+        return _short_error(f"downstream returned invalid JSON: {exc}")
+
+    if not isinstance(body, dict):
+        return _short_error(f"downstream returned invalid payment check body: {body!r}")
+
+    status = body.get("status")
+    if status == PAYMENT_CHECK_STATUS_AUTHORIZED:
+        return PaymentCheckOutcome(status=PAYMENT_CHECK_STATUS_AUTHORIZED)
+    if status == PAYMENT_CHECK_STATUS_PENDING:
+        return PaymentCheckOutcome(
+            status=PAYMENT_CHECK_STATUS_PENDING,
+            retry_after_seconds=_valid_positive_number(body.get("retry_after_seconds")),
+        )
+
+    return _short_error(f"downstream returned invalid payment check body: {body!r}")
+
+
+def _reschedule_payment_check_after_error(
+    *,
+    task: ClaimedTask,
+    worker_id: str,
+    order_id: str,
+    error: str,
+) -> ProcessingResult:
+    """Consume retry budget after a failed payment check request."""
+    updated_at = datetime.now(timezone.utc)
+
+    with open_db_connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                row = _load_payment_check_task_row(cur, task_id=task.id)
+                skip_result = _owned_task_check_result(row, worker_id=worker_id)
+                if skip_result is not None:
+                    return skip_result
+
+                order_state = row["order_state"]
+                if is_terminal_order_state(order_state):
+                    _complete_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        completed_at=updated_at,
+                    )
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_COMPLETED_TERMINAL_NOOP,
+                        order_id=row["order_id"],
+                        from_state=order_state,
+                    )
+
+                if order_state != ORDER_STATE_PLACED:
+                    _complete_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        completed_at=updated_at,
+                    )
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_COMPLETED_STALE_NOOP,
+                        order_id=row["order_id"],
+                        from_state=order_state,
+                    )
+
+                return _retry_or_fail_claimed_task(
+                    cur,
+                    task_id=task.id,
+                    worker_id=worker_id,
+                    order_id=order_id,
+                    from_state=ORDER_STATE_PLACED,
+                    to_state=ORDER_STATE_PAYMENT_CHECK,
+                    attempts=row["attempts"],
+                    max_attempts=row["max_attempts"],
+                    next_run_at=updated_at
+                    + timedelta(
+                        seconds=_task_retry_delay_seconds(attempts=row["attempts"])
+                    ),
+                    last_error=error,
+                    updated_at=updated_at,
+                )
+
+
+def _reschedule_payment_check_after_pending(
+    *,
+    task: ClaimedTask,
+    worker_id: str,
+    outcome: PaymentCheckOutcome,
+) -> ProcessingResult:
+    """Release check_payment after a normal payment-pending response."""
+    updated_at = datetime.now(timezone.utc)
+
+    with open_db_connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                row = _load_payment_check_task_row(cur, task_id=task.id)
+                skip_result = _owned_task_check_result(row, worker_id=worker_id)
+                if skip_result is not None:
+                    return skip_result
+
+                order_state = row["order_state"]
+                order_id = row["order_id"]
+                if is_terminal_order_state(order_state):
+                    _complete_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        completed_at=updated_at,
+                    )
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_COMPLETED_TERMINAL_NOOP,
+                        order_id=order_id,
+                        from_state=order_state,
+                    )
+
+                if order_state != ORDER_STATE_PLACED:
+                    _complete_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        completed_at=updated_at,
+                    )
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_COMPLETED_STALE_NOOP,
+                        order_id=order_id,
+                        from_state=order_state,
+                    )
+
+                if row["deadline_at"] is None:
+                    return _retry_or_fail_claimed_task(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        order_id=order_id,
+                        from_state=ORDER_STATE_PLACED,
+                        to_state=ORDER_STATE_PAYMENT_CHECK,
+                        attempts=row["attempts"],
+                        max_attempts=row["max_attempts"],
+                        next_run_at=updated_at
+                        + timedelta(
+                            seconds=_task_retry_delay_seconds(
+                                attempts=row["attempts"]
+                            )
+                        ),
+                        last_error="check_payment task is missing deadline_at",
+                        updated_at=updated_at,
+                    )
+
+                if updated_at >= row["deadline_at"]:
+                    error = "payment check deadline exceeded"
+                    failed = _fail_claimed_task_without_attempt_increment(
+                        cur,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        last_error=error,
+                        updated_at=updated_at,
+                    )
+                    if failed:
+                        return ProcessingResult(
+                            action=PROCESSING_ACTION_FAILED,
+                            order_id=order_id,
+                            from_state=ORDER_STATE_PLACED,
+                            to_state=ORDER_STATE_PAYMENT_CHECK,
+                            error=error,
+                        )
+
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_LOST_OWNERSHIP,
+                        order_id=order_id,
+                        from_state=ORDER_STATE_PLACED,
+                        to_state=ORDER_STATE_PAYMENT_CHECK,
+                        error=error,
+                    )
+
+                next_run_at = _bounded_payment_check_next_run_at(
+                    now=updated_at,
+                    retry_after_seconds=outcome.retry_after_seconds,
+                    deadline_at=row["deadline_at"],
+                )
+                scheduled = _reschedule_poll_task(
+                    cur,
+                    task_id=task.id,
+                    worker_id=worker_id,
+                    next_run_at=next_run_at,
+                    updated_at=updated_at,
+                )
+                if scheduled:
+                    return ProcessingResult(
+                        action=PROCESSING_ACTION_POLL_SCHEDULED,
+                        order_id=order_id,
+                        from_state=ORDER_STATE_PLACED,
+                        to_state=ORDER_STATE_PAYMENT_CHECK,
+                    )
+
+    return ProcessingResult(
+        action=PROCESSING_ACTION_LOST_OWNERSHIP,
+        order_id=task.order_id,
+        from_state=ORDER_STATE_PLACED,
+        to_state=ORDER_STATE_PAYMENT_CHECK,
     )
 
 
@@ -1984,6 +2402,39 @@ def _reschedule_transition_task(
     )
 
 
+def process_payment_check_task(
+    *,
+    task: ClaimedTask,
+    worker_id: str,
+) -> ProcessingResult:
+    """Poll payment authorization and advance placed orders to payment_check."""
+    prepared = _prepare_payment_check_call(task=task, worker_id=worker_id)
+    if isinstance(prepared, ProcessingResult):
+        return prepared
+
+    outcome = _call_payment_check(prepared)
+    if isinstance(outcome, str):
+        return _reschedule_payment_check_after_error(
+            task=task,
+            worker_id=worker_id,
+            order_id=prepared.order_id,
+            error=outcome,
+        )
+
+    if outcome.status == PAYMENT_CHECK_STATUS_AUTHORIZED:
+        return _finalize_transition_task(
+            task=task,
+            worker_id=worker_id,
+            spec=PAYMENT_FINALIZATION_SPEC,
+        )
+
+    return _reschedule_payment_check_after_pending(
+        task=task,
+        worker_id=worker_id,
+        outcome=outcome,
+    )
+
+
 def process_transition_task(
     *,
     task: ClaimedTask,
@@ -2488,6 +2939,11 @@ def claim_and_process_one_task(*, worker_id: str) -> bool:
                 )
             else:
                 result = None
+    elif (
+        task.task_type == TASK_TYPE_CHECK_PAYMENT
+        and task.target_state == ORDER_STATE_PAYMENT_CHECK
+    ):
+        result = process_payment_check_task(task=task, worker_id=worker_id)
     elif (
         task.task_type == TASK_TYPE_CHECK_READY
         and task.target_state == ORDER_STATE_READY
