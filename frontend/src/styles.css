@@ -18,6 +18,7 @@ body {
 
 button,
 input,
+select,
 table {
   font: inherit;
 }
@@ -1016,13 +1017,42 @@ tbody tr:last-child td {
   white-space: nowrap;
 }
 
-.overdue-orders-table,
-.stuck-orders-table {
-  min-width: 760px;
+.attention-toolbar {
+  align-items: end;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(180px, 220px) minmax(220px, 1fr);
+  margin-bottom: 14px;
 }
 
-.overdue-duration,
-.stuck-duration {
+.attention-toolbar label {
+  color: #5c6875;
+  display: grid;
+  font-size: 12px;
+  font-weight: 800;
+  gap: 6px;
+  text-transform: uppercase;
+}
+
+.attention-toolbar input,
+.attention-toolbar select {
+  background: #ffffff;
+  border: 1px solid #cbd4dc;
+  border-radius: 6px;
+  color: #263241;
+  font-size: 13px;
+  font-weight: 650;
+  min-height: 36px;
+  padding: 7px 10px;
+  text-transform: none;
+  width: 100%;
+}
+
+.attention-orders-table {
+  min-width: 980px;
+}
+
+.attention-duration {
   color: #a33b2f;
   font-weight: 900;
 }
@@ -1123,6 +1153,10 @@ tbody tr:last-child td {
     grid-template-columns: 1fr;
   }
 
+  .attention-toolbar {
+    grid-template-columns: 1fr;
+  }
+
   .secondary-metrics div,
   .secondary-metrics div:nth-last-child(-n + 2) {
     border-bottom: 1px solid #e4e8ed;
@@ -1203,22 +1237,23 @@ tbody tr:last-child td {
 .task-badge--cancelled { background: #edf1f4; color: #5c6875; }
 .task-badge--unknown   { background: #edf1f4; color: #5c6875; }
 
-/* ── Problem reason badges ──────────────────────────────── */
+.reason-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 150px;
+}
 
-.reason-badge {
+.reason-chip {
+  background: #fef3e2;
   border-radius: 4px;
-  display: inline-block;
+  color: #7a4a0a;
   font-size: 11px;
   font-weight: 700;
   padding: 2px 8px;
+  text-transform: capitalize;
   white-space: nowrap;
 }
-
-.reason-badge--failed         { background: #fde8e6; color: #a33b2f; }
-.reason-badge--expired_running { background: #fef3e2; color: #7a4a0a; }
-.reason-badge--pending_retry  { background: #ddeef9; color: #1a5a8a; }
-.reason-badge--due_retry      { background: #fef3e2; color: #7a4a0a; }
-.reason-badge--unknown        { background: #edf1f4; color: #5c6875; }
 
 /* ── Pipeline duration annotation ──────────────────────── */
 
